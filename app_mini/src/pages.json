@@ -1,0 +1,45 @@
+{
+  "pages": [
+    {
+      "path": "pages/home/home",
+      "style": { "navigationBarTitleText": "MealMate", "enablePullDownRefresh": true }
+    },
+    {
+      "path": "pages/rank/rank",
+      "style": { "navigationBarTitleText": "热榜", "enablePullDownRefresh": true }
+    },
+    {
+      "path": "pages/recipes/recipes",
+      "style": { "navigationBarTitleText": "菜谱", "enablePullDownRefresh": true }
+    },
+    {
+      "path": "pages/mine/mine",
+      "style": { "navigationBarTitleText": "我的" }
+    },
+    { "path": "pages/post/detail", "style": { "navigationBarTitleText": "饭帖详情" } },
+    { "path": "pages/recipe/detail", "style": { "navigationBarTitleText": "菜谱详情" } },
+    { "path": "pages/publish/publish", "style": { "navigationBarTitleText": "发布饭帖" } },
+    { "path": "pages/login/login", "style": { "navigationBarTitleText": "手机号登录" } },
+    { "path": "pages/favorites/favorites", "style": { "navigationBarTitleText": "我的收藏" } },
+    { "path": "pages/my-posts/my-posts", "style": { "navigationBarTitleText": "我的发布" } }
+  ],
+  "globalStyle": {
+    "navigationStyle": "custom",
+    "navigationBarTextStyle": "black",
+    "navigationBarTitleText": "MealMate",
+    "navigationBarBackgroundColor": "#FFFFFF",
+    "backgroundColor": "#F6F7F8"
+  },
+  "tabBar": {
+    "color": "#666666",
+    "selectedColor": "#CC462C",
+    "backgroundColor": "#FFFFFF",
+    "borderStyle": "white",
+    "list": [
+      { "pagePath": "pages/home/home", "text": "首页" },
+      { "pagePath": "pages/rank/rank", "text": "热榜" },
+      { "pagePath": "pages/recipes/recipes", "text": "菜谱" },
+      { "pagePath": "pages/mine/mine", "text": "我的" }
+    ]
+  }
+}

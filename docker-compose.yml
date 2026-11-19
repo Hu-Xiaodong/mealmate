@@ -1,0 +1,58 @@
+services:
+  api:
+    build:
+      context: ./server
+    restart: unless-stopped
+    environment:
+      APP_ENV: prod
+      DATABASE_URL: postgresql+asyncpg://mealmate:${POSTGRES_PASSWORD:-mealmate_dev_password}@db:5432/mealmate
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:?请在 .env 或环境变量中设置 SECRET_KEY}
+      ALLOW_DEV_AUTH_CODE: "false"
+      SEED_DEMO_DATA: "false"
+      AUTO_PUBLISH_POSTS: "false"
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:8000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://127.0.0.1:5173}
+      MEDIA_ROOT: /data/media
+      ADMIN_INITIAL_USERNAME: ${ADMIN_INITIAL_USERNAME:-admin}
+      ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:?请在 .env 或环境变量中设置 ADMIN_INITIAL_PASSWORD}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - mealmate_media:/data/media
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: mealmate
+      POSTGRES_USER: mealmate
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mealmate_dev_password}
+    volumes:
+      - mealmate_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mealmate -d mealmate"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - mealmate_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mealmate_pgdata:
+  mealmate_media:
+  mealmate_redis:

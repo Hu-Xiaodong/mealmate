@@ -1,0 +1,331 @@
+"""逻辑数据模型，对应 PRD 4.4.1。
+
+ID 一律使用稳定前缀 + 随机片段，不依赖客户端时间。
+"""
+
+from datetime import date, datetime
+
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base, utcnow
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    phone_encrypted: Mapped[str] = mapped_column(Text)
+    phone_lookup_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    nickname: Mapped[str] = mapped_column(String(40))
+    avatar_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Session(Base):
+    __tablename__ = "sessions"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    token_digest: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    device_ref: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class VerificationChallenge(Base):
+    __tablename__ = "verification_challenges"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    phone_encrypted: Mapped[str] = mapped_column(Text)
+    phone_lookup_key: Mapped[str] = mapped_column(String(64), index=True)
+    purpose: Mapped[str] = mapped_column(String(20), default="login")
+    code_digest: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AdminUser(Base):
+    """管理后台账号。
+
+    为什么不复用 users 表：普通用户注册无门槛、数量大、令牌有效期长；
+    管理员数量少但权限极高。独立表可以把两套身份体系彻底隔开，
+    避免普通用户端的任何越权漏洞直接影响后台。
+    """
+
+    __tablename__ = "admin_users"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    # 登录名，唯一索引保证不会出现两个同名管理员。
+    username: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    # 只保存 Argon2id 哈希，永远不保存明文，也无法反向还原。
+    password_hash: Mapped[str] = mapped_column(String(255))
+    display_name: Mapped[str] = mapped_column(String(40))
+    # active 可登录；disabled 已停用，登录时直接拒绝。
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AdminRole(Base):
+    """角色。权限不直接挂在账号上，而是先定义角色拥有哪些权限点。
+
+    这样新增一个内容运营只需分配角色，不用逐条勾选权限，也不会漏配。
+    """
+
+    __tablename__ = "admin_roles"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    code: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(40))
+
+
+class AdminUserRole(Base):
+    """管理员与角色的多对多关联。
+
+    一个管理员可以同时拥有多个角色，最终权限是这些角色权限点的并集。
+    """
+
+    __tablename__ = "admin_user_roles"
+    __table_args__ = (UniqueConstraint("admin_id", "role_id", name="uq_admin_user_role"),)
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    admin_id: Mapped[str] = mapped_column(ForeignKey("admin_users.id"), index=True)
+    role_id: Mapped[str] = mapped_column(ForeignKey("admin_roles.id"), index=True)
+
+
+class AdminRolePermission(Base):
+    """角色与权限点的关联。
+
+    权限点是一个最小操作单位的字符串，例如 post.review 表示审核饭帖。
+    后端每个需要权限的接口都用 require_permission("post.review") 声明，
+    未授权直接返回 403，前端隐藏按钮只作为体验优化。
+    """
+
+    __tablename__ = "admin_role_permissions"
+    __table_args__ = (
+        UniqueConstraint("role_id", "permission_code", name="uq_role_permission"),
+    )
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    role_id: Mapped[str] = mapped_column(ForeignKey("admin_roles.id"), index=True)
+    permission_code: Mapped[str] = mapped_column(String(60), index=True)
+
+
+class AdminSession(Base):
+    """管理员登录会话。
+
+    与普通用户会话分开建表，原因有三点：
+    1. 有效期更短，默认 2 小时；
+    2. 可以按管理员整体撤销；
+    3. 令牌摘要独立存储，两套令牌不能互相冒用。
+    """
+
+    __tablename__ = "admin_sessions"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    admin_id: Mapped[str] = mapped_column(ForeignKey("admin_users.id"), index=True)
+    # 数据库只保存 SHA-256 摘要，即使泄露也无法直接拿摘要当令牌使用。
+    token_digest: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AdminLoginAttempt(Base):
+    """管理员登录失败统计。
+
+    需求是“同一用户名 + 同一来源地址 10 分钟内失败 5 次，锁定 15 分钟”。
+    因此计数键是用户名与来源地址的组合，而不是只按用户名。
+    这张表是方案文档 5.1 节的实现补充：如果不落库，服务重启后锁定状态会丢失。
+    """
+
+    __tablename__ = "admin_login_attempts"
+    __table_args__ = (
+        UniqueConstraint("username", "ip", name="uq_admin_login_attempt"),
+    )
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    username: Mapped[str] = mapped_column(String(40), index=True)
+    ip: Mapped[str] = mapped_column(String(64))
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    # 本轮计数的开始时间，超过窗口后重新从 0 开始。
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    locked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class AuditLog(Base):
+    """审计日志：只追加，不修改，不删除。
+
+    记录“谁在什么时间、从哪里、对什么对象、做了什么、为什么”。
+    拒绝和下架必须填写原因，因此 reason 在业务层做强制校验。
+    before_json 与 after_json 保存变更前后的关键字段快照，
+    排查问题时不用去猜当时的数据长什么样。
+
+    应用层不提供修改和删除接口；生产环境建议数据库账号也只授予插入权限。
+    """
+
+    __tablename__ = "audit_logs"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(String(40), index=True)
+    # 操作人名称快照。即使以后改名或删除账号，历史日志仍然可读。
+    actor_name: Mapped[str] = mapped_column(String(40))
+    action: Mapped[str] = mapped_column(String(60), index=True)
+    target_type: Mapped[str] = mapped_column(String(40))
+    target_id: Mapped[str] = mapped_column(String(40), index=True)
+    reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    before_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    after_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 与接口响应头 X-Request-Id 一致，便于把一次操作和一条日志对上。
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
+class MealPost(Base):
+    __tablename__ = "meal_posts"
+    __table_args__ = (
+        UniqueConstraint("author_id", "client_request_id", name="uq_post_author_request"),
+    )
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    author_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(24))
+    review: Mapped[str] = mapped_column(String(200))
+    source: Mapped[str] = mapped_column(String(20), index=True)
+    image_asset_ids: Mapped[list[str]] = mapped_column(JSON)
+    author_recipe: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    platform_recipe_id: Mapped[str | None] = mapped_column(
+        ForeignKey("recipes.id"), nullable=True
+    )
+    takeaway_store: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    dine_in_address: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    coarse_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    coarse_lng: Mapped[float | None] = mapped_column(Float, nullable=True)
+    coarse_area: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending_review", index=True)
+    # 审核记录：谁审的、什么时候审的、拒绝或下架的原因。
+    # reviewed_by 指向管理员表，但不做级联删除，历史审核记录必须保留。
+    reviewed_by: Mapped[str | None] = mapped_column(
+        ForeignKey("admin_users.id"), nullable=True, index=True
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    review_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    client_request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class Recipe(Base):
+    __tablename__ = "recipes"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    title: Mapped[str] = mapped_column(String(40))
+    cover_url: Mapped[str] = mapped_column(String(255))
+    total_minutes: Mapped[int] = mapped_column(Integer)
+    tool_codes: Mapped[list[str]] = mapped_column(JSON)
+    category_codes: Mapped[list[str]] = mapped_column(JSON)
+    servings: Mapped[float] = mapped_column(Float, default=1)
+    main_ingredients: Mapped[list[str]] = mapped_column(JSON)
+    ingredients: Mapped[list[dict]] = mapped_column(JSON)
+    steps: Mapped[list[str]] = mapped_column(JSON)
+    preconditions: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    content_origin: Mapped[str] = mapped_column(String(20), default="platform")
+    validation_status: Mapped[str] = mapped_column(String(20), default="tested")
+    status: Mapped[str] = mapped_column(String(20), default="published", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RecipeCategory(Base):
+    __tablename__ = "recipe_categories"
+    __table_args__ = (UniqueConstraint("recipe_id", "code", name="uq_recipe_category"),)
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    recipe_id: Mapped[str] = mapped_column(ForeignKey("recipes.id"), index=True)
+    code: Mapped[str] = mapped_column(String(20), index=True)
+
+
+class Like(Base):
+    __tablename__ = "likes"
+    __table_args__ = (UniqueConstraint("account_id", "post_id", name="uq_like_account_post"),)
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    post_id: Mapped[str] = mapped_column(ForeignKey("meal_posts.id"), index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    risk_status: Mapped[str] = mapped_column(String(20), default="valid")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class Favorite(Base):
+    __tablename__ = "favorites"
+    __table_args__ = (
+        UniqueConstraint("account_id", "target_type", "target_id", name="uq_favorite_target"),
+    )
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    target_type: Mapped[str] = mapped_column(String(20))
+    target_id: Mapped[str] = mapped_column(String(40))
+    saved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class MediaAsset(Base):
+    __tablename__ = "media_assets"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    mime: Mapped[str] = mapped_column(String(40))
+    bytes: Mapped[int] = mapped_column(Integer)
+    width: Mapped[int] = mapped_column(Integer)
+    height: Mapped[int] = mapped_column(Integer)
+    storage_key: Mapped[str] = mapped_column(String(255))
+    thumb_key: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(20), default="ready")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AIUsage(Base):
+    __tablename__ = "ai_usage"
+    __table_args__ = (UniqueConstraint("subject_ref", "usage_date", name="uq_ai_usage_subject"),)
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    subject_ref: Mapped[str] = mapped_column(String(80), index=True)
+    usage_date: Mapped[date] = mapped_column(Date, index=True)
+    count: Mapped[int] = mapped_column(Integer, default=0)

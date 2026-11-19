@@ -1,0 +1,51 @@
+[project]
+name = "mealmate-api"
+version = "0.1.0"
+description = "MealMate API：饭帖、菜谱、互动、登录与 AI 网关"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "SQLAlchemy[asyncio]>=2.0.36",
+    "aiosqlite>=0.20",
+    "asyncpg>=0.30",
+    "python-multipart>=0.0.12",
+    "Pillow>=11.0",
+    "cryptography>=43",
+    # 管理员密码哈希：Argon2id 实现，故意消耗内存与计算时间，抗暴力破解。
+    "argon2-cffi>=23.1",
+    "httpx>=0.27",
+    "redis>=5.2",
+    # Windows 不自带 IANA 时区库，zoneinfo 需要 tzdata。
+    "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+# FastAPI 依赖注入习惯用 Depends(...) 作为默认值，B008 属于误报。
+ignore = ["B008"]

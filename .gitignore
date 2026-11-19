@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# 本地数据与上传
+server/mealmate_dev.db
+server/mealmate_dev.db-*
+server/media/uploads/
+.env
+*.log
+
+# 本地工具链（如临时解压的 Flutter SDK）
+tools/
+
+# 交互原型仓库（独立 Git 项目，远程为 Hu-Xiaodong/mealmate）
+/mealmate/
+
+# Node / uni-app
+node_modules/
+app_mini/dist/
+app_mini/unpackage/
+app_admin/dist/
+*.local
+
+# Flutter
+app_flutter/.dart_tool/
+app_flutter/build/
+app_flutter/.flutter-plugins
+app_flutter/.flutter-plugins-dependencies
+app_flutter/ios/Pods/
+app_flutter/ios/.symlinks/
+app_flutter/android/.gradle/
+app_flutter/android/local.properties
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store

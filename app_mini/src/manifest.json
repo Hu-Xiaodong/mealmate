@@ -1,0 +1,30 @@
+{
+  "name": "MealMate",
+  "appid": "",
+  "description": "记录今天的饭，找到下一顿的灵感",
+  "versionName": "1.0.0",
+  "versionCode": "100",
+  "transformPx": false,
+  "app-plus": {
+    "usingComponents": true,
+    "nvueStyleCompiler": "uni-app",
+    "compilerVersion": 3,
+    "distribute": {
+      "android": { "permissions": [] },
+      "ios": {},
+      "sdkConfigs": {}
+    }
+  },
+  "h5": {
+    "title": "MealMate",
+    "router": { "mode": "hash" },
+    "optimization": { "treeShaking": { "enable": false } }
+  },
+  "mp-weixin": {
+    "appid": "",
+    "setting": { "urlCheck": false, "es6": true, "minified": true },
+    "usingComponents": true
+  },
+  "mp-alipay": { "usingComponents": true },
+  "vueVersion": "3"
+}
