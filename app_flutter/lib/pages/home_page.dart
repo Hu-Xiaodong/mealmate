@@ -7,7 +7,6 @@ import '../core/location.dart';
 import '../core/login_gate.dart';
 import '../theme/app_theme.dart';
 import '../widgets/ai_assistant.dart';
-import '../widgets/app_header.dart';
 import '../widgets/empty_state.dart';
 import '../widgets/post_grid_tile.dart';
 import 'post_detail_page.dart';
@@ -147,11 +146,6 @@ class _HomePageState extends State<HomePage> {
           children: [
             Column(
               children: [
-                AppHeader(
-                  title: '今天吃啥',
-                  compact: true,
-                  action: _publishAction(),
-                ),
                 Expanded(
                   child: RefreshIndicator(
                     color: AppColors.primary,
@@ -159,7 +153,7 @@ class _HomePageState extends State<HomePage> {
                     child: ListView(
                       controller: _scroll,
                       physics: const AlwaysScrollableScrollPhysics(),
-                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 88),
+                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 88),
                       children: [
                         const Text(
                           '看看大家今天吃什么，给晚饭找点灵感。',
@@ -227,12 +221,13 @@ class _HomePageState extends State<HomePage> {
       onTap: _openPublish,
       behavior: HitTestBehavior.opaque,
       child: Container(
-        constraints: const BoxConstraints(minHeight: 44),
+        // 与“全部 / 附近”按钮同高、同圆角，放在同一行更像一组控件。
+        height: 44,
         padding: const EdgeInsets.symmetric(horizontal: 15),
         alignment: Alignment.center,
         decoration: BoxDecoration(
           color: AppColors.primary,
-          borderRadius: BorderRadius.circular(24),
+          borderRadius: BorderRadius.circular(22),
         ),
         child: const Row(
           mainAxisSize: MainAxisSize.min,
@@ -254,9 +249,15 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _filterChips() {
-    return Wrap(
-      spacing: 8,
-      children: [_filterChip('all', '全部'), _filterChip('near', '附近')],
+    // 全部、附近与晒饭放在同一行：左侧是筛选，右侧是发布入口。
+    return Row(
+      children: [
+        _filterChip('all', '全部'),
+        const SizedBox(width: 8),
+        _filterChip('near', '附近'),
+        const Spacer(),
+        _publishAction(),
+      ],
     );
   }
 

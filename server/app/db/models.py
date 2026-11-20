@@ -351,3 +351,65 @@ class AIUsage(Base):
     subject_ref: Mapped[str] = mapped_column(String(80), index=True)
     usage_date: Mapped[date] = mapped_column(Date, index=True)
     count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class TasteTag(Base):
+    """口味标签字典表。
+
+    为什么把标签从代码里的写死枚举搬到数据库：
+    1. 标签属于运营数据，产品想增减一个口味时不应该改代码再发版；
+    2. 前端展示哪些标签、按什么顺序展示，都以这张表为准，避免两端各写一份慢慢对不上；
+    3. 后台以后要做“标签管理”时，直接改这张表即可，接口不需要变。
+
+    为什么用 name 直接做主键而不额外造一个编号：
+    标签本身很短、天然唯一、就是业务主键，饭帖里保存的也是标签文字（JSON 数组），
+    用文字做主键可以让“饭帖里的标签”和“字典里的标签”直接对应，查询时少一次关联。
+    代价是以后改标签文字要同步改历史饭帖，但口味标签基本不会改名，可以接受。
+
+    对比方案：
+    - 代码里的 Literal 枚举：简单，但每次调整都要发版，运营无法自助；
+    - 枚举字典表（本方案）：可运营、可排序、可停用，成本很低，是公司里最常见的做法；
+    - 独立标签表 + 饭帖标签关联表（多对多）：适合标签数量成百上千、需要按标签统计热度的场景，
+      当前只有不到二十个固定标签，用 JSON 数组存饭帖标签已经够用，没必要提前拆表。
+    """
+
+    __tablename__ = "taste_tags"
+
+    # 标签文字，例如“香辣”。主键保证不会出现两条同名标签。
+    name: Mapped[str] = mapped_column(String(20), primary_key=True)
+    # 展示顺序，数字越小越靠前。前端按这个字段升序排列。
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    # 是否启用。停用后不再下发给前端，也不能被新饭帖选用。
+    # 为什么用“停用”而不是直接删除：历史饭帖里可能还在引用这个标签，
+    # 直接删行会让历史数据变成“查不到的标签”，排查问题时很麻烦。
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class UserLocation(Base):
+    """用户最近一次定位结果，每个账号只保留一条。
+
+    用途：用户没有开启手机定位时，退而使用上一次成功定位的位置，
+    保证“外卖 / 到店”选店铺时仍然有一个可用的地图中心点。
+
+    为什么只保留一条“最新”记录，而不是保存定位历史流水：
+    - 业务上只需要“最近一次在哪”，旧位置没有使用场景；
+    - 一条记录用主键直接覆盖更新，读写都是常数级，不需要清理历史数据；
+    - 定位属于敏感个人信息，少存即少风险，能不留历史就不留。
+
+    为什么 account_id 直接做主键：一个账号只能有一条最新定位，
+    主键天然保证唯一，插入时不需要先查再判断，直接覆盖即可。
+    """
+
+    __tablename__ = "user_locations"
+
+    account_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    # 纬度、经度。使用双精度浮点（Double Precision）保存，
+    # 与饭帖里的坐标字段保持一致，避免不同表精度不同导致对不上。
+    lat: Mapped[float] = mapped_column(Float)
+    lng: Mapped[float] = mapped_column(Float)
+    # 逆地址解析出的区域名称，例如“上海市徐汇区”。可能为空（定位服务不返回或解析失败）。
+    area: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )

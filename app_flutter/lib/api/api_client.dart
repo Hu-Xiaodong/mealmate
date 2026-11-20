@@ -329,6 +329,45 @@ class ApiClient {
         : const [];
   }
 
+  /// 口味标签字典。
+  ///
+  /// 标签由后端数据库维护，客户端不再写死选项：
+  /// 产品调整标签时只改数据库，App 不需要发新版本。
+  Future<List<String>> tasteTags() async {
+    final data = await _request('/api/v1/taste-tags');
+    final items = data['items'];
+    if (items is! List) return const [];
+    return items
+        .whereType<Map<String, dynamic>>()
+        .map((item) => item['name'] as String? ?? '')
+        .where((name) => name.isNotEmpty)
+        .toList(growable: false);
+  }
+
+  /// 当前账号最近一次保存的定位；没有记录时返回 null。
+  Future<Coordinates?> myLocation() async {
+    final data = await _request('/api/v1/me/location');
+    final location = data['location'];
+    if (location is! Map<String, dynamic>) return null;
+    final lat = (location['lat'] as num?)?.toDouble();
+    final lng = (location['lng'] as num?)?.toDouble();
+    if (lat == null || lng == null) return null;
+    return Coordinates(lat: lat, lng: lng);
+  }
+
+  /// 保存“我最近一次定位”，供下次无法获取手机定位时兜底。
+  Future<void> saveMyLocation({
+    required double lat,
+    required double lng,
+    String? area,
+  }) async {
+    await _request(
+      '/api/v1/me/location',
+      method: 'PUT',
+      body: {'lat': lat, 'lng': lng, 'area': area},
+    );
+  }
+
   /// 拼好静态地图地址，直接交给 `Image.network`，无需下载字节。
   String staticMapUrl({
     required double lat,

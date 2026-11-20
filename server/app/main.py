@@ -13,7 +13,7 @@ from app.api.router import api_router
 from app.core.config import settings
 from app.core.errors import register_error_handlers, request_id_ctx
 from app.core.responses import ok
-from app.db.seed import seed_admin_data, seed_demo_data
+from app.db.seed import seed_admin_data, seed_demo_data, seed_taste_tags
 from app.db.session import SessionLocal, init_db
 from app.services.cache import close_cache
 
@@ -25,6 +25,10 @@ logger = logging.getLogger("mealmate")
 async def lifespan(_: FastAPI):
     Path(settings.media_root).mkdir(parents=True, exist_ok=True)
     await init_db()
+    # 口味标签字典是页面的基础数据，必须无条件补齐：
+    # 它不依赖演示数据开关，生产环境第一次启动也需要这 9 个默认标签。
+    async with SessionLocal() as db:
+        await seed_taste_tags(db)
     if settings.seed_demo_data and settings.app_env != "prod":
         async with SessionLocal() as db:
             await seed_demo_data(db)

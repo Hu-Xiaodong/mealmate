@@ -48,8 +48,6 @@ async function logout() {
 
 <template>
   <view class="page">
-    <AppHeader title="我的" subtitle="记录与收藏，都在这里" />
-
     <view v-if="!session.isLoggedIn" class="guest card">
       <view class="guest-mark">
         <text class="guest-text">饭</text>

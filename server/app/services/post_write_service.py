@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.serializers import iso, media_url
 from app.core.config import settings
 from app.core.errors import AppError
-from app.db.models import MealPost, MediaAsset, User
+from app.db.models import MealPost, MediaAsset, TasteTag, User
 from app.schemas import CreatePostRequest, DraftPostRequest
 from app.utils.time import now_utc
 
@@ -49,6 +49,38 @@ async def validate_image_assets(
     ).all()
     if len(assets) != len(asset_ids):
         raise AppError("IMAGE_NOT_OWNED", "图片不存在或不属于当前账号，请重新上传")
+
+
+async def validate_taste_tags(db: AsyncSession, tags: list[str]) -> None:
+    """按数据库字典校验口味标签。
+
+    为什么不在请求模型里做：
+    合法标签由数据库表决定，而请求模型只是数据格式定义，拿不到数据库会话；
+    把校验放在服务层，可以让“发布”“存草稿”“改草稿”“草稿发布”四个入口共用同一套规则。
+
+    为什么只接受“已启用”的标签：
+    运营停用某个标签后，新内容不应该再选它；但历史饭帖里已经存在的标签保持原样，
+    既不影响历史展示，也避免用户打开旧草稿时被强制清空。
+    """
+    if not tags:
+        # 标签是选填项，没选就无需查库。
+        return
+    valid = set(
+        (
+            await db.scalars(
+                select(TasteTag.name).where(
+                    TasteTag.enabled.is_(True), TasteTag.name.in_(tags)
+                )
+            )
+        ).all()
+    )
+    unknown = [tag for tag in tags if tag not in valid]
+    if unknown:
+        raise AppError(
+            "TASTE_TAG_INVALID",
+            f"口味标签不可用：{'、'.join(unknown)}",
+            status_code=422,
+        )
 
 
 def _apply_common_fields(
@@ -117,6 +149,9 @@ async def create_post(
     与旧版的区别只是多校验了图片、多了人均价格、口味标签与店铺坐标；
     状态仍由 AUTO_PUBLISH_POSTS 决定，演示环境直接发布，正式环境进入待审核。
     """
+    # 先校验标签再校验图片：标签是一次轻量查库，图片校验更重；
+    # 参数本身不合法时尽早返回，避免白做后面的查询。
+    await validate_taste_tags(db, body.taste_tags)
     await validate_image_assets(db, user.id, body.image_asset_ids)
     publish = settings.auto_publish_posts
     post = MealPost(
@@ -158,6 +193,7 @@ async def create_draft(db: AsyncSession, user: User, body: DraftPostRequest) -> 
     草稿不要求图片、菜名、评价完整，用户可以先存一半，之后再回来继续写。
     但图片只要传了就必须属于当前用户，避免草稿阶段就出现越权引用。
     """
+    await validate_taste_tags(db, body.taste_tags)
     await validate_image_assets(db, user.id, body.image_asset_ids)
     post = MealPost(
         id=f"p_{secrets.token_hex(8)}",
@@ -212,6 +248,7 @@ async def update_draft(
     if post.status != "draft":
         raise AppError("POST_NOT_DRAFT", "只有草稿可以这样编辑", status_code=400)
 
+    await validate_taste_tags(db, body.taste_tags)
     await validate_image_assets(db, user.id, body.image_asset_ids)
     _apply_common_fields(
         post,
@@ -244,6 +281,7 @@ async def publish_draft(
     if post.status != "draft":
         raise AppError("POST_NOT_DRAFT", "这条饭帖不是草稿，无需再次发布", status_code=400)
 
+    await validate_taste_tags(db, body.taste_tags)
     await validate_image_assets(db, user.id, body.image_asset_ids)
     _apply_common_fields(
         post,

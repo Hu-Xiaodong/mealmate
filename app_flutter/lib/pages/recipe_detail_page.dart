@@ -77,7 +77,7 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
         bottom: false,
         child: Column(
           children: [
-            AppHeader(title: '菜谱', subtitle: subtitle, showBack: true),
+            AppHeader(subtitle: subtitle, showBack: true),
             Expanded(
               child: _loading && recipe == null
                   ? const Center(

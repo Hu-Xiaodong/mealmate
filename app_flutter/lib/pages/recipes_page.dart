@@ -4,7 +4,6 @@ import '../api/api_client.dart';
 import '../api/models.dart';
 import '../core/format.dart';
 import '../theme/app_theme.dart';
-import '../widgets/app_header.dart';
 import '../widgets/empty_state.dart';
 import '../widgets/recipe_card_tile.dart';
 import 'recipe_detail_page.dart';
@@ -105,12 +104,11 @@ class _RecipesPageState extends State<RecipesPage> {
         bottom: false,
         child: Column(
           children: [
-            const AppHeader(title: '菜谱', subtitle: '平台试做 · 可核实的简单做法'),
             SizedBox(
               height: 48,
               child: SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.fromLTRB(20, 8, 20, 10),
+                padding: const EdgeInsets.fromLTRB(20, 12, 20, 10),
                 child: Row(
                   children: [
                     for (final item in _categories) ...[

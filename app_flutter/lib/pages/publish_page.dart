@@ -3,6 +3,7 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../api/api_client.dart';
@@ -16,7 +17,7 @@ import '../widgets/app_header.dart';
 import '../widgets/common.dart';
 import '../widgets/empty_state.dart';
 import '../widgets/segmented_tabs.dart';
-import 'post_detail_page.dart';
+import 'store_map_page.dart';
 
 class PublishPage extends StatefulWidget {
   const PublishPage({super.key, this.draftId});
@@ -39,18 +40,6 @@ class _PickedImage {
 }
 
 class _PublishPageState extends State<PublishPage> {
-  static const List<String> _tasteOptions = [
-    '清淡',
-    '正常',
-    '香辣',
-    '酸甜',
-    '咸鲜',
-    '油炸',
-    '烧烤',
-    '汤羹',
-    '面食',
-  ];
-
   final ImagePicker _picker = ImagePicker();
   final TextEditingController _title = TextEditingController();
   final TextEditingController _review = TextEditingController();
@@ -58,17 +47,21 @@ class _PublishPageState extends State<PublishPage> {
   final TextEditingController _address = TextEditingController();
   final TextEditingController _ingredients = TextEditingController();
   final TextEditingController _steps = TextEditingController();
-  final TextEditingController _area = TextEditingController();
   final TextEditingController _price = TextEditingController();
-  final TextEditingController _placeKeyword = TextEditingController();
 
   List<_PickedImage> _images = const [];
   int _uploading = 0;
   String _source = 'self';
   bool _recipeOpen = false;
-  bool _locationOpen = false;
+
+  /// 外卖 / 到店使用的定位。来源有两种：手机当前定位，或后端保存的历史定位。
   Coordinates? _coords;
+
+  /// 地图选中的店铺坐标。地图里没找到店铺时为 null，但名称仍然可以提交。
+  Place? _storePlace;
+
   bool _submitting = false;
+  bool _resolvingLocation = false;
   String _idempotencyKey = _makeKey();
 
   String? _draftId;
@@ -76,17 +69,26 @@ class _PublishPageState extends State<PublishPage> {
   bool _savingDraft = false;
   List<String> _taste = const [];
 
-  bool _mapEnabled = false;
-  bool _searching = false;
-  List<Place> _places = const [];
-  Place? _place;
+  /// 口味标签选项改为后端接口下发，客户端不再写死。
+  List<String> _tasteOptions = const [];
+  bool _loadingTaste = false;
+  String? _tasteError;
 
   @override
   void initState() {
     super.initState();
     _draftId = widget.draftId;
-    if (_draftId != null) _loadDraft();
-    _loadMapConfig();
+    _bootstrap();
+  }
+
+  /// 启动时依次加载标签字典和草稿。
+  /// 标签加载失败不能阻塞草稿编辑：[_loadTasteTags] 自己吞掉错误并展示重试入口。
+  Future<void> _bootstrap() async {
+    await _loadTasteTags();
+    // 标签加载期间用户可能已经离开页面，不能再对已销毁的页面调用 setState。
+    if (!mounted) return;
+    final draftId = _draftId;
+    if (draftId != null) await _loadDraft();
   }
 
   @override
@@ -97,9 +99,7 @@ class _PublishPageState extends State<PublishPage> {
     _address.dispose();
     _ingredients.dispose();
     _steps.dispose();
-    _area.dispose();
     _price.dispose();
-    _placeKeyword.dispose();
     super.dispose();
   }
 
@@ -114,21 +114,168 @@ class _PublishPageState extends State<PublishPage> {
       _uploading == 0 &&
       _images.isNotEmpty;
 
-  Future<void> _loadMapConfig() async {
+  Future<void> _loadTasteTags() async {
+    setState(() => _loadingTaste = true);
     try {
-      final enabled = await apiClient.mapEnabled();
+      final tags = await apiClient.tasteTags();
       if (!mounted) return;
-      setState(() => _mapEnabled = enabled);
-    } on ApiException {
-      // 配置接口失败时按“地图不可用”处理，手动填写店名/地址仍可正常发布。
+      setState(() {
+        _tasteOptions = tags;
+        _tasteError = null;
+      });
+    } on ApiException catch (error) {
       if (!mounted) return;
-      setState(() => _mapEnabled = false);
+      setState(() => _tasteError = error.message);
+    } finally {
+      if (mounted) setState(() => _loadingTaste = false);
     }
+  }
+
+  /// 口味标签的展示列表。
+  ///
+  /// 除了接口下发的字典，还要把“草稿里已经选中、但字典里已停用”的旧标签带上，
+  /// 否则用户打开旧草稿会看不到自己选过的标签，也无法取消它。
+  List<String> get _visibleTasteOptions {
+    final missing = _taste.where((tag) => !_tasteOptions.contains(tag));
+    return [..._tasteOptions, ...missing];
+  }
+
+  /// 解析外卖 / 到店要用的定位。
+  ///
+  /// 顺序严格按需求：
+  /// 1. 手机已开启定位 → 取当前位置，并异步写入后端作为“最新定位”；
+  /// 2. 手机没开启定位 → 读取后端保存的历史定位；
+  /// 3. 两者都没有 → 弹框提示开启定位，用户确认后跳系统定位设置。
+  ///
+  /// [force] 为 true 时忽略页面上已缓存的坐标，重新走一遍检查。
+  Future<Coordinates?> _resolveLocation({bool force = false}) async {
+    if (!force && _coords != null) return _coords;
+    if (_resolvingLocation) return null;
+    setState(() => _resolvingLocation = true);
+    try {
+      final current = await currentLocationIfPermitted();
+      if (current != null) {
+        if (mounted) setState(() => _coords = current);
+        // 写入历史定位失败不影响本次发布，所以不等待、不提示。
+        apiClient.saveMyLocation(lat: current.lat, lng: current.lng).ignore();
+        return current;
+      }
+      final history = await apiClient.myLocation();
+      if (history != null) {
+        if (mounted) setState(() => _coords = history);
+        return history;
+      }
+      if (mounted) await _showLocationRequiredDialog();
+      return null;
+    } on ApiException catch (error) {
+      if (mounted) showError(context, error, '定位获取失败');
+      return null;
+    } finally {
+      if (mounted) setState(() => _resolvingLocation = false);
+    }
+  }
+
+  Future<void> _showLocationRequiredDialog() async {
+    final openSettings = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('请先开启手机定位'),
+        content: const Text('外卖和到店需要用当前位置查找附近店铺。开启定位后再回来试试。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('去开启'),
+          ),
+        ],
+      ),
+    );
+    if (openSettings != true) return;
+
+    // 分两种情况：
+    // - 系统定位总开关没开：跳系统“位置信息”设置页；
+    // - 总开关已开但 App 没权限：永久拒绝只能去应用设置，普通拒绝可以直接再次申请。
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      final opened = await Geolocator.openLocationSettings();
+      if (!opened) await Geolocator.openAppSettings();
+      return;
+    }
+    final permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.deniedForever) {
+      await Geolocator.openAppSettings();
+    } else {
+      await Geolocator.requestPermission();
+    }
+  }
+
+  /// 切换来源：自己做不需要定位；外卖 / 到店必须先拿到定位。
+  Future<void> _selectSource(String value) async {
+    if (value == _source) return;
+    if (value == 'self') {
+      setState(() {
+        _source = 'self';
+        _coords = null;
+        _storePlace = null;
+        _store.clear();
+        _address.clear();
+      });
+      return;
+    }
+    final coords = await _resolveLocation(force: true);
+    if (!mounted || coords == null) return;
+    setState(() {
+      _source = value;
+      _storePlace = null;
+      _store.clear();
+      _address.clear();
+    });
+  }
+
+  /// 打开全屏地图选点页，并把结果回填到店名 / 地址字段。
+  Future<void> _openStoreMap() async {
+    final coords = _coords ?? await _resolveLocation();
+    if (!mounted || coords == null) return;
+    // 先收起键盘，避免输入法窗口残留影响地图页的全屏布局。
+    FocusScope.of(context).unfocus();
+    final isTakeaway = _source == 'takeaway';
+    final initial = isTakeaway ? _store.text.trim() : _address.text.trim();
+    final result = await Navigator.of(context).push<StoreMapResult>(
+      MaterialPageRoute(
+        builder: (_) => StoreMapPage(
+          center: coords,
+          initialKeyword: initial,
+          title: isTakeaway ? '选择店家' : '选择店铺地址',
+        ),
+      ),
+    );
+    if (!mounted || result == null) return;
+    setState(() {
+      _storePlace = result.place;
+      if (isTakeaway) {
+        _store.text = _clampText(result.name, 80);
+      } else {
+        _address.text = _clampText(
+          result.address.isEmpty ? result.name : result.address,
+          160,
+        );
+      }
+    });
+  }
+
+  /// 后端对店名限 80 字、地址限 160 字；程序赋值不会触发输入框的 maxLength，
+  /// 所以这里手动截断，避免提交时被后端判为超长。
+  static String _clampText(String value, int maxLength) {
+    final text = value.trim();
+    return text.length <= maxLength ? text : text.substring(0, maxLength);
   }
 
   Future<void> _loadDraft() async {
     final draftId = _draftId;
-    if (draftId == null) return;
+    if (draftId == null || !mounted) return;
     setState(() => _loadingDraft = true);
     try {
       final draft = await apiClient.myDraft(draftId);
@@ -156,12 +303,10 @@ class _PublishPageState extends State<PublishPage> {
         }
         final location = draft.location;
         if (location != null) {
-          _locationOpen = true;
           _coords = Coordinates(lat: location.lat, lng: location.lng);
-          _area.text = location.area ?? '';
         }
         final storeLocation = draft.storeLocation;
-        _place = storeLocation == null
+        _storePlace = storeLocation == null
             ? null
             : Place(
                 id: storeLocation.poiId ?? '',
@@ -269,23 +414,6 @@ class _PublishPageState extends State<PublishPage> {
     });
   }
 
-  Future<void> _toggleLocation() async {
-    if (_locationOpen) {
-      setState(() => _locationOpen = false);
-      return;
-    }
-    try {
-      final coords = await locateCoarse();
-      if (!mounted) return;
-      setState(() {
-        _coords = coords;
-        _locationOpen = true;
-      });
-    } on LocationFailure catch (error) {
-      if (mounted) showMessage(context, error.message);
-    }
-  }
-
   void _toggleTaste(String tag) {
     if (_taste.contains(tag)) {
       setState(() => _taste = _taste.where((item) => item != tag).toList());
@@ -296,64 +424,6 @@ class _PublishPageState extends State<PublishPage> {
       return;
     }
     setState(() => _taste = [..._taste, tag]);
-  }
-
-  Future<void> _searchPlaces() async {
-    final keyword = _placeKeyword.text.trim();
-    if (keyword.isEmpty) {
-      showMessage(context, '先输入店名再搜索');
-      return;
-    }
-    if (!_locationOpen || _coords == null) {
-      showMessage(context, '先开启下方“公开大概位置”再搜索店铺');
-      return;
-    }
-    if (_searching) return;
-    setState(() => _searching = true);
-    try {
-      final items = await apiClient.searchPlaces(
-        keyword: keyword,
-        lat: _locationOpen ? _coords?.lat : null,
-        lng: _locationOpen ? _coords?.lng : null,
-      );
-      if (!mounted) return;
-      setState(() => _places = items);
-    } on ApiException catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _places = const [];
-        if (error.status == 503) _mapEnabled = false;
-      });
-      if (error.status == 503) {
-        showMessage(context, '地图暂不可用，可手动填写地址');
-      } else {
-        showError(context, error, '搜索店铺失败');
-      }
-    } finally {
-      if (mounted) setState(() => _searching = false);
-    }
-  }
-
-  void _selectPlace(Place place) {
-    setState(() {
-      _place = place;
-      _places = const [];
-      if (_source == 'takeaway') {
-        _store.text = place.name;
-      } else if (_source == 'dine_in') {
-        _address.text = place.address.isEmpty
-            ? place.name
-            : '${place.name} · ${place.address}';
-      }
-    });
-  }
-
-  String _placeLabel() {
-    final place = _place;
-    if (place == null) return '';
-    if (place.name.isNotEmpty) return place.name;
-    if (_source == 'takeaway') return _store.text.trim();
-    return _address.text.trim();
   }
 
   List<String> _parseLines(String text) {
@@ -370,7 +440,7 @@ class _PublishPageState extends State<PublishPage> {
     final recipe = _recipeOpen && ingredients.isNotEmpty && steps.isNotEmpty
         ? {'ingredients': ingredients, 'steps': steps}
         : null;
-    final place = _place;
+    final place = _storePlace;
     final storeLocation = _source != 'self' && place != null
         ? StoreLocation(
             lat: place.lat,
@@ -389,11 +459,13 @@ class _PublishPageState extends State<PublishPage> {
       'avgPrice': int.tryParse(_price.text.trim()),
       'tasteTags': _taste,
       'storeLocation': storeLocation,
-      'location': _locationOpen && _coords != null
+      // 外卖 / 到店会自动带上定位：它同时作为饭帖的“大概位置”，
+      // 让首页「附近」仍然能按距离推荐。精度由后端统一降到三位小数。
+      'location': _source != 'self' && _coords != null
           ? {
               'lat': _coords!.lat,
               'lng': _coords!.lng,
-              'area': _area.text.trim().isEmpty ? null : _area.text.trim(),
+              'area': null,
               'publicConsent': true,
             }
           : null,
@@ -452,6 +524,12 @@ class _PublishPageState extends State<PublishPage> {
       showMessage(context, '至少上传 1 张图片');
       return;
     }
+    if (_source != 'self') {
+      // 正常流程在点击来源时已经拿到定位；这里再兜一次底，
+      // 防止用户打开旧草稿后直接发布、而草稿里没有保存定位。
+      final coords = await _resolveLocation();
+      if (!mounted || coords == null) return;
+    }
     if (_source == 'takeaway' && _store.text.trim().isEmpty) {
       showMessage(context, '外卖来源需要填写店家名称');
       return;
@@ -478,22 +556,46 @@ class _PublishPageState extends State<PublishPage> {
           : await apiClient.publishDraft(draftId, payload);
       if (draftId == null) _idempotencyKey = _makeKey();
       if (!mounted) return;
-      if (result.reviewRequired) {
-        showMessage(context, '已提交审核');
-        Navigator.of(context).pop();
-      } else {
-        showMessage(context, '发布成功');
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute<void>(
-            builder: (_) => PostDetailPage(postId: result.postId),
-          ),
-        );
-      }
+      // 提示和返回同时发生：先插入浮层，再立刻返回上一页。
+      // 浮层挂在 Navigator 的 Overlay 上，不会随发布页一起销毁，会在上一页继续淡出。
+      _showPublishResult(result.reviewRequired ? '已提交审核' : '发布成功');
+      Navigator.of(context).pop();
     } on ApiException catch (error) {
       if (mounted) showError(context, error);
     } finally {
       if (mounted) setState(() => _submitting = false);
     }
+  }
+
+  /// 发布结果提示：屏幕上方居中，淡入、停留、淡出，结束后自动移除。
+  ///
+  /// 为什么用 Overlay：
+  /// 1. SnackBar 固定在屏幕底部，不满足位置要求；
+  /// 2. showDialog 会阻塞用户并需要点确认；
+  /// 3. 浮层挂在 Navigator 的 Overlay 上，发布页返回后还能继续显示。
+  void _showPublishResult(String message) {
+    final overlay = Overlay.of(context);
+    late final OverlayEntry entry;
+    entry = OverlayEntry(
+      builder: (context) {
+        return Positioned(
+          top: MediaQuery.sizeOf(context).height * 0.12,
+          left: 0,
+          right: 0,
+          child: IgnorePointer(
+            child: Center(
+              child: _PublishResultToast(
+                message: message,
+                onFinished: () {
+                  if (entry.mounted) entry.remove();
+                },
+              ),
+            ),
+          ),
+        );
+      },
+    );
+    overlay.insert(entry);
   }
 
   @override
@@ -504,11 +606,7 @@ class _PublishPageState extends State<PublishPage> {
         bottom: false,
         child: Column(
           children: [
-            const AppHeader(
-              title: '发布今天的饭',
-              subtitle: '真实的一餐，比精致的摆拍更有用',
-              showBack: true,
-            ),
+            const AppHeader(showBack: true),
             Expanded(
               child: sessionStore.isLoggedIn ? _form() : _guest(),
             ),
@@ -547,12 +645,6 @@ class _PublishPageState extends State<PublishPage> {
           _priceTasteSection(),
           const SizedBox(height: 14),
           _recipeSection(),
-          const SizedBox(height: 14),
-          if (_mapEnabled && _source != 'self') ...[
-            _storeSearchSection(),
-            const SizedBox(height: 14),
-          ],
-          _locationSection(),
           const SizedBox(height: 18),
           PrimaryButton(
             label: _submitting ? '发布中…' : '发布',
@@ -784,7 +876,7 @@ class _PublishPageState extends State<PublishPage> {
           const SizedBox(height: 8),
           SegmentedTabs<String>(
             selected: _source,
-            onSelected: (value) => setState(() => _source = value),
+            onSelected: _selectSource,
             trackColor: AppColors.bg,
             options: const [
               SegmentOption('self', '自己做'),
@@ -796,22 +888,28 @@ class _PublishPageState extends State<PublishPage> {
             const SizedBox(height: 12),
             const _Label('店家名称'),
             const SizedBox(height: 8),
-            TextField(
-              controller: _store,
-              maxLength: 80,
-              decoration: _inputDecoration('例如：街角便当'),
-              style: const TextStyle(fontSize: 15, color: AppColors.text),
+            _storePicker(
+              hint: '点击进入地图选择店家',
+              value: _store.text.trim(),
+              onTap: _resolvingLocation ? null : _openStoreMap,
+              onClear: () => setState(() {
+                _store.clear();
+                _storePlace = null;
+              }),
             ),
           ],
           if (_source == 'dine_in') ...[
             const SizedBox(height: 12),
             const _Label('店铺地址'),
             const SizedBox(height: 8),
-            TextField(
-              controller: _address,
-              maxLength: 160,
-              decoration: _inputDecoration('例如：演示路 12 号 · 老友粉店'),
-              style: const TextStyle(fontSize: 15, color: AppColors.text),
+            _storePicker(
+              hint: '点击进入地图选择店铺地址',
+              value: _address.text.trim(),
+              onTap: _resolvingLocation ? null : _openStoreMap,
+              onClear: () => setState(() {
+                _address.clear();
+                _storePlace = null;
+              }),
             ),
           ],
         ],
@@ -841,20 +939,51 @@ class _PublishPageState extends State<PublishPage> {
           Row(
             children: [
               const Expanded(child: _Label('口味标签（最多 3 个）')),
-              Text(
-                '${_taste.length}/3',
-                style: const TextStyle(fontSize: 12, color: AppColors.faint),
-              ),
+              if (_loadingTaste)
+                const SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.6,
+                    color: AppColors.primary,
+                  ),
+                )
+              else
+                Text(
+                  '${_taste.length}/3',
+                  style: const TextStyle(fontSize: 12, color: AppColors.faint),
+                ),
             ],
           ),
           const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              for (final tag in _tasteOptions) _tasteChip(tag),
-            ],
-          ),
+          if (_tasteError != null) ...[
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    '口味标签加载失败：$_tasteError',
+                    style: const TextStyle(fontSize: 12, color: AppColors.muted),
+                  ),
+                ),
+                TextButton(
+                  onPressed: _loadingTaste ? null : _loadTasteTags,
+                  child: const Text('重试'),
+                ),
+              ],
+            ),
+          ] else if (!_loadingTaste && _tasteOptions.isEmpty)
+            const Text(
+              '暂时没有可选的口味标签',
+              style: TextStyle(fontSize: 12, color: AppColors.faint),
+            )
+          else
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final tag in _visibleTasteOptions) _tasteChip(tag),
+              ],
+            ),
         ],
       ),
     );
@@ -887,180 +1016,57 @@ class _PublishPageState extends State<PublishPage> {
     );
   }
 
-  Widget _storeSearchSection() {
-    final place = _place;
-    return SectionCard(
-      margin: EdgeInsets.zero,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
-            '搜索店铺',
-            style: TextStyle(
-              fontSize: 15,
-              fontWeight: FontWeight.w700,
-              color: AppColors.text,
-            ),
-          ),
-          const SizedBox(height: 4),
-          const Text(
-            '先开启下方「公开大概位置」，搜索会按你附近 1 公里查找；选中后自动回填名称和地址。',
-            style: TextStyle(fontSize: 12, color: AppColors.muted, height: 1.55),
-          ),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _placeKeyword,
-                  textInputAction: TextInputAction.search,
-                  onSubmitted: (_) => _searchPlaces(),
-                  decoration: _inputDecoration(
-                    _source == 'takeaway' ? '例如：老友粉店' : '例如：商场里的粉店',
-                  ),
-                  style: const TextStyle(fontSize: 14, color: AppColors.text),
-                ),
-              ),
-              const SizedBox(width: 8),
-              GestureDetector(
-                onTap: _searching ? null : _searchPlaces,
-                behavior: HitTestBehavior.opaque,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 12,
-                  ),
-                  decoration: BoxDecoration(
-                    color: AppColors.primary,
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Text(
-                    _searching ? '搜索中…' : '搜索',
-                    style: const TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                      color: Colors.white,
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-          if (_places.isNotEmpty) ...[
-            const SizedBox(height: 10),
-            for (final item in _places) _placeRow(item),
-          ],
-          if (place != null) ...[
-            const SizedBox(height: 12),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(12),
-              child: AspectRatio(
-                aspectRatio: 2,
-                child: Image.network(
-                  apiClient.staticMapUrl(lat: place.lat, lng: place.lng),
-                  fit: BoxFit.cover,
-                  errorBuilder: (_, _, _) => Container(
-                    color: AppColors.peach,
-                    alignment: Alignment.center,
-                    child: const Text(
-                      '地图加载失败，可继续填写地址',
-                      style: TextStyle(fontSize: 12, color: AppColors.muted),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    _placeLabel().isEmpty ? '已选择店铺位置' : _placeLabel(),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 12,
-                      color: AppColors.muted,
-                    ),
-                  ),
-                ),
-                GestureDetector(
-                  onTap: () => setState(() {
-                    _place = null;
-                    _places = const [];
-                  }),
-                  behavior: HitTestBehavior.opaque,
-                  child: const Padding(
-                    padding: EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 4,
-                    ),
-                    child: Text(
-                      '清除',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: AppColors.primary,
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _placeRow(Place place) {
-    final distance = distanceLabel(place.distanceMeters);
+  /// 店名 / 地址选择框。
+  ///
+  /// 为什么做成“只读入口”而不是普通输入框：
+  /// 需求要求点击后进入地图页选店，名称必须来自地图结果（或用户在地图页手写确认），
+  /// 这样才能保证“名称”和“坐标”来自同一个来源。
+  Widget _storePicker({
+    required String hint,
+    required String value,
+    required VoidCallback? onTap,
+    required VoidCallback onClear,
+  }) {
+    final empty = value.isEmpty;
     return GestureDetector(
-      onTap: () => _selectPlace(place),
+      onTap: onTap,
       behavior: HitTestBehavior.opaque,
       child: Container(
-        margin: const EdgeInsets.only(bottom: 8),
-        padding: const EdgeInsets.all(10),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
         decoration: BoxDecoration(
           color: AppColors.bg,
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(12),
         ),
         child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            const Icon(Icons.map_outlined, size: 18, color: AppColors.muted),
+            const SizedBox(width: 8),
             Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    place.name,
-                    style: const TextStyle(
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
-                      color: AppColors.text,
-                    ),
-                  ),
-                  if (place.address.isNotEmpty) ...[
-                    const SizedBox(height: 3),
-                    Text(
-                      place.address,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 11,
-                        color: AppColors.faint,
-                      ),
-                    ),
-                  ],
-                ],
+              child: Text(
+                empty ? hint : value,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 14,
+                  color: empty ? AppColors.faint : AppColors.text,
+                ),
               ),
             ),
-            if (distance.isNotEmpty) ...[
-              const SizedBox(width: 8),
-              Text(
-                distance,
-                style: const TextStyle(fontSize: 11, color: AppColors.faint),
+            if (empty)
+              const Icon(
+                Icons.chevron_right,
+                size: 18,
+                color: AppColors.faint,
+              )
+            else
+              GestureDetector(
+                onTap: onClear,
+                behavior: HitTestBehavior.opaque,
+                child: const Padding(
+                  padding: EdgeInsets.only(left: 8),
+                  child: Icon(Icons.close, size: 16, color: AppColors.faint),
+                ),
               ),
-            ],
           ],
         ),
       ),
@@ -1113,83 +1119,28 @@ class _PublishPageState extends State<PublishPage> {
           ),
           if (_recipeOpen) ...[
             const SizedBox(height: 12),
-            const _Label('食材（每行一项）'),
+            const _Label('食材'),
             const SizedBox(height: 8),
             TextField(
               controller: _ingredients,
               minLines: 5,
               maxLines: 8,
               decoration: _inputDecoration(
-                '豆角 200 克\n鲜面条 150 克\n蒜 2 瓣',
+                '例如：豆角 200 克、鲜面条 150 克、蒜 2 瓣',
               ),
               style: const TextStyle(fontSize: 14, color: AppColors.text),
             ),
             const SizedBox(height: 12),
-            const _Label('步骤（每行一步）'),
+            const _Label('步骤'),
             const SizedBox(height: 8),
             TextField(
               controller: _steps,
               minLines: 5,
               maxLines: 8,
               decoration: _inputDecoration(
-                '豆角掰段炒香\n加水铺面焖 12 分钟\n拌匀收汁',
+                '例如：豆角掰段炒香，加水铺面焖 12 分钟，最后拌匀收汁',
               ),
               style: const TextStyle(fontSize: 14, color: AppColors.text),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _locationSection() {
-    return SectionCard(
-      margin: EdgeInsets.zero,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          GestureDetector(
-            onTap: _toggleLocation,
-            behavior: HitTestBehavior.opaque,
-            child: Row(
-              children: [
-                const Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        '公开大概位置',
-                        style: TextStyle(
-                          fontSize: 15,
-                          fontWeight: FontWeight.w700,
-                          color: AppColors.text,
-                        ),
-                      ),
-                      SizedBox(height: 4),
-                      Text(
-                        '开启后会出现在「附近 3 公里」，只保留百米级精度。',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: AppColors.muted,
-                          height: 1.55,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                _Toggle(value: _locationOpen),
-              ],
-            ),
-          ),
-          if (_locationOpen) ...[
-            const SizedBox(height: 12),
-            const _Label('位置描述（可选）'),
-            const SizedBox(height: 8),
-            TextField(
-              controller: _area,
-              maxLength: 80,
-              decoration: _inputDecoration('例如：徐汇区某商圈'),
-              style: const TextStyle(fontSize: 15, color: AppColors.text),
             ),
           ],
         ],
@@ -1236,34 +1187,94 @@ class _Label extends StatelessWidget {
   }
 }
 
-class _Toggle extends StatelessWidget {
-  const _Toggle({required this.value});
+/// 发布结果浮层里的提示卡片。
+///
+/// 单独做成有状态组件，是为了拿到 AnimationController 做淡入淡出：
+/// 先淡入 180 毫秒，停留 900 毫秒，再淡出 180 毫秒，结束后通知外部移除浮层。
+class _PublishResultToast extends StatefulWidget {
+  const _PublishResultToast({required this.message, required this.onFinished});
 
-  final bool value;
+  final String message;
+  final VoidCallback onFinished;
+
+  @override
+  State<_PublishResultToast> createState() => _PublishResultToastState();
+}
+
+class _PublishResultToastState extends State<_PublishResultToast>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 180),
+  );
+
+  late final Animation<double> _opacity = CurvedAnimation(
+    parent: _controller,
+    curve: Curves.easeOut,
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    _play();
+  }
+
+  Future<void> _play() async {
+    await _controller.forward();
+    await Future<void>.delayed(const Duration(milliseconds: 900));
+    if (!mounted) return;
+    await _controller.reverse();
+    if (mounted) widget.onFinished();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 180),
-      width: 44,
-      height: 26,
-      padding: const EdgeInsets.all(3),
-      decoration: BoxDecoration(
-        color: value ? AppColors.primary : AppColors.line,
-        borderRadius: BorderRadius.circular(13),
-      ),
-      child: AnimatedAlign(
-        duration: const Duration(milliseconds: 180),
-        alignment: value ? Alignment.centerRight : Alignment.centerLeft,
+    return FadeTransition(
+      opacity: _opacity,
+      child: Material(
+        color: Colors.transparent,
         child: Container(
-          width: 20,
-          height: 20,
-          decoration: const BoxDecoration(
-            color: Colors.white,
-            shape: BoxShape.circle,
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+          decoration: BoxDecoration(
+            color: AppColors.card,
+            borderRadius: BorderRadius.circular(14),
+            boxShadow: const [
+              BoxShadow(
+                color: Colors.black26,
+                blurRadius: 16,
+                offset: Offset(0, 6),
+              ),
+            ],
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.check_circle,
+                size: 20,
+                color: AppColors.primary,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                widget.message,
+                style: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: AppColors.text,
+                ),
+              ),
+            ],
           ),
         ),
       ),
     );
   }
 }
+
+

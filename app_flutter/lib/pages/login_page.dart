@@ -128,11 +128,7 @@ class _LoginPageState extends State<LoginPage> {
         bottom: false,
         child: Column(
           children: [
-            const AppHeader(
-              title: '手机号登录',
-              subtitle: '登录后可点赞、收藏与发布',
-              showBack: true,
-            ),
+            const AppHeader(showBack: true),
             Expanded(
               child: SingleChildScrollView(
                 padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),

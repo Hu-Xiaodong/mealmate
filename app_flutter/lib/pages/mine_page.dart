@@ -5,7 +5,6 @@ import '../core/format.dart';
 import '../core/login_gate.dart';
 import '../session/session_store.dart';
 import '../theme/app_theme.dart';
-import '../widgets/app_header.dart';
 import 'favorites_page.dart';
 import 'my_posts_page.dart';
 import 'publish_page.dart';
@@ -48,7 +47,6 @@ class MinePage extends StatelessWidget {
           builder: (context, _) {
             return Column(
               children: [
-                const AppHeader(title: '我的', subtitle: '记录与收藏，都在这里'),
                 Expanded(
                   child: SingleChildScrollView(
                     padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),

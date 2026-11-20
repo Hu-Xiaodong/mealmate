@@ -371,7 +371,7 @@ async def test_post_price_tags_and_store_location(client):
         "imageAssetIds": [media["assetId"]],
         "takeawayStore": "测试小馆",
         "avgPrice": 35,
-        "tasteTags": ["微辣", "重口下饭"],
+        "tasteTags": ["香辣", "咸鲜"],
         "storeLocation": {"lat": 31.2299, "lng": 121.4711, "poiId": "B0TEST001"},
         # 重复标签会被去重，保留用户选择的顺序。
         "location": {"lat": 31.2299, "lng": 121.4711, "area": "测试商圈", "publicConsent": True},
@@ -385,7 +385,7 @@ async def test_post_price_tags_and_store_location(client):
     )
     detail = data_of(await client.get(f"{API}/posts/{created['postId']}"))
     assert detail["avgPrice"] == 35
-    assert detail["tasteTags"] == ["微辣", "重口下饭"]
+    assert detail["tasteTags"] == ["香辣", "咸鲜"]
     assert detail["storeLocation"] == {
         "lat": 31.2299,
         "lng": 121.4711,
@@ -406,19 +406,71 @@ async def test_taste_tags_are_limited_and_validated(client):
     }
     too_many = await client.post(
         f"{API}/posts",
-        json={**base, "tasteTags": ["清淡", "微辣", "特辣", "酸甜"]},
+        json={**base, "tasteTags": ["清淡", "香辣", "酸甜", "咸鲜"]},
         headers={**headers, "Idempotency-Key": "publish-tags-0002"},
     )
     assert too_many.status_code == 422
     assert too_many.json()["code"] == "VALIDATION_FAILED"
 
+    # 数量合法但字典里没有的标签，由服务层查数据库后拒绝。
     unknown = await client.post(
         f"{API}/posts",
         json={**base, "tasteTags": ["超级辣"]},
         headers={**headers, "Idempotency-Key": "publish-tags-0003"},
     )
     assert unknown.status_code == 422
-    assert unknown.json()["code"] == "VALIDATION_FAILED"
+    assert unknown.json()["code"] == "TASTE_TAG_INVALID"
+
+
+async def test_taste_tag_dictionary_is_served_in_order(client):
+    """口味标签由数据库字典下发，顺序与种子数据一致。"""
+    data = data_of(await client.get(f"{API}/taste-tags"))
+    assert [item["name"] for item in data["items"]] == [
+        "清淡",
+        "正常",
+        "香辣",
+        "酸甜",
+        "咸鲜",
+        "油炸",
+        "烧烤",
+        "汤羹",
+        "面食",
+    ]
+    assert [item["sortOrder"] for item in data["items"]] == list(range(1, 10))
+
+
+async def test_my_location_history_is_per_account(client):
+    """最近定位：未保存时为空，保存后可读回，且不同账号互相隔离。"""
+    first = await login(client)
+    headers = auth_headers(first["token"])
+
+    empty = data_of(await client.get(f"{API}/me/location", headers=headers))
+    assert empty["location"] is None
+
+    saved = data_of(
+        await client.put(
+            f"{API}/me/location",
+            json={"lat": 31.2299123, "lng": 121.4711456, "area": "徐汇区"},
+            headers=headers,
+        )
+    )
+    # 经纬度保留 6 位小数，区域名称原样返回。
+    assert saved["location"]["lat"] == 31.229912
+    assert saved["location"]["lng"] == 121.471146
+    assert saved["location"]["area"] == "徐汇区"
+    assert saved["location"]["updatedAt"]
+
+    again = data_of(await client.get(f"{API}/me/location", headers=headers))
+    assert again["location"]["lat"] == 31.229912
+
+    # 换一个账号登录，读到的仍然是自己的“没有记录”。
+    second = await login(client, phone="13800000002")
+    other = data_of(
+        await client.get(
+            f"{API}/me/location", headers=auth_headers(second["token"])
+        )
+    )
+    assert other["location"] is None
 
 
 async def test_draft_create_update_and_publish(client):

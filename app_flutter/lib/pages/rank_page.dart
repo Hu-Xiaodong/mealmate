@@ -4,7 +4,6 @@ import '../api/api_client.dart';
 import '../api/models.dart';
 import '../core/format.dart';
 import '../theme/app_theme.dart';
-import '../widgets/app_header.dart';
 import '../widgets/empty_state.dart';
 import 'post_detail_page.dart';
 
@@ -60,14 +59,13 @@ class _RankPageState extends State<RankPage> {
         bottom: false,
         child: Column(
           children: [
-            const AppHeader(title: '今日热榜', compact: true),
             Expanded(
               child: RefreshIndicator(
                 color: AppColors.primary,
                 onRefresh: _load,
                 child: ListView(
                   physics: const AlwaysScrollableScrollPhysics(),
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
                   children: [
                     const Text(
                       '今日点赞 TOP20',

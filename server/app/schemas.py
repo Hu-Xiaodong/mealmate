@@ -43,21 +43,13 @@ class LocationInput(CamelModel):
     public_consent: bool = False
 
 
-# 口味标签使用固定枚举，而不是让用户自由输入。
-# 原因：自由输入会产生“辣”“有点辣”“微辣口”等同义标签，无法筛选也无法统计。
-# 新增口味时必须同时改后端枚举与前端选项，保证两端永远一致。
-TasteTag = Literal[
-    "清淡",
-    "重口下饭",
-    "微辣",
-    "特辣",
-    "酸甜",
-    "咸鲜",
-    "油炸",
-    "烧烤",
-    "汤羹",
-    "面食",
-]
+# 口味标签不再写成代码里的固定枚举：
+# 标签是可运营的数据，改由数据库字典表 taste_tags 统一维护，
+# 后端在写入时按数据库里“已启用”的标签做校验。
+# 为什么请求体里仍然用字符串列表而不是直接信任客户端：
+# 字符串只是“传输格式”，真正的合法性以数据库为准，避免客户端伪造不存在的标签。
+# 自由输入同样不允许：用户只能从前端展示的字典里选，保证标签可筛选、可统计。
+TasteTagText = str
 
 
 class StoreLocationInput(CamelModel):
@@ -118,7 +110,7 @@ class CreatePostRequest(CamelModel):
     location: LocationInput | None = None
     # 人均价格，单位元。上限 9999 是为了挡住误输入，例如把手机号填进来。
     avg_price: int | None = Field(default=None, ge=0, le=9999)
-    taste_tags: list[TasteTag] = Field(default_factory=list, max_length=3)
+    taste_tags: list[TasteTagText] = Field(default_factory=list, max_length=3)
     store_location: StoreLocationInput | None = None
 
     @model_validator(mode="after")
@@ -172,7 +164,7 @@ class DraftPostRequest(CamelModel):
     dine_in_address: str | None = Field(default=None, max_length=160)
     location: LocationInput | None = None
     avg_price: int | None = Field(default=None, ge=0, le=9999)
-    taste_tags: list[TasteTag] = Field(default_factory=list, max_length=3)
+    taste_tags: list[TasteTagText] = Field(default_factory=list, max_length=3)
     store_location: StoreLocationInput | None = None
 
     @model_validator(mode="after")
@@ -191,6 +183,18 @@ class DraftPostRequest(CamelModel):
             store_location=self.store_location,
         )
         return self
+
+
+class SaveLocationRequest(CamelModel):
+    """保存“我最近一次定位”的请求体。
+
+    只接收经纬度和可选的区域名称，不接收用户编号：
+    用户编号从登录令牌里取，客户端无法替别人保存定位。
+    """
+
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    area: str | None = Field(default=None, max_length=80)
 
 
 class LikeRequest(CamelModel):

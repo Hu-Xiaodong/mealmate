@@ -135,7 +135,6 @@ class _PostDetailPageState extends State<PostDetailPage> {
         child: Column(
           children: [
             AppHeader(
-              title: '饭帖',
               subtitle: detail == null ? '' : timeLabel(detail.publishedAt),
               showBack: true,
             ),

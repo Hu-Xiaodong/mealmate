@@ -118,11 +118,7 @@ class _FavoritesPageState extends State<FavoritesPage> {
         bottom: false,
         child: Column(
           children: [
-            const AppHeader(
-              title: '我的收藏',
-              subtitle: '想再吃一次的味道',
-              showBack: true,
-            ),
+            const AppHeader(showBack: true),
             Expanded(
               child: !sessionStore.isLoggedIn
                   ? SingleChildScrollView(

@@ -187,8 +187,6 @@ class _MyPostsPageState extends State<MyPostsPage> {
         child: Column(
           children: [
             AppHeader(
-              title: '我的发布',
-              subtitle: '记录每一顿认真吃过的饭',
               showBack: true,
               action: GestureDetector(
                 onTap: _goPublish,

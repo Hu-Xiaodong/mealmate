@@ -21,6 +21,7 @@ from app.db.models import (
     MediaAsset,
     Recipe,
     RecipeCategory,
+    TasteTag,
     User,
 )
 from app.utils.time import business_day_bounds, now_utc
@@ -317,7 +318,7 @@ POSTS = [
         "dine_in_address": "演示路 12 号 · 老友粉店",
         "author_recipe": None,
         "avg_price": 26,
-        "taste_tags": ["重口下饭", "汤羹"],
+        "taste_tags": ["香辣", "汤羹"],
         "store_lat": 31.2286,
         "store_lng": 121.469,
         "store_poi_id": "demo-poi-002",
@@ -374,7 +375,7 @@ POSTS = [
         "takeaway_store": "楼下小馆",
         "author_recipe": None,
         "avg_price": 24,
-        "taste_tags": ["重口下饭"],
+        "taste_tags": ["香辣"],
         "store_lat": 31.2318,
         "store_lng": 121.4752,
         "store_poi_id": "demo-poi-003",
@@ -406,7 +407,44 @@ LIKE_COUNTS = {
 }
 
 
+# 口味标签的初始字典，与旧前端页面里展示的 9 个选项完全一致。
+# 顺序即展示顺序，写入 sort_order；以后运营调整顺序或停用标签只需改数据库。
+TASTE_TAG_NAMES = [
+    "清淡",
+    "正常",
+    "香辣",
+    "酸甜",
+    "咸鲜",
+    "油炸",
+    "烧烤",
+    "汤羹",
+    "面食",
+]
+
+
+async def seed_taste_tags(db: AsyncSession) -> None:
+    """补齐口味标签字典。
+
+    为什么单独做成一个函数、并且在应用启动时无条件调用：
+    1. 字典是基础数据，新环境第一次启动就必须有，否则前端拿不到任何标签；
+    2. 只插入“缺失的”标签，不覆盖已有记录，避免把运营在后台改过的顺序或启用状态冲掉；
+    3. 演示数据函数可能因为“库里已有用户”提前返回，所以不能把字典初始化只放在它里面。
+    """
+    existing = set((await db.scalars(select(TasteTag.name))).all())
+    added = False
+    for order, name in enumerate(TASTE_TAG_NAMES, start=1):
+        if name in existing:
+            continue
+        db.add(TasteTag(name=name, sort_order=order, enabled=True))
+        added = True
+    if added:
+        await db.commit()
+
+
 async def seed_demo_data(db: AsyncSession) -> None:
+    # 先补字典，再判断演示用户是否存在：
+    # 字典属于基础数据，即使演示数据已经初始化过，也要保证它是最新的。
+    await seed_taste_tags(db)
     exists = await db.scalar(select(func.count(User.id)))
     if exists:
         return
