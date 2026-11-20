@@ -12,6 +12,10 @@ os.environ["DEV_AUTH_CODE"] = "123456"
 os.environ["AI_PROVIDER"] = "mock"
 os.environ["SEED_DEMO_DATA"] = "true"
 os.environ["RANK_CACHE_SECONDS"] = "10"
+# 测试不访问真实地图服务：把腾讯地图 Key 与 Secret Key 都置空，
+# 用例只验证“未配置时的降级行为”，避免误用本机 .env 里的真实密钥。
+os.environ["TENCENT_MAP_KEY"] = ""
+os.environ["TENCENT_MAP_SECRET_KEY"] = ""
 os.environ["MEDIA_ROOT"] = Path(tempfile.mkdtemp(prefix="mealmate-media-")).as_posix()
 # 测试固定一个管理员初始密码，登录用例不依赖本机 .env。
 os.environ["ADMIN_INITIAL_USERNAME"] = "admin"

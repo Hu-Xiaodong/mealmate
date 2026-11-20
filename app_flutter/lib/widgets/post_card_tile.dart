@@ -12,12 +12,14 @@ class PostCardTile extends StatelessWidget {
     required this.post,
     required this.onTap,
     this.onLike,
+    this.onDelete,
     this.showDistance = false,
   });
 
   final PostCard post;
   final VoidCallback onTap;
   final VoidCallback? onLike;
+  final VoidCallback? onDelete;
   final bool showDistance;
 
   @override
@@ -78,6 +80,27 @@ class PostCardTile extends StatelessWidget {
                       ],
                     ),
                   ),
+                  if (onDelete != null)
+                    Positioned(
+                      top: 12,
+                      right: 12,
+                      child: GestureDetector(
+                        onTap: onDelete,
+                        behavior: HitTestBehavior.opaque,
+                        child: Container(
+                          padding: const EdgeInsets.all(6),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.4),
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(
+                            Icons.delete_outline,
+                            size: 16,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    ),
                 ],
               ),
             ),

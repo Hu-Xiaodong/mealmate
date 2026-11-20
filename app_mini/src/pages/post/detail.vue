@@ -2,7 +2,7 @@
 import { onLoad } from "@dcloudio/uni-app";
 import { computed, ref } from "vue";
 
-import { api } from "../../api/client";
+import { api, mapStaticUrl } from "../../api/client";
 import type { AIChatResult, PostDetail } from "../../api/types";
 import AppHeader from "../../components/AppHeader.vue";
 import EmptyState from "../../components/EmptyState.vue";
@@ -16,6 +16,13 @@ const aiOpen = ref(false);
 const aiMessage = ref("");
 const aiSending = ref(false);
 const aiResult = ref<AIChatResult | null>(null);
+const mapBroken = ref(false);
+
+const storeMapUrl = computed(() => {
+  const store = post.value?.storeLocation;
+  if (!store) return "";
+  return mapStaticUrl({ lat: store.lat, lng: store.lng, zoom: 16, width: 640, height: 320 });
+});
 
 const recipeTitle = computed(() => {
   if (!post.value) return "";
@@ -99,6 +106,19 @@ function openRecipe(id: string) {
   uni.navigateTo({ url: `/pages/recipe/detail?id=${id}` });
 }
 
+function openNavigation() {
+  const current = post.value;
+  const store = current?.storeLocation;
+  if (!current || !store) return;
+  uni.openLocation({
+    latitude: store.lat,
+    longitude: store.lng,
+    name: current.takeawayStore || current.title,
+    address: current.dineInAddress || current.takeawayStore || current.coarseArea || "",
+    fail: () => uni.showToast({ title: "打开地图失败", icon: "none" }),
+  });
+}
+
 onLoad((options) => {
   const id = options?.id;
   if (!id) {
@@ -153,6 +173,30 @@ onLoad((options) => {
         <view v-if="post.coarseArea" class="info-row">
           <text class="info-label">附近</text>
           <text class="info-value">{{ post.coarseArea }}</text>
+        </view>
+        <view v-if="post.avgPrice !== null && post.avgPrice !== undefined" class="info-row">
+          <text class="info-label">人均</text>
+          <text class="info-value">¥{{ post.avgPrice }}</text>
+        </view>
+        <view v-if="post.tasteTags && post.tasteTags.length" class="tag-row">
+          <text v-for="tag in post.tasteTags" :key="tag" class="tag">{{ tag }}</text>
+        </view>
+      </view>
+
+      <view v-if="post.storeLocation" class="card">
+        <text class="section-title">店铺位置</text>
+        <image
+          v-if="!mapBroken"
+          class="store-map"
+          :src="storeMapUrl"
+          mode="aspectFill"
+          @error="mapBroken = true"
+        />
+        <view v-else class="map-fallback">
+          <text class="map-fallback-text">地图暂不可用</text>
+        </view>
+        <view class="nav-btn" @tap="openNavigation">
+          <text class="nav-btn-text">打开地图导航</text>
         </view>
       </view>
 
@@ -353,6 +397,63 @@ onLoad((options) => {
   font-size: 13px;
   color: var(--c-text);
   flex: 1;
+}
+
+.tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--c-line);
+}
+
+.tag {
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: var(--c-peach);
+  color: var(--c-primary-deep);
+  font-size: 11px;
+}
+
+.store-map {
+  display: block;
+  width: 100%;
+  height: 180px;
+  margin-top: 10px;
+  border-radius: 12px;
+  background: var(--c-peach);
+}
+
+.map-fallback {
+  height: 180px;
+  margin-top: 10px;
+  border-radius: 12px;
+  background: var(--c-peach);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.map-fallback-text {
+  font-size: 12px;
+  color: var(--c-primary-deep);
+}
+
+.nav-btn {
+  margin-top: 12px;
+  padding: 11px 0;
+  border-radius: 999px;
+  background: var(--c-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.nav-btn-text {
+  font-size: 13px;
+  font-weight: 600;
+  color: #ffffff;
 }
 
 .section-head {

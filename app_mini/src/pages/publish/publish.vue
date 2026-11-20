@@ -1,19 +1,39 @@
 <script setup lang="ts">
-import { onShow } from "@dcloudio/uni-app";
+import { onLoad, onShow } from "@dcloudio/uni-app";
 import { computed, ref } from "vue";
 
-import { api, uploadImage } from "../../api/client";
-import type { CreatePostPayload, Source } from "../../api/types";
+import { ApiError, api, mapStaticUrl, uploadImage } from "../../api/client";
+import type {
+  CreatePostPayload,
+  DraftPayload,
+  PlaceItem,
+  Source,
+  StoreLocation,
+} from "../../api/types";
 import AppHeader from "../../components/AppHeader.vue";
 import EmptyState from "../../components/EmptyState.vue";
+import { resolveMedia } from "../../config";
 import { useSessionStore } from "../../stores/session";
-import { showError } from "../../utils/format";
+import { distanceLabel, showError } from "../../utils/format";
 import { requireLogin } from "../../utils/gate";
 
 interface PickedImage {
   assetId: string;
   preview: string;
 }
+
+const TASTE_TAGS = [
+  "清淡",
+  "重口下饭",
+  "微辣",
+  "特辣",
+  "酸甜",
+  "咸鲜",
+  "油炸",
+  "烧烤",
+  "汤羹",
+  "面食",
+];
 
 const session = useSessionStore();
 
@@ -24,6 +44,8 @@ const review = ref("");
 const source = ref<Source>("self");
 const store = ref("");
 const address = ref("");
+const avgPrice = ref("");
+const tasteTags = ref<string[]>([]);
 const recipeOpen = ref(false);
 const ingredientText = ref("");
 const stepText = ref("");
@@ -34,6 +56,17 @@ const submitting = ref(false);
 const redirected = ref(false);
 const idempotencyKey = ref(makeKey());
 
+const draftId = ref("");
+const draftLoading = ref(false);
+const savingDraft = ref(false);
+
+const mapsEnabled = ref(false);
+const keyword = ref("");
+const places = ref<PlaceItem[]>([]);
+const searching = ref(false);
+const storeLocation = ref<StoreLocation | null>(null);
+const mapPreviewFailed = ref(false);
+
 const SOURCES: { value: Source; label: string }[] = [
   { value: "self", label: "自己做" },
   { value: "takeaway", label: "外卖" },
@@ -41,8 +74,26 @@ const SOURCES: { value: Source; label: string }[] = [
 ];
 
 const canSubmit = computed(
-  () => session.isLoggedIn && !submitting.value && uploading.value === 0 && images.value.length > 0,
+  () =>
+    session.isLoggedIn &&
+    !submitting.value &&
+    !draftLoading.value &&
+    uploading.value === 0 &&
+    images.value.length > 0,
 );
+
+const mapPreviewUrl = computed(() => {
+  const picked = storeLocation.value;
+  if (!picked) return "";
+  return mapStaticUrl({ lat: picked.lat, lng: picked.lng, zoom: 16, width: 640, height: 320 });
+});
+
+const placeName = computed(() => {
+  if (!storeLocation.value) return "";
+  if (source.value === "takeaway") return store.value.trim();
+  if (source.value === "dine_in") return address.value.trim();
+  return "";
+});
 
 function makeKey(): string {
   return `pub-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -52,12 +103,70 @@ function toast(message: string) {
   uni.showToast({ title: message, icon: "none" });
 }
 
+onLoad((options) => {
+  void loadMapConfig();
+  const id = options?.id;
+  if (id) {
+    draftId.value = id;
+    void loadDraft(id);
+  }
+});
+
 onShow(() => {
   if (!session.isLoggedIn && !redirected.value) {
     redirected.value = true;
     requireLogin();
   }
 });
+
+async function loadMapConfig() {
+  try {
+    const config = await api.mapConfig();
+    mapsEnabled.value = Boolean(config.enabled);
+  } catch {
+    // 配置读取失败时退回手动填写，不阻塞发布。
+    mapsEnabled.value = false;
+  }
+}
+
+async function loadDraft(id: string) {
+  draftLoading.value = true;
+  try {
+    const draft = await api.draft(id);
+    title.value = draft.title || "";
+    review.value = draft.review || "";
+    source.value = draft.source || "self";
+    store.value = draft.takeawayStore || "";
+    address.value = draft.dineInAddress || "";
+    avgPrice.value =
+      draft.avgPrice === null || draft.avgPrice === undefined ? "" : String(draft.avgPrice);
+    tasteTags.value = draft.tasteTags || [];
+
+    const ingredients = draft.authorRecipe?.ingredients || [];
+    const steps = draft.authorRecipe?.steps || [];
+    ingredientText.value = ingredients.join("\n");
+    stepText.value = steps.join("\n");
+    recipeOpen.value = ingredients.length > 0 || steps.length > 0;
+
+    const urls = draft.images || [];
+    images.value = (draft.imageAssetIds || []).map((assetId, index) => ({
+      assetId,
+      preview: resolveMedia(urls[index] || ""),
+    }));
+
+    if (draft.location) {
+      coords.value = { lat: draft.location.lat, lng: draft.location.lng };
+      area.value = draft.location.area || "";
+      locationOpen.value = true;
+    }
+    storeLocation.value = draft.storeLocation || null;
+    mapPreviewFailed.value = false;
+  } catch (error) {
+    showError(error, "草稿加载失败");
+  } finally {
+    draftLoading.value = false;
+  }
+}
 
 function goLogin() {
   uni.navigateTo({ url: "/pages/login/login" });
@@ -120,6 +229,27 @@ function toggleLocation() {
   });
 }
 
+function onPriceInput(event: { detail: { value: string } }) {
+  const digits = String(event.detail.value || "")
+    .replace(/\D/g, "")
+    .slice(0, 4);
+  avgPrice.value = digits;
+  return digits;
+}
+
+function toggleTag(tag: string) {
+  const index = tasteTags.value.indexOf(tag);
+  if (index >= 0) {
+    tasteTags.value.splice(index, 1);
+    return;
+  }
+  if (tasteTags.value.length >= 3) {
+    toast("最多选择 3 个口味标签");
+    return;
+  }
+  tasteTags.value.push(tag);
+}
+
 function parseLines(text: string): string[] {
   return text
     .split("\n")
@@ -127,12 +257,128 @@ function parseLines(text: string): string[] {
     .filter(Boolean);
 }
 
+function parsedPrice(): number | null {
+  const text = avgPrice.value.trim();
+  if (!text) return null;
+  return Number(text);
+}
+
+async function searchPlaces() {
+  const text = keyword.value.trim();
+  if (!text) {
+    toast("先输入店铺关键词");
+    return;
+  }
+  if (searching.value) return;
+  searching.value = true;
+  try {
+    const page = await api.searchPlaces({
+      keyword: text,
+      lat: locationOpen.value && coords.value ? coords.value.lat : undefined,
+      lng: locationOpen.value && coords.value ? coords.value.lng : undefined,
+      limit: 10,
+    });
+    places.value = page.items || [];
+    if (!places.value.length) toast("没有找到相关店铺");
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 503) {
+      toast("地图暂不可用，可手动填写地址");
+    } else {
+      showError(error, "搜索店铺失败");
+    }
+  } finally {
+    searching.value = false;
+  }
+}
+
+function selectPlace(place: PlaceItem) {
+  storeLocation.value = { lat: place.lat, lng: place.lng, poiId: place.id };
+  mapPreviewFailed.value = false;
+  if (source.value === "takeaway") {
+    store.value = place.name;
+  } else if (source.value === "dine_in") {
+    address.value = `${place.name} ${place.address}`.trim();
+  }
+  places.value = [];
+}
+
+function reselectPlace() {
+  storeLocation.value = null;
+  places.value = [];
+}
+
+function clearPlace() {
+  storeLocation.value = null;
+  places.value = [];
+  keyword.value = "";
+}
+
+function buildLocation() {
+  return locationOpen.value && coords.value
+    ? {
+        lat: coords.value.lat,
+        lng: coords.value.lng,
+        area: area.value.trim() || null,
+        publicConsent: true,
+      }
+    : null;
+}
+
+function buildAuthorRecipe() {
+  const ingredients = parseLines(ingredientText.value);
+  const steps = parseLines(stepText.value);
+  return recipeOpen.value && ingredients.length && steps.length ? { ingredients, steps } : null;
+}
+
+function buildStoreLocation(): StoreLocation | null {
+  return source.value === "self" ? null : storeLocation.value;
+}
+
+async function saveDraft() {
+  if (!session.isLoggedIn) {
+    goLogin();
+    return;
+  }
+  if (savingDraft.value || submitting.value) return;
+  if (uploading.value > 0) {
+    toast("图片还在上传，请稍候");
+    return;
+  }
+
+  const payload: DraftPayload = {
+    title: title.value.trim(),
+    review: review.value.trim(),
+    source: source.value,
+    imageAssetIds: images.value.map((item) => item.assetId),
+    authorRecipe: buildAuthorRecipe(),
+    takeawayStore: source.value === "takeaway" ? store.value.trim() || null : null,
+    dineInAddress: source.value === "dine_in" ? address.value.trim() || null : null,
+    location: buildLocation(),
+    avgPrice: parsedPrice(),
+    tasteTags: tasteTags.value,
+    storeLocation: buildStoreLocation(),
+  };
+
+  savingDraft.value = true;
+  try {
+    const result = draftId.value
+      ? await api.updateDraft(draftId.value, payload)
+      : await api.createDraft(payload);
+    draftId.value = result.postId;
+    toast("草稿已保存");
+  } catch (error) {
+    showError(error, "草稿保存失败");
+  } finally {
+    savingDraft.value = false;
+  }
+}
+
 async function submit() {
   if (!session.isLoggedIn) {
     goLogin();
     return;
   }
-  if (submitting.value) return;
+  if (submitting.value || draftLoading.value) return;
   if (uploading.value > 0) {
     toast("图片还在上传，请稍候");
     return;
@@ -159,12 +405,13 @@ async function submit() {
     toast("到店来源需要填写店铺地址");
     return;
   }
-
-  const ingredients = parseLines(ingredientText.value);
-  const steps = parseLines(stepText.value);
-  if (recipeOpen.value && (ingredients.length === 0 || steps.length === 0)) {
-    toast("作者做法需要食材和步骤一起填写");
-    return;
+  if (recipeOpen.value) {
+    const ingredients = parseLines(ingredientText.value);
+    const steps = parseLines(stepText.value);
+    if (!ingredients.length || !steps.length) {
+      toast("作者做法需要食材和步骤一起填写");
+      return;
+    }
   }
 
   const payload: CreatePostPayload = {
@@ -172,24 +419,20 @@ async function submit() {
     review: text,
     source: source.value,
     imageAssetIds: images.value.map((item) => item.assetId),
-    authorRecipe:
-      recipeOpen.value && ingredients.length && steps.length ? { ingredients, steps } : null,
+    authorRecipe: buildAuthorRecipe(),
     takeawayStore: source.value === "takeaway" ? store.value.trim() : null,
     dineInAddress: source.value === "dine_in" ? address.value.trim() : null,
-    location:
-      locationOpen.value && coords.value
-        ? {
-            lat: coords.value.lat,
-            lng: coords.value.lng,
-            area: area.value.trim() || null,
-            publicConsent: true,
-          }
-        : null,
+    avgPrice: parsedPrice(),
+    tasteTags: tasteTags.value,
+    storeLocation: buildStoreLocation(),
+    location: buildLocation(),
   };
 
   submitting.value = true;
   try {
-    const result = await api.createPost(payload, idempotencyKey.value);
+    const result = draftId.value
+      ? await api.publishDraft(draftId.value, payload)
+      : await api.createPost(payload, idempotencyKey.value);
     idempotencyKey.value = makeKey();
     if (result.reviewRequired) {
       toast("已提交审核");
@@ -210,7 +453,11 @@ async function submit() {
 
 <template>
   <view class="page">
-    <AppHeader title="发布今天的饭" subtitle="真实的一餐，比精致的摆拍更有用" back />
+    <AppHeader
+      title="发布今天的饭"
+      :subtitle="draftId ? '继续编辑未完成的草稿' : '真实的一餐，比精致的摆拍更有用'"
+      back
+    />
 
     <EmptyState
       v-if="!session.isLoggedIn"
@@ -221,15 +468,15 @@ async function submit() {
     />
 
     <view v-else class="sheet">
+      <view v-if="draftLoading" class="hint-card">
+        <text class="hint-text">草稿加载中…</text>
+      </view>
+
       <view class="section card">
         <text class="section-title">这一餐的照片</text>
         <text class="section-hint">1–9 张，单张不超过 5MB。第一张会作为封面。</text>
         <view class="grid">
-          <view
-            v-for="(image, index) in images"
-            :key="image.assetId"
-            class="tile"
-          >
+          <view v-for="(image, index) in images" :key="image.assetId" class="tile">
             <image class="tile-image" :src="image.preview" mode="aspectFill" />
             <view class="remove" @tap.stop="removeImage(index)">
               <text class="remove-text">×</text>
@@ -317,6 +564,94 @@ async function submit() {
       </view>
 
       <view class="section card">
+        <view class="field">
+          <view class="label-row">
+            <text class="label">人均价格（元）</text>
+            <text class="counter">可选</text>
+          </view>
+          <input
+            :value="avgPrice"
+            class="input"
+            type="number"
+            :maxlength="4"
+            placeholder="例如：28"
+            placeholder-class="ph"
+            @input="onPriceInput"
+          />
+        </view>
+
+        <view class="field">
+          <view class="label-row">
+            <text class="label">口味标签</text>
+            <text class="counter">{{ tasteTags.length }}/3</text>
+          </view>
+          <view class="chips">
+            <view
+              v-for="tag in TASTE_TAGS"
+              :key="tag"
+              class="chip"
+              :class="{ on: tasteTags.includes(tag) }"
+              @tap="toggleTag(tag)"
+            >
+              <text>{{ tag }}</text>
+            </view>
+          </view>
+        </view>
+      </view>
+
+      <view v-if="mapsEnabled && source !== 'self'" class="section card">
+        <text class="section-title">在地图上选店铺</text>
+        <text class="section-hint">选中后会保存店铺坐标，详情页可以查看地图并一键导航。</text>
+
+        <view class="search-row">
+          <input
+            v-model="keyword"
+            class="input search-input"
+            :maxlength="40"
+            confirm-type="search"
+            placeholder="搜索店铺，例如：老友粉店"
+            placeholder-class="ph"
+            @confirm="searchPlaces"
+          />
+          <view class="search-btn" :class="{ busy: searching }" @tap="searchPlaces">
+            <text class="search-btn-text">{{ searching ? "搜索中…" : "搜索" }}</text>
+          </view>
+        </view>
+
+        <view v-if="places.length" class="place-list">
+          <view v-for="item in places" :key="item.id" class="place-item" @tap="selectPlace(item)">
+            <view class="place-info">
+              <text class="place-name">{{ item.name }}</text>
+              <text class="place-address">{{ item.address }}</text>
+            </view>
+            <text v-if="item.distanceMeters !== null" class="place-distance">
+              {{ distanceLabel(item.distanceMeters) }}
+            </text>
+          </view>
+        </view>
+
+        <view v-if="storeLocation" class="map-preview">
+          <image
+            v-if="!mapPreviewFailed"
+            class="map-image"
+            :src="mapPreviewUrl"
+            mode="aspectFill"
+            @error="mapPreviewFailed = true"
+          />
+          <view v-else class="map-fallback">
+            <text class="map-fallback-text">地图暂不可用</text>
+          </view>
+          <view class="map-foot">
+            <text class="map-name">{{ placeName || "已选店铺" }}</text>
+            <view class="map-actions">
+              <view class="map-btn" @tap="reselectPlace"><text class="map-btn-text">重新选择</text></view>
+              <view class="map-btn" @tap="clearPlace"><text class="map-btn-text">清除</text></view>
+            </view>
+          </view>
+        </view>
+      </view>
+
+      <view class="section card">
         <view class="switch-row" @tap="recipeOpen = !recipeOpen">
           <view class="switch-texts">
             <text class="section-title">补充我的做法</text>
@@ -369,8 +704,13 @@ async function submit() {
         </view>
       </view>
 
-      <view class="submit" :class="{ disabled: !canSubmit }" @tap="submit">
-        <text class="submit-text">{{ submitting ? "发布中…" : "发布" }}</text>
+      <view class="actions">
+        <view class="draft-btn" :class="{ disabled: savingDraft }" @tap="saveDraft">
+          <text class="draft-btn-text">{{ savingDraft ? "保存中…" : "存草稿" }}</text>
+        </view>
+        <view class="submit" :class="{ disabled: !canSubmit }" @tap="submit">
+          <text class="submit-text">{{ submitting ? "发布中…" : draftId ? "发布草稿" : "发布" }}</text>
+        </view>
       </view>
       <text class="footnote">发布后会先进入审核，审核通过后出现在首页与热榜。</text>
     </view>
@@ -386,6 +726,17 @@ async function submit() {
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+.hint-card {
+  padding: 12px 16px;
+  border-radius: var(--radius-lg);
+  background: var(--c-peach);
+}
+
+.hint-text {
+  font-size: 12px;
+  color: var(--c-primary-deep);
 }
 
 .card {
@@ -565,6 +916,159 @@ async function submit() {
   box-shadow: 0 2px 8px rgba(36, 36, 36, 0.06);
 }
 
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chip {
+  padding: 7px 14px;
+  border-radius: 999px;
+  background: var(--c-bg);
+  font-size: 12px;
+  color: var(--c-muted);
+  border: 1px solid transparent;
+}
+
+.chip.on {
+  background: var(--c-peach);
+  color: var(--c-primary-deep);
+  border-color: rgba(204, 70, 44, 0.4);
+  font-weight: 600;
+}
+
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.search-input {
+  flex: 1;
+}
+
+.search-btn {
+  flex-shrink: 0;
+  padding: 0 18px;
+  height: 44px;
+  border-radius: 12px;
+  background: var(--c-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.search-btn.busy {
+  opacity: 0.65;
+}
+
+.search-btn-text {
+  font-size: 13px;
+  font-weight: 600;
+  color: #ffffff;
+}
+
+.place-list {
+  display: flex;
+  flex-direction: column;
+  border-radius: 12px;
+  background: var(--c-bg);
+  overflow: hidden;
+}
+
+.place-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--c-line);
+}
+
+.place-item:last-child {
+  border-bottom: none;
+}
+
+.place-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.place-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--c-text);
+}
+
+.place-address {
+  font-size: 12px;
+  color: var(--c-muted);
+  line-height: 1.5;
+}
+
+.place-distance {
+  font-size: 11px;
+  color: var(--c-primary-deep);
+  flex-shrink: 0;
+}
+
+.map-preview {
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--c-bg);
+}
+
+.map-image {
+  width: 100%;
+  height: 160px;
+  background: var(--c-peach);
+}
+
+.map-fallback {
+  height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--c-peach);
+}
+
+.map-fallback-text {
+  font-size: 12px;
+  color: var(--c-primary-deep);
+}
+
+.map-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+}
+
+.map-name {
+  flex: 1;
+  font-size: 12px;
+  color: var(--c-text);
+}
+
+.map-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.map-btn {
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: var(--c-card);
+  border: 1px solid var(--c-line);
+}
+
+.map-btn-text {
+  font-size: 11px;
+  color: var(--c-muted);
+}
+
 .switch-row {
   display: flex;
   align-items: center;
@@ -617,8 +1121,34 @@ async function submit() {
   transform: translateX(18px);
 }
 
-.submit {
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   margin-top: 4px;
+}
+
+.draft-btn {
+  padding: 14px 22px;
+  border-radius: 999px;
+  background: var(--c-peach);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.draft-btn.disabled {
+  opacity: 0.6;
+}
+
+.draft-btn-text {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--c-primary-deep);
+}
+
+.submit {
+  flex: 1;
   padding: 14px 0;
   border-radius: 999px;
   background: var(--c-primary);

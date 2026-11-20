@@ -124,6 +124,8 @@ class ApiClient {
             headers: requestHeaders,
             body: body == null ? null : jsonEncode(body),
           );
+        case 'DELETE':
+          return _http.delete(uri, headers: requestHeaders);
         default:
           return _http.get(uri, headers: requestHeaders);
       }
@@ -277,11 +279,112 @@ class ApiClient {
     return MyPostPage.fromJson(data);
   }
 
+  Future<MyPostPage> myDrafts({String? cursor, int limit = 20}) async {
+    final data = await _request(
+      '/api/v1/me/drafts${_query({'cursor': cursor, 'limit': limit})}',
+    );
+    return MyPostPage.fromJson(data);
+  }
+
+  Future<DraftDetail> myDraft(String postId) async {
+    final data = await _request(
+      '/api/v1/me/drafts/${Uri.encodeComponent(postId)}',
+    );
+    return DraftDetail.fromJson(data);
+  }
+
   Future<FavoritePage> myFavorites({String? cursor, int limit = 20}) async {
     final data = await _request(
       '/api/v1/me/favorites${_query({'cursor': cursor, 'limit': limit})}',
     );
     return FavoritePage.fromJson(data);
+  }
+
+  /// 地图是否可用。不可用时前端退化为手动填写店名/地址。
+  Future<bool> mapEnabled() async {
+    final data = await _request('/api/v1/maps/config');
+    return data['enabled'] as bool? ?? false;
+  }
+
+  Future<List<Place>> searchPlaces({
+    required String keyword,
+    double? lat,
+    double? lng,
+    int limit = 10,
+  }) async {
+    final data = await _request(
+      '/api/v1/maps/places${_query({
+        'keyword': keyword,
+        'lat': lat,
+        'lng': lng,
+        'limit': limit,
+      })}',
+    );
+    final items = data['items'];
+    return items is List
+        ? items
+              .whereType<Map<String, dynamic>>()
+              .map(Place.fromJson)
+              .toList(growable: false)
+        : const [];
+  }
+
+  /// 拼好静态地图地址，直接交给 `Image.network`，无需下载字节。
+  String staticMapUrl({
+    required double lat,
+    required double lng,
+    int zoom = 16,
+    int width = 640,
+    int height = 320,
+  }) {
+    return '$baseUrl/api/v1/maps/static${_query({
+      'lat': lat,
+      'lng': lng,
+      'zoom': zoom,
+      'width': width,
+      'height': height,
+    })}';
+  }
+
+  Future<DraftSaveResult> createDraft(Map<String, dynamic> payload) async {
+    final data = await _request(
+      '/api/v1/posts/drafts',
+      method: 'POST',
+      body: payload,
+    );
+    return DraftSaveResult.fromJson(data);
+  }
+
+  Future<DraftSaveResult> updateDraft(
+    String postId,
+    Map<String, dynamic> payload,
+  ) async {
+    final data = await _request(
+      '/api/v1/posts/${Uri.encodeComponent(postId)}/draft',
+      method: 'PUT',
+      body: payload,
+    );
+    return DraftSaveResult.fromJson(data);
+  }
+
+  Future<PublishResult> publishDraft(
+    String postId,
+    Map<String, dynamic> payload,
+  ) async {
+    final data = await _request(
+      '/api/v1/posts/${Uri.encodeComponent(postId)}/publish',
+      method: 'POST',
+      body: payload,
+    );
+    return PublishResult.fromJson(data);
+  }
+
+  Future<DeletePostResult> deletePost(String postId) async {
+    final data = await _request(
+      '/api/v1/posts/${Uri.encodeComponent(postId)}',
+      method: 'DELETE',
+    );
+    return DeletePostResult.fromJson(data);
   }
 
   Future<PublishResult> createPost(

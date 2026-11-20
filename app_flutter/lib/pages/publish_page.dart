@@ -19,20 +19,38 @@ import '../widgets/segmented_tabs.dart';
 import 'post_detail_page.dart';
 
 class PublishPage extends StatefulWidget {
-  const PublishPage({super.key});
+  const PublishPage({super.key, this.draftId});
+
+  /// 传入草稿编号时进入“继续编辑草稿”模式。
+  final String? draftId;
 
   @override
   State<PublishPage> createState() => _PublishPageState();
 }
 
 class _PickedImage {
-  const _PickedImage({required this.assetId, required this.path});
+  const _PickedImage({required this.assetId, this.path = '', this.url});
 
   final String assetId;
+
+  /// 本地文件路径；草稿里的历史图片没有本地文件，改用 [url] 预览。
   final String path;
+  final String? url;
 }
 
 class _PublishPageState extends State<PublishPage> {
+  static const List<String> _tasteOptions = [
+    '清淡',
+    '正常',
+    '香辣',
+    '酸甜',
+    '咸鲜',
+    '油炸',
+    '烧烤',
+    '汤羹',
+    '面食',
+  ];
+
   final ImagePicker _picker = ImagePicker();
   final TextEditingController _title = TextEditingController();
   final TextEditingController _review = TextEditingController();
@@ -41,6 +59,8 @@ class _PublishPageState extends State<PublishPage> {
   final TextEditingController _ingredients = TextEditingController();
   final TextEditingController _steps = TextEditingController();
   final TextEditingController _area = TextEditingController();
+  final TextEditingController _price = TextEditingController();
+  final TextEditingController _placeKeyword = TextEditingController();
 
   List<_PickedImage> _images = const [];
   int _uploading = 0;
@@ -51,6 +71,24 @@ class _PublishPageState extends State<PublishPage> {
   bool _submitting = false;
   String _idempotencyKey = _makeKey();
 
+  String? _draftId;
+  bool _loadingDraft = false;
+  bool _savingDraft = false;
+  List<String> _taste = const [];
+
+  bool _mapEnabled = false;
+  bool _searching = false;
+  List<Place> _places = const [];
+  Place? _place;
+
+  @override
+  void initState() {
+    super.initState();
+    _draftId = widget.draftId;
+    if (_draftId != null) _loadDraft();
+    _loadMapConfig();
+  }
+
   @override
   void dispose() {
     _title.dispose();
@@ -60,6 +98,8 @@ class _PublishPageState extends State<PublishPage> {
     _ingredients.dispose();
     _steps.dispose();
     _area.dispose();
+    _price.dispose();
+    _placeKeyword.dispose();
     super.dispose();
   }
 
@@ -73,6 +113,70 @@ class _PublishPageState extends State<PublishPage> {
       !_submitting &&
       _uploading == 0 &&
       _images.isNotEmpty;
+
+  Future<void> _loadMapConfig() async {
+    try {
+      final enabled = await apiClient.mapEnabled();
+      if (!mounted) return;
+      setState(() => _mapEnabled = enabled);
+    } on ApiException {
+      // 配置接口失败时按“地图不可用”处理，手动填写店名/地址仍可正常发布。
+      if (!mounted) return;
+      setState(() => _mapEnabled = false);
+    }
+  }
+
+  Future<void> _loadDraft() async {
+    final draftId = _draftId;
+    if (draftId == null) return;
+    setState(() => _loadingDraft = true);
+    try {
+      final draft = await apiClient.myDraft(draftId);
+      if (!mounted) return;
+      setState(() {
+        _title.text = draft.title;
+        _review.text = draft.review;
+        _source = draft.source ?? 'self';
+        _store.text = draft.takeawayStore ?? '';
+        _address.text = draft.dineInAddress ?? '';
+        _price.text = draft.avgPrice?.toString() ?? '';
+        _taste = List<String>.from(draft.tasteTags);
+        _images = [
+          for (var i = 0; i < draft.imageAssetIds.length; i++)
+            _PickedImage(
+              assetId: draft.imageAssetIds[i],
+              url: i < draft.images.length ? draft.images[i] : null,
+            ),
+        ];
+        final recipe = draft.authorRecipe;
+        if (recipe != null) {
+          _recipeOpen = true;
+          _ingredients.text = recipe.ingredients.join('\n');
+          _steps.text = recipe.steps.join('\n');
+        }
+        final location = draft.location;
+        if (location != null) {
+          _locationOpen = true;
+          _coords = Coordinates(lat: location.lat, lng: location.lng);
+          _area.text = location.area ?? '';
+        }
+        final storeLocation = draft.storeLocation;
+        _place = storeLocation == null
+            ? null
+            : Place(
+                id: storeLocation.poiId ?? '',
+                name: '',
+                address: '',
+                lat: storeLocation.lat,
+                lng: storeLocation.lng,
+              );
+      });
+    } on ApiException catch (error) {
+      if (mounted) showError(context, error, '草稿加载失败');
+    } finally {
+      if (mounted) setState(() => _loadingDraft = false);
+    }
+  }
 
   Future<void> _pickImages() async {
     final remain = 9 - _images.length;
@@ -182,12 +286,146 @@ class _PublishPageState extends State<PublishPage> {
     }
   }
 
+  void _toggleTaste(String tag) {
+    if (_taste.contains(tag)) {
+      setState(() => _taste = _taste.where((item) => item != tag).toList());
+      return;
+    }
+    if (_taste.length >= 3) {
+      showMessage(context, '最多选择 3 个口味标签');
+      return;
+    }
+    setState(() => _taste = [..._taste, tag]);
+  }
+
+  Future<void> _searchPlaces() async {
+    final keyword = _placeKeyword.text.trim();
+    if (keyword.isEmpty) {
+      showMessage(context, '先输入店名再搜索');
+      return;
+    }
+    if (!_locationOpen || _coords == null) {
+      showMessage(context, '先开启下方“公开大概位置”再搜索店铺');
+      return;
+    }
+    if (_searching) return;
+    setState(() => _searching = true);
+    try {
+      final items = await apiClient.searchPlaces(
+        keyword: keyword,
+        lat: _locationOpen ? _coords?.lat : null,
+        lng: _locationOpen ? _coords?.lng : null,
+      );
+      if (!mounted) return;
+      setState(() => _places = items);
+    } on ApiException catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _places = const [];
+        if (error.status == 503) _mapEnabled = false;
+      });
+      if (error.status == 503) {
+        showMessage(context, '地图暂不可用，可手动填写地址');
+      } else {
+        showError(context, error, '搜索店铺失败');
+      }
+    } finally {
+      if (mounted) setState(() => _searching = false);
+    }
+  }
+
+  void _selectPlace(Place place) {
+    setState(() {
+      _place = place;
+      _places = const [];
+      if (_source == 'takeaway') {
+        _store.text = place.name;
+      } else if (_source == 'dine_in') {
+        _address.text = place.address.isEmpty
+            ? place.name
+            : '${place.name} · ${place.address}';
+      }
+    });
+  }
+
+  String _placeLabel() {
+    final place = _place;
+    if (place == null) return '';
+    if (place.name.isNotEmpty) return place.name;
+    if (_source == 'takeaway') return _store.text.trim();
+    return _address.text.trim();
+  }
+
   List<String> _parseLines(String text) {
     return text
         .split('\n')
         .map((line) => line.trim())
         .where((line) => line.isNotEmpty)
         .toList(growable: false);
+  }
+
+  Map<String, dynamic> _payload() {
+    final ingredients = _parseLines(_ingredients.text);
+    final steps = _parseLines(_steps.text);
+    final recipe = _recipeOpen && ingredients.isNotEmpty && steps.isNotEmpty
+        ? {'ingredients': ingredients, 'steps': steps}
+        : null;
+    final place = _place;
+    final storeLocation = _source != 'self' && place != null
+        ? StoreLocation(
+            lat: place.lat,
+            lng: place.lng,
+            poiId: place.id.isEmpty ? null : place.id,
+          ).toJson()
+        : null;
+    return {
+      'title': _title.text.trim(),
+      'review': _review.text.trim(),
+      'source': _source,
+      'imageAssetIds': _images.map((item) => item.assetId).toList(),
+      'authorRecipe': recipe,
+      'takeawayStore': _source == 'takeaway' ? _store.text.trim() : null,
+      'dineInAddress': _source == 'dine_in' ? _address.text.trim() : null,
+      'avgPrice': int.tryParse(_price.text.trim()),
+      'tasteTags': _taste,
+      'storeLocation': storeLocation,
+      'location': _locationOpen && _coords != null
+          ? {
+              'lat': _coords!.lat,
+              'lng': _coords!.lng,
+              'area': _area.text.trim().isEmpty ? null : _area.text.trim(),
+              'publicConsent': true,
+            }
+          : null,
+    };
+  }
+
+  Future<void> _saveDraft() async {
+    if (!sessionStore.isLoggedIn) {
+      await requireLogin(context);
+      if (!mounted || !sessionStore.isLoggedIn) return;
+    }
+    if (_savingDraft || _submitting) return;
+    if (_uploading > 0) {
+      showMessage(context, '图片还在上传，请稍候');
+      return;
+    }
+
+    setState(() => _savingDraft = true);
+    try {
+      final payload = _payload();
+      final draftId = _draftId;
+      final result = draftId == null
+          ? await apiClient.createDraft(payload)
+          : await apiClient.updateDraft(draftId, payload);
+      if (!mounted) return;
+      setState(() => _draftId = result.postId);
+      showMessage(context, '草稿已保存');
+    } on ApiException catch (error) {
+      if (mounted) showError(context, error, '草稿保存失败');
+    } finally {
+      if (mounted) setState(() => _savingDraft = false);
+    }
   }
 
   Future<void> _submit() async {
@@ -230,30 +468,15 @@ class _PublishPageState extends State<PublishPage> {
       return;
     }
 
-    final payload = <String, dynamic>{
-      'title': title,
-      'review': review,
-      'source': _source,
-      'imageAssetIds': _images.map((item) => item.assetId).toList(),
-      'authorRecipe': _recipeOpen && ingredients.isNotEmpty && steps.isNotEmpty
-          ? {'ingredients': ingredients, 'steps': steps}
-          : null,
-      'takeawayStore': _source == 'takeaway' ? _store.text.trim() : null,
-      'dineInAddress': _source == 'dine_in' ? _address.text.trim() : null,
-      'location': _locationOpen && _coords != null
-          ? {
-              'lat': _coords!.lat,
-              'lng': _coords!.lng,
-              'area': _area.text.trim().isEmpty ? null : _area.text.trim(),
-              'publicConsent': true,
-            }
-          : null,
-    };
+    final payload = _payload();
 
     setState(() => _submitting = true);
     try {
-      final result = await apiClient.createPost(payload, _idempotencyKey);
-      _idempotencyKey = _makeKey();
+      final draftId = _draftId;
+      final result = draftId == null
+          ? await apiClient.createPost(payload, _idempotencyKey)
+          : await apiClient.publishDraft(draftId, payload);
+      if (draftId == null) _idempotencyKey = _makeKey();
       if (!mounted) return;
       if (result.reviewRequired) {
         showMessage(context, '已提交审核');
@@ -307,6 +530,11 @@ class _PublishPageState extends State<PublishPage> {
   }
 
   Widget _form() {
+    if (_loadingDraft) {
+      return const Center(
+        child: CircularProgressIndicator(color: AppColors.primary),
+      );
+    }
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 40),
       child: Column(
@@ -316,8 +544,14 @@ class _PublishPageState extends State<PublishPage> {
           const SizedBox(height: 14),
           _textSection(),
           const SizedBox(height: 14),
+          _priceTasteSection(),
+          const SizedBox(height: 14),
           _recipeSection(),
           const SizedBox(height: 14),
+          if (_mapEnabled && _source != 'self') ...[
+            _storeSearchSection(),
+            const SizedBox(height: 14),
+          ],
           _locationSection(),
           const SizedBox(height: 18),
           PrimaryButton(
@@ -326,6 +560,8 @@ class _PublishPageState extends State<PublishPage> {
             dimmed: !_canSubmit,
             onTap: _submit,
           ),
+          const SizedBox(height: 10),
+          _draftButton(),
           const SizedBox(height: 12),
           const Text(
             '发布后会先进入审核，审核通过后出现在首页与热榜。',
@@ -337,6 +573,33 @@ class _PublishPageState extends State<PublishPage> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _draftButton() {
+    return GestureDetector(
+      onTap: _savingDraft ? null : _saveDraft,
+      behavior: HitTestBehavior.opaque,
+      child: Opacity(
+        opacity: _savingDraft ? 0.6 : 1,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 13),
+          decoration: BoxDecoration(
+            color: AppColors.peach,
+            borderRadius: BorderRadius.circular(999),
+            border: Border.all(color: AppColors.primary.withValues(alpha: 0.4)),
+          ),
+          child: Text(
+            _savingDraft ? '保存中…' : '存草稿',
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: AppColors.primaryDeep,
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -390,12 +653,7 @@ class _PublishPageState extends State<PublishPage> {
         child: Stack(
           fit: StackFit.expand,
           children: [
-            Image.file(
-              File(image.path),
-              fit: BoxFit.cover,
-              errorBuilder: (_, _, _) =>
-                  const ColoredBox(color: AppColors.peach),
-            ),
+            _imagePreview(image),
             Positioned(
               top: 4,
               right: 4,
@@ -439,6 +697,23 @@ class _PublishPageState extends State<PublishPage> {
           ],
         ),
       ),
+    );
+  }
+
+  Widget _imagePreview(_PickedImage image) {
+    if (image.path.isNotEmpty) {
+      return Image.file(
+        File(image.path),
+        fit: BoxFit.cover,
+        errorBuilder: (_, _, _) => const ColoredBox(color: AppColors.peach),
+      );
+    }
+    final url = resolveMedia(image.url);
+    if (url.isEmpty) return const ColoredBox(color: AppColors.peach);
+    return Image.network(
+      url,
+      fit: BoxFit.cover,
+      errorBuilder: (_, _, _) => const ColoredBox(color: AppColors.peach),
     );
   }
 
@@ -540,6 +815,254 @@ class _PublishPageState extends State<PublishPage> {
             ),
           ],
         ],
+      ),
+    );
+  }
+
+  Widget _priceTasteSection() {
+    return SectionCard(
+      margin: EdgeInsets.zero,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const _Label('人均价格（可选）'),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _price,
+            keyboardType: TextInputType.number,
+            inputFormatters: [
+              FilteringTextInputFormatter.digitsOnly,
+              LengthLimitingTextInputFormatter(4),
+            ],
+            decoration: _inputDecoration('例如：28（单位：元）'),
+            style: const TextStyle(fontSize: 15, color: AppColors.text),
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              const Expanded(child: _Label('口味标签（最多 3 个）')),
+              Text(
+                '${_taste.length}/3',
+                style: const TextStyle(fontSize: 12, color: AppColors.faint),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              for (final tag in _tasteOptions) _tasteChip(tag),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _tasteChip(String tag) {
+    final selected = _taste.contains(tag);
+    return GestureDetector(
+      onTap: () => _toggleTaste(tag),
+      behavior: HitTestBehavior.opaque,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 160),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: selected ? AppColors.peach : AppColors.bg,
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(
+            color: selected ? AppColors.primary : Colors.transparent,
+          ),
+        ),
+        child: Text(
+          tag,
+          style: TextStyle(
+            fontSize: 12,
+            color: selected ? AppColors.primaryDeep : AppColors.muted,
+            fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _storeSearchSection() {
+    final place = _place;
+    return SectionCard(
+      margin: EdgeInsets.zero,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            '搜索店铺',
+            style: TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w700,
+              color: AppColors.text,
+            ),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            '先开启下方「公开大概位置」，搜索会按你附近 1 公里查找；选中后自动回填名称和地址。',
+            style: TextStyle(fontSize: 12, color: AppColors.muted, height: 1.55),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _placeKeyword,
+                  textInputAction: TextInputAction.search,
+                  onSubmitted: (_) => _searchPlaces(),
+                  decoration: _inputDecoration(
+                    _source == 'takeaway' ? '例如：老友粉店' : '例如：商场里的粉店',
+                  ),
+                  style: const TextStyle(fontSize: 14, color: AppColors.text),
+                ),
+              ),
+              const SizedBox(width: 8),
+              GestureDetector(
+                onTap: _searching ? null : _searchPlaces,
+                behavior: HitTestBehavior.opaque,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    color: AppColors.primary,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Text(
+                    _searching ? '搜索中…' : '搜索',
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (_places.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            for (final item in _places) _placeRow(item),
+          ],
+          if (place != null) ...[
+            const SizedBox(height: 12),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: AspectRatio(
+                aspectRatio: 2,
+                child: Image.network(
+                  apiClient.staticMapUrl(lat: place.lat, lng: place.lng),
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, _, _) => Container(
+                    color: AppColors.peach,
+                    alignment: Alignment.center,
+                    child: const Text(
+                      '地图加载失败，可继续填写地址',
+                      style: TextStyle(fontSize: 12, color: AppColors.muted),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _placeLabel().isEmpty ? '已选择店铺位置' : _placeLabel(),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: AppColors.muted,
+                    ),
+                  ),
+                ),
+                GestureDetector(
+                  onTap: () => setState(() {
+                    _place = null;
+                    _places = const [];
+                  }),
+                  behavior: HitTestBehavior.opaque,
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
+                    child: Text(
+                      '清除',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: AppColors.primary,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _placeRow(Place place) {
+    final distance = distanceLabel(place.distanceMeters);
+    return GestureDetector(
+      onTap: () => _selectPlace(place),
+      behavior: HitTestBehavior.opaque,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: AppColors.bg,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    place.name,
+                    style: const TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                      color: AppColors.text,
+                    ),
+                  ),
+                  if (place.address.isNotEmpty) ...[
+                    const SizedBox(height: 3),
+                    Text(
+                      place.address,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: AppColors.faint,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            if (distance.isNotEmpty) ...[
+              const SizedBox(width: 8),
+              Text(
+                distance,
+                style: const TextStyle(fontSize: 11, color: AppColors.faint),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }

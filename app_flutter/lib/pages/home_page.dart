@@ -6,10 +6,10 @@ import '../core/format.dart';
 import '../core/location.dart';
 import '../core/login_gate.dart';
 import '../theme/app_theme.dart';
+import '../widgets/ai_assistant.dart';
 import '../widgets/app_header.dart';
 import '../widgets/empty_state.dart';
-import '../widgets/post_card_tile.dart';
-import '../widgets/segmented_tabs.dart';
+import '../widgets/post_grid_tile.dart';
 import 'post_detail_page.dart';
 import 'publish_page.dart';
 
@@ -29,7 +29,6 @@ class _HomePageState extends State<HomePage> {
   bool _hasMore = false;
   bool _loading = false;
   bool _firstLoaded = false;
-  String _businessDate = '';
   Coordinates? _coords;
 
   @override
@@ -81,7 +80,6 @@ class _HomePageState extends State<HomePage> {
       );
       if (!mounted) return;
       setState(() {
-        _businessDate = page.businessDate;
         _posts = reset ? page.items : [..._posts, ...page.items];
         _cursor = page.nextCursor;
         _hasMore = page.hasMore;
@@ -127,139 +125,211 @@ class _HomePageState extends State<HomePage> {
     await requireLogin(
       context,
       action: () async {
-        await Navigator.of(context).push(
-          MaterialPageRoute<void>(builder: (_) => const PublishPage()),
-        );
+        await Navigator.of(context)
+            .push(MaterialPageRoute<void>(builder: (_) => const PublishPage()));
       },
     );
   }
 
   void _openPost(PostCard post) {
     Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) => PostDetailPage(postId: post.id),
-      ),
+      MaterialPageRoute<void>(builder: (_) => PostDetailPage(postId: post.id)),
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    final subtitle = _businessDate.isEmpty
-        ? '今天的饭，都在这里'
-        : '今天 · ${dateLabel(_businessDate)}';
-
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: AppColors.card,
       body: SafeArea(
         bottom: false,
-        child: Column(
+        child: Stack(
           children: [
-            AppHeader(
-              title: 'MealMate',
-              subtitle: subtitle,
-              action: GestureDetector(
-                onTap: _openPublish,
-                behavior: HitTestBehavior.opaque,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 8,
-                  ),
-                  decoration: BoxDecoration(
+            Column(
+              children: [
+                AppHeader(
+                  title: '今天吃啥',
+                  compact: true,
+                  action: _publishAction(),
+                ),
+                Expanded(
+                  child: RefreshIndicator(
                     color: AppColors.primary,
-                    borderRadius: BorderRadius.circular(999),
-                    boxShadow: const [
-                      BoxShadow(
-                        color: Color(0x38CC462C),
-                        blurRadius: 14,
-                        offset: Offset(0, 6),
-                      ),
-                    ],
-                  ),
-                  child: const Row(
-                    children: [
-                      Icon(Icons.add, size: 14, color: Colors.white),
-                      SizedBox(width: 2),
-                      Text(
-                        '发布',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 10, 20, 14),
-              child: SegmentedTabs<String>(
-                selected: _filter,
-                onSelected: _switchFilter,
-                options: const [
-                  SegmentOption('all', '全部'),
-                  SegmentOption('near', '附近 3 公里'),
-                ],
-              ),
-            ),
-            Expanded(
-              child: RefreshIndicator(
-                color: AppColors.primary,
-                onRefresh: () => _load(reset: true),
-                child: ListView(
-                  controller: _scroll,
-                  physics: const AlwaysScrollableScrollPhysics(),
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
-                  children: [
-                    for (final post in _posts)
-                      PostCardTile(
-                        post: post,
-                        showDistance: _filter == 'near',
-                        onTap: () => _openPost(post),
-                        onLike: () => _toggleLike(post),
-                      ),
-                    if (_loading && _posts.isEmpty)
-                      const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 16),
-                        child: Center(
-                          child: Text(
-                            '加载中…',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: AppColors.faint,
-                            ),
+                    onRefresh: () => _load(reset: true),
+                    child: ListView(
+                      controller: _scroll,
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 88),
+                      children: [
+                        const Text(
+                          '看看大家今天吃什么，给晚饭找点灵感。',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: AppColors.muted,
                           ),
                         ),
-                      )
-                    else if (_firstLoaded && _posts.isEmpty)
-                      EmptyState(
-                        title: '今天还没有饭帖',
-                        description: '拍下你的这一餐，成为今天的第一条。',
-                        actionText: '去发布',
-                        onAction: _openPublish,
-                      )
-                    else if (_posts.isNotEmpty && !_hasMore)
-                      const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 16),
-                        child: Center(
-                          child: Text(
-                            '今天就看到这里',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: AppColors.faint,
+                        const SizedBox(height: 12),
+                        _filterChips(),
+                        const SizedBox(height: 16),
+                        ..._feedRows(),
+                        if (_loading && _posts.isEmpty)
+                          const Padding(
+                            padding: EdgeInsets.symmetric(vertical: 16),
+                            child: Center(
+                              child: Text(
+                                '加载中…',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: AppColors.faint,
+                                ),
+                              ),
+                            ),
+                          )
+                        else if (_firstLoaded && _posts.isEmpty)
+                          EmptyState(
+                            title: '今天还没有饭帖',
+                            description: '拍下你的这一餐，成为今天的第一条。',
+                            actionText: '去发布',
+                            onAction: _openPublish,
+                          )
+                        else if (_posts.isNotEmpty && !_hasMore)
+                          const Padding(
+                            padding: EdgeInsets.symmetric(vertical: 16),
+                            child: Center(
+                              child: Text(
+                                '今天就看到这里',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: AppColors.faint,
+                                ),
+                              ),
                             ),
                           ),
-                        ),
-                      ),
-                  ],
+                      ],
+                    ),
+                  ),
                 ),
+              ],
+            ),
+            Positioned.fill(
+              child: DraggableAiFab(
+                onTap: () => showAiChatSheet(context),
               ),
             ),
           ],
         ),
       ),
     );
+  }
+
+  Widget _publishAction() {
+    return GestureDetector(
+      onTap: _openPublish,
+      behavior: HitTestBehavior.opaque,
+      child: Container(
+        constraints: const BoxConstraints(minHeight: 44),
+        padding: const EdgeInsets.symmetric(horizontal: 15),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: AppColors.primary,
+          borderRadius: BorderRadius.circular(24),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.add, size: 16, color: Colors.white),
+            SizedBox(width: 4),
+            Text(
+              '晒饭',
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w500,
+                color: Colors.white,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _filterChips() {
+    return Wrap(
+      spacing: 8,
+      children: [_filterChip('all', '全部'), _filterChip('near', '附近')],
+    );
+  }
+
+  Widget _filterChip(String value, String label) {
+    final selected = _filter == value;
+    return GestureDetector(
+      onTap: () => _switchFilter(value),
+      behavior: HitTestBehavior.opaque,
+      child: Container(
+        height: 44,
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        decoration: BoxDecoration(
+          color: selected ? AppColors.peach : AppColors.bg,
+          borderRadius: BorderRadius.circular(22),
+          border: Border(
+            bottom: BorderSide(
+              color: selected ? AppColors.primary : Colors.transparent,
+              width: 2,
+            ),
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: selected ? FontWeight.w500 : FontWeight.w400,
+                color: AppColors.text,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _feedRows() {
+    final rows = <Widget>[];
+    for (var i = 0; i < _posts.length; i += 2) {
+      final left = _posts[i];
+      final right = i + 1 < _posts.length ? _posts[i + 1] : null;
+      rows.add(
+        Padding(
+          padding: const EdgeInsets.only(bottom: 24),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: PostGridTile(
+                  post: left,
+                  showDistance: _filter == 'near',
+                  onTap: () => _openPost(left),
+                  onLike: () => _toggleLike(left),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: right == null
+                    ? const SizedBox.shrink()
+                    : PostGridTile(
+                        post: right,
+                        showDistance: _filter == 'near',
+                        onTap: () => _openPost(right),
+                        onLike: () => _toggleLike(right),
+                      ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    return rows;
   }
 }

@@ -277,6 +277,8 @@ POSTS = [
             "ingredients": ["豆角 200 克", "鲜面条 150 克", "蒜 2 瓣", "生抽 2 勺"],
             "steps": ["豆角掰段炒香", "加水铺面焖 12 分钟", "拌匀收汁"],
         },
+        "avg_price": 22,
+        "taste_tags": ["咸鲜", "面食"],
     },
     {
         "id": "p_1002",
@@ -287,6 +289,8 @@ POSTS = [
         "assets": ["m_seed_4"],
         "recipe": "r_101",
         "author_recipe": None,
+        "avg_price": 15,
+        "taste_tags": ["酸甜"],
     },
     {
         "id": "p_1003",
@@ -297,6 +301,11 @@ POSTS = [
         "assets": ["m_seed_5", "m_seed_6"],
         "takeaway_store": "街角便当",
         "author_recipe": None,
+        "avg_price": 28,
+        "taste_tags": ["咸鲜"],
+        "store_lat": 31.2305,
+        "store_lng": 121.4737,
+        "store_poi_id": "demo-poi-001",
     },
     {
         "id": "p_1004",
@@ -307,6 +316,11 @@ POSTS = [
         "assets": ["m_seed_1"],
         "dine_in_address": "演示路 12 号 · 老友粉店",
         "author_recipe": None,
+        "avg_price": 26,
+        "taste_tags": ["重口下饭", "汤羹"],
+        "store_lat": 31.2286,
+        "store_lng": 121.469,
+        "store_poi_id": "demo-poi-002",
     },
     {
         "id": "p_1005",
@@ -320,6 +334,8 @@ POSTS = [
             "ingredients": ["嫩豆腐 1 盒", "香菇 5 朵", "葱 1 根"],
             "steps": ["豆腐切块", "香菇炒香后加豆腐", "小火煮 8 分钟"],
         },
+        "avg_price": 18,
+        "taste_tags": ["清淡"],
     },
     {
         "id": "p_1006",
@@ -330,6 +346,8 @@ POSTS = [
         "assets": ["m_seed_3"],
         "recipe": "r_104",
         "author_recipe": None,
+        "avg_price": 12,
+        "taste_tags": ["清淡"],
     },
     {
         "id": "p_1007",
@@ -343,6 +361,8 @@ POSTS = [
             "ingredients": ["细面条 150 克", "小葱 4 根", "生抽 2 勺", "糖 半勺"],
             "steps": ["冷油小火炸葱", "调好酱汁", "煮面拌匀"],
         },
+        "avg_price": 10,
+        "taste_tags": ["咸鲜", "面食"],
     },
     {
         "id": "p_1008",
@@ -353,6 +373,11 @@ POSTS = [
         "assets": ["m_seed_6", "m_seed_1"],
         "takeaway_store": "楼下小馆",
         "author_recipe": None,
+        "avg_price": 24,
+        "taste_tags": ["重口下饭"],
+        "store_lat": 31.2318,
+        "store_lng": 121.4752,
+        "store_poi_id": "demo-poi-003",
     },
     {
         "id": "p_1009",
@@ -363,6 +388,8 @@ POSTS = [
         "assets": ["m_seed_4"],
         "recipe": None,
         "author_recipe": None,
+        "avg_price": 6,
+        "taste_tags": ["清淡"],
     },
 ]
 
@@ -465,6 +492,11 @@ async def seed_demo_data(db: AsyncSession) -> None:
                 platform_recipe_id=item.get("recipe"),
                 takeaway_store=item.get("takeaway_store"),
                 dine_in_address=item.get("dine_in_address"),
+                avg_price=item.get("avg_price"),
+                taste_tags=item.get("taste_tags", []),
+                store_lat=item.get("store_lat"),
+                store_lng=item.get("store_lng"),
+                store_poi_id=item.get("store_poi_id"),
                 coarse_lat=31.23 if index < 5 else None,
                 coarse_lng=121.47 if index < 5 else None,
                 coarse_area="演示商圈" if index < 5 else None,

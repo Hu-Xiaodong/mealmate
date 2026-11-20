@@ -3,10 +3,17 @@ import type {
   AIChatPayload,
   AIChatResult,
   CreatePostPayload,
+  DeleteResult,
+  DraftDetail,
+  DraftPage,
+  DraftPayload,
+  DraftSaveResult,
   FavoritePage,
   FeedPage,
   LoginResult,
+  MapConfig,
   MyPostPage,
+  PlacePage,
   PostDetail,
   PublishResult,
   RankPage,
@@ -71,7 +78,7 @@ function rawRequest(options: UniApp.RequestOptions): Promise<UniApp.RequestSucce
 async function request<T>(
   path: string,
   options: {
-    method?: "GET" | "POST" | "PUT";
+    method?: "GET" | "POST" | "PUT" | "DELETE";
     data?: unknown;
     auth?: boolean;
     headers?: Record<string, string>;
@@ -179,6 +186,14 @@ export const api = {
     return request<MyPostPage>(`/api/v1/me/posts${query({ cursor, limit })}`);
   },
 
+  myDrafts(cursor?: string | null, limit = 20) {
+    return request<DraftPage>(`/api/v1/me/drafts${query({ cursor, limit })}`);
+  },
+
+  draft(postId: string) {
+    return request<DraftDetail>(`/api/v1/me/drafts/${encodeURIComponent(postId)}`);
+  },
+
   myFavorites(cursor?: string | null, limit = 20) {
     return request<FavoritePage>(`/api/v1/me/favorites${query({ cursor, limit })}`);
   },
@@ -192,10 +207,65 @@ export const api = {
     });
   },
 
+  createDraft(payload: DraftPayload) {
+    return request<DraftSaveResult>("/api/v1/posts/drafts", {
+      method: "POST",
+      data: payload,
+      auth: true,
+    });
+  },
+
+  updateDraft(postId: string, payload: DraftPayload) {
+    return request<DraftSaveResult>(`/api/v1/posts/${encodeURIComponent(postId)}/draft`, {
+      method: "PUT",
+      data: payload,
+      auth: true,
+    });
+  },
+
+  publishDraft(postId: string, payload: CreatePostPayload) {
+    return request<PublishResult>(`/api/v1/posts/${encodeURIComponent(postId)}/publish`, {
+      method: "POST",
+      data: payload,
+      auth: true,
+    });
+  },
+
+  deletePost(postId: string) {
+    return request<DeleteResult>(`/api/v1/posts/${encodeURIComponent(postId)}`, {
+      method: "DELETE",
+      auth: true,
+    });
+  },
+
+  mapConfig() {
+    return request<MapConfig>("/api/v1/maps/config");
+  },
+
+  searchPlaces(params: {
+    keyword: string;
+    lat?: number;
+    lng?: number;
+    limit?: number;
+  }) {
+    return request<PlacePage>(`/api/v1/maps/places${query(params)}`);
+  },
+
   aiChat(payload: AIChatPayload) {
     return request<AIChatResult>("/api/v1/ai/chat", { method: "POST", data: payload });
   },
 };
+
+/** 静态地图直接返回图片字节，可以当作普通图片地址使用。 */
+export function mapStaticUrl(params: {
+  lat: number;
+  lng: number;
+  zoom?: number;
+  width?: number;
+  height?: number;
+}): string {
+  return `${API_BASE}/api/v1/maps/static${query(params)}`;
+}
 
 export function uploadImage(filePath: string): Promise<{ assetId: string; url: string }> {
   return new Promise((resolve, reject) => {

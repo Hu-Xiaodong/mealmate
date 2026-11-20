@@ -112,6 +112,10 @@ async def list_admin_posts(
     conditions = []
     if status:
         conditions.append(MealPost.status == status)
+    else:
+        # 后台默认列表只展示真正参与内容流转的饭帖。
+        # 草稿是用户没写完的私人内容，已删除内容也不应再占用审核视线。
+        conditions.append(MealPost.status.notin_(["draft", "deleted"]))
 
     cursor_data = decode_cursor(cursor)
     if cursor:

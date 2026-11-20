@@ -149,6 +149,10 @@ def base_post_payload(
         "likedByMe": liked,
         "savedByMe": saved,
         "status": post.status,
+        # 人均价格为空时前端不展示，不做 0 元兜底，避免误导。
+        "avgPrice": post.avg_price,
+        # 老数据没有这个字段时数据库返回 None，这里统一成空列表。
+        "tasteTags": post.taste_tags or [],
     }
     if distance_meters is not None:
         payload["distanceMeters"] = distance_meters

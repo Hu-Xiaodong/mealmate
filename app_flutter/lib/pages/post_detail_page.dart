@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../api/api_client.dart';
 import '../api/models.dart';
@@ -216,6 +217,21 @@ class _PostDetailPageState extends State<PostDetailPage> {
                     height: 1.7,
                   ),
                 ),
+                if (detail.avgPrice != null || detail.tasteTags.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      if (detail.avgPrice != null)
+                        InfoChip(
+                          label: '人均 ¥${detail.avgPrice}',
+                          highlight: true,
+                        ),
+                      for (final tag in detail.tasteTags) InfoChip(label: tag),
+                    ],
+                  ),
+                ],
                 const SizedBox(height: 16),
                 Row(
                   children: [
@@ -260,6 +276,7 @@ class _PostDetailPageState extends State<PostDetailPage> {
               ],
             ),
           ),
+          if (detail.storeLocation != null) _storeCard(detail),
           if (ingredientLines.isNotEmpty || stepLines.isNotEmpty)
             SectionCard(
               child: Column(
@@ -318,6 +335,108 @@ class _PostDetailPageState extends State<PostDetailPage> {
               ),
             ),
           SectionCard(child: _aiPanel()),
+        ],
+      ),
+    );
+  }
+
+  String _storeName(PostDetail detail) {
+    final takeaway = detail.takeawayStore?.trim() ?? '';
+    if (takeaway.isNotEmpty) return takeaway;
+    final dineIn = detail.dineInAddress?.trim() ?? '';
+    if (dineIn.isNotEmpty) return dineIn;
+    return detail.title;
+  }
+
+  Future<void> _openMap(PostDetail detail) async {
+    final store = detail.storeLocation;
+    if (store == null) return;
+    final name = Uri.encodeComponent(_storeName(detail));
+    final address = detail.dineInAddress?.trim() ?? '';
+    final addr = Uri.encodeComponent(address.isEmpty ? _storeName(detail) : address);
+    // 腾讯地图统一资源标识符：优先唤起已安装的腾讯地图应用，未安装时退回网页。
+    // 坐标顺序是“纬度,经度”，与高德的“经度,纬度”相反；
+    // coord、title、addr 三个属性都是腾讯要求必填的，referer 填应用名称。
+    final uri = Uri.parse(
+      'https://apis.map.qq.com/uri/v1/marker'
+      '?marker=coord:${store.lat},${store.lng};title:$name;addr:$addr'
+      '&referer=mealmate',
+    );
+    try {
+      final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!opened && mounted) showMessage(context, '未找到可打开地图的应用');
+    } catch (_) {
+      if (mounted) showMessage(context, '未找到可打开地图的应用');
+    }
+  }
+
+  Widget _storeCard(PostDetail detail) {
+    final store = detail.storeLocation!;
+    return SectionCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            '店铺位置',
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+              color: AppColors.text,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            _storeName(detail),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 12, color: AppColors.muted),
+          ),
+          const SizedBox(height: 10),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(AppRadius.sm),
+            child: AspectRatio(
+              aspectRatio: 2,
+              child: Image.network(
+                apiClient.staticMapUrl(lat: store.lat, lng: store.lng),
+                fit: BoxFit.cover,
+                errorBuilder: (_, _, _) => Container(
+                  color: AppColors.peach,
+                  alignment: Alignment.center,
+                  child: const Text(
+                    '地图加载失败，不影响查看饭帖',
+                    style: TextStyle(fontSize: 12, color: AppColors.muted),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          GestureDetector(
+            onTap: () => _openMap(detail),
+            behavior: HitTestBehavior.opaque,
+            child: Container(
+              padding: const EdgeInsets.symmetric(vertical: 11),
+              decoration: BoxDecoration(
+                color: AppColors.primary,
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: const Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.navigation_outlined, size: 16, color: Colors.white),
+                  SizedBox(width: 6),
+                  Text(
+                    '打开地图导航',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.white,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
         ],
       ),
     );

@@ -123,14 +123,14 @@ flutter run --dart-define=API_BASE=http://10.0.2.2:8000
 
 - Android 模拟器访问宿主机 API 用 `10.0.2.2`；iOS 模拟器用 `127.0.0.1`；真机用局域网 IP。
 - Android 需要 `android.permission.INTERNET`，iOS 调试直连 HTTP 需在 Info.plist 放行 ATS。
-- 本机已解压 Flutter SDK 到 `tools/flutter`（该目录被 `.gitignore` 忽略）。未加入 PATH 时先设置：
+- 本机已把 Flutter SDK 放在 `E:\tools\flutter`（ASCII 路径，避免 Gradle 读取中文路径时乱码）。未加入 PATH 时先设置：
 
 ```powershell
 $env:PUB_CACHE='E:\项目\mealmate\tools\pub-cache'
 $env:APPDATA='E:\项目\mealmate\tools\appdata'
 $env:USERPROFILE='E:\项目\mealmate\tools\home'
 $env:HOME='E:\项目\mealmate\tools\home'
-& 'E:\项目\mealmate\tools\flutter\bin\flutter' pub get
+& 'E:\tools\flutter\bin\flutter' pub get
 ```
 
 ## 测试与检查

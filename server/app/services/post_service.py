@@ -86,6 +86,17 @@ async def load_detail(
     payload["takeawayStore"] = post.takeaway_store if post.source == "takeaway" else None
     payload["dineInAddress"] = post.dine_in_address if post.source == "dine_in" else None
     payload["coarseArea"] = post.coarse_area
+    # 店铺坐标只用于详情页地图与导航，不参与“附近”推荐。
+    # 没有坐标时返回 None，前端就只展示文字地址，不显示地图占位。
+    payload["storeLocation"] = (
+        {
+            "lat": post.store_lat,
+            "lng": post.store_lng,
+            "poiId": post.store_poi_id,
+        }
+        if post.store_lat is not None and post.store_lng is not None
+        else None
+    )
     if distance_meters is not None:
         payload["distanceMeters"] = distance_meters
     return payload

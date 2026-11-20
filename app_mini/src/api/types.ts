@@ -8,6 +8,12 @@ export interface Author {
   avatarUrl: string | null;
 }
 
+export interface StoreLocation {
+  lat: number;
+  lng: number;
+  poiId?: string | null;
+}
+
 export interface PostCard {
   id: string;
   title: string;
@@ -23,6 +29,8 @@ export interface PostCard {
   savedByMe: boolean;
   status: string;
   distanceMeters?: number;
+  avgPrice?: number | null;
+  tasteTags?: string[];
 }
 
 export interface AuthorRecipe {
@@ -60,6 +68,9 @@ export interface PostDetail extends PostCard {
   takeawayStore: string | null;
   dineInAddress: string | null;
   coarseArea: string | null;
+  avgPrice: number | null;
+  tasteTags: string[];
+  storeLocation: StoreLocation | null;
 }
 
 export interface RankItem extends PostCard {
@@ -174,6 +185,85 @@ export interface CreatePostPayload {
     area?: string | null;
     publicConsent: boolean;
   } | null;
+  avgPrice?: number | null;
+  tasteTags?: string[];
+  storeLocation?: StoreLocation | null;
+}
+
+/** 草稿请求体，所有字段都是可选的，允许保存只写了一半的内容。 */
+export interface DraftPayload {
+  title?: string;
+  review?: string;
+  source?: Source | null;
+  imageAssetIds?: string[];
+  authorRecipe?: AuthorRecipe | null;
+  takeawayStore?: string | null;
+  dineInAddress?: string | null;
+  location?: {
+    lat: number;
+    lng: number;
+    area?: string | null;
+    publicConsent: boolean;
+  } | null;
+  avgPrice?: number | null;
+  tasteTags?: string[];
+  storeLocation?: StoreLocation | null;
+}
+
+export interface DraftSaveResult {
+  postId: string;
+  status: string;
+  updatedAt: string;
+}
+
+export interface DraftDetail {
+  postId: string;
+  title: string | null;
+  review: string | null;
+  source: Source | null;
+  imageAssetIds: string[];
+  images: string[];
+  authorRecipe: AuthorRecipe | null;
+  takeawayStore: string | null;
+  dineInAddress: string | null;
+  avgPrice: number | null;
+  tasteTags: string[];
+  location: { lat: number; lng: number; area: string | null } | null;
+  storeLocation: StoreLocation | null;
+  updatedAt: string;
+}
+
+export interface DraftCard extends PostCard {
+  updatedAt: string;
+}
+
+export interface DraftPage {
+  items: DraftCard[];
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+export interface DeleteResult {
+  postId: string;
+  status: string;
+  deletedAt: string;
+}
+
+export interface MapConfig {
+  enabled: boolean;
+}
+
+export interface PlaceItem {
+  id: string;
+  name: string;
+  address: string;
+  lat: number;
+  lng: number;
+  distanceMeters: number | null;
+}
+
+export interface PlacePage {
+  items: PlaceItem[];
 }
 
 export interface PublishResult {

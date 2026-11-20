@@ -29,6 +29,9 @@ class PostCard {
     required this.savedByMe,
     required this.status,
     this.distanceMeters,
+    this.avgPrice,
+    this.tasteTags = const [],
+    this.updatedAt,
   });
 
   final String id;
@@ -45,12 +48,17 @@ class PostCard {
   bool savedByMe;
   final String status;
   final int? distanceMeters;
+  final int? avgPrice;
+  final List<String> tasteTags;
+  /// 草稿卡片才有值，用于“最近修改时间”排序展示。
+  final String? updatedAt;
 
   bool get pendingReview => status != 'published';
 
   factory PostCard.fromJson(Map<String, dynamic> json) {
     final author = json['author'];
     final images = json['images'];
+    final tasteTags = json['tasteTags'];
     return PostCard(
       id: json['id'] as String? ?? '',
       title: json['title'] as String? ?? '',
@@ -68,6 +76,11 @@ class PostCard {
       savedByMe: json['savedByMe'] as bool? ?? false,
       status: json['status'] as String? ?? 'published',
       distanceMeters: json['distanceMeters'] as int?,
+      avgPrice: json['avgPrice'] as int?,
+      tasteTags: tasteTags is List
+          ? tasteTags.map((item) => item as String).toList(growable: false)
+          : const [],
+      updatedAt: json['updatedAt'] as String?,
     );
   }
 }
@@ -149,14 +162,14 @@ class Recipe {
       id: json['id'] as String? ?? '',
       title: json['title'] as String? ?? '',
       coverImage: json['coverImage'] as String? ?? '',
-      totalMinutes: json['totalMinutes'] as int? ?? 0,
+      totalMinutes: (json['totalMinutes'] as num?)?.toInt() ?? 0,
       tools: tools is List
           ? tools.map((item) => item as String).toList(growable: false)
           : const [],
       categories: categories is List
           ? categories.map((item) => item as String).toList(growable: false)
           : const [],
-      servings: json['servings'] as int? ?? 1,
+      servings: (json['servings'] as num?)?.toInt() ?? 1,
       mainIngredients: mainIngredients is List
           ? mainIngredients.map((item) => item as String).toList(growable: false)
           : const [],
@@ -200,6 +213,9 @@ class PostDetail {
     this.takeawayStore,
     this.dineInAddress,
     this.coarseArea,
+    this.avgPrice,
+    this.tasteTags = const [],
+    this.storeLocation,
   });
 
   final String id;
@@ -223,12 +239,17 @@ class PostDetail {
   final String? takeawayStore;
   final String? dineInAddress;
   final String? coarseArea;
+  final int? avgPrice;
+  final List<String> tasteTags;
+  final StoreLocation? storeLocation;
 
   factory PostDetail.fromJson(Map<String, dynamic> json) {
     final author = json['author'];
     final images = json['images'];
     final authorRecipe = json['authorRecipe'];
     final recipe = json['recipe'];
+    final tasteTags = json['tasteTags'];
+    final storeLocation = json['storeLocation'];
     return PostDetail(
       id: json['id'] as String? ?? '',
       title: json['title'] as String? ?? '',
@@ -255,6 +276,13 @@ class PostDetail {
       takeawayStore: json['takeawayStore'] as String?,
       dineInAddress: json['dineInAddress'] as String?,
       coarseArea: json['coarseArea'] as String?,
+      avgPrice: json['avgPrice'] as int?,
+      tasteTags: tasteTags is List
+          ? tasteTags.map((item) => item as String).toList(growable: false)
+          : const [],
+      storeLocation: storeLocation is Map<String, dynamic>
+          ? StoreLocation.fromJson(storeLocation)
+          : null,
     );
   }
 }
@@ -661,4 +689,176 @@ class Coordinates {
 
   final double lat;
   final double lng;
+}
+
+/// 店铺坐标：来自地图选点，比“公开大概位置”精度更高，用于详情页地图与导航。
+class StoreLocation {
+  const StoreLocation({required this.lat, required this.lng, this.poiId});
+
+  final double lat;
+  final double lng;
+  final String? poiId;
+
+  factory StoreLocation.fromJson(Map<String, dynamic> json) => StoreLocation(
+    lat: (json['lat'] as num?)?.toDouble() ?? 0,
+    lng: (json['lng'] as num?)?.toDouble() ?? 0,
+    poiId: json['poiId'] as String?,
+  );
+
+  Map<String, dynamic> toJson() => {'lat': lat, 'lng': lng, 'poiId': poiId};
+}
+
+/// 地图搜索返回的地点（后端代理腾讯地点搜索后的统一结构）。
+class Place {
+  const Place({
+    required this.id,
+    required this.name,
+    required this.address,
+    required this.lat,
+    required this.lng,
+    this.distanceMeters,
+  });
+
+  final String id;
+  final String name;
+  final String address;
+  final double lat;
+  final double lng;
+  final int? distanceMeters;
+
+  factory Place.fromJson(Map<String, dynamic> json) => Place(
+    id: json['id'] as String? ?? '',
+    name: json['name'] as String? ?? '',
+    address: json['address'] as String? ?? '',
+    lat: (json['lat'] as num?)?.toDouble() ?? 0,
+    lng: (json['lng'] as num?)?.toDouble() ?? 0,
+    distanceMeters: json['distanceMeters'] as int?,
+  );
+}
+
+/// 草稿里保存的“公开大概位置”，没有 publicConsent（编辑时由前端补 true）。
+class SavedLocation {
+  const SavedLocation({required this.lat, required this.lng, this.area});
+
+  final double lat;
+  final double lng;
+  final String? area;
+
+  factory SavedLocation.fromJson(Map<String, dynamic> json) => SavedLocation(
+    lat: (json['lat'] as num?)?.toDouble() ?? 0,
+    lng: (json['lng'] as num?)?.toDouble() ?? 0,
+    area: json['area'] as String?,
+  );
+}
+
+/// 草稿编辑数据：包含 imageAssetIds 才能在不换图的情况下继续保存。
+class DraftDetail {
+  const DraftDetail({
+    required this.postId,
+    required this.title,
+    required this.review,
+    this.source,
+    required this.imageAssetIds,
+    required this.images,
+    this.authorRecipe,
+    this.takeawayStore,
+    this.dineInAddress,
+    this.avgPrice,
+    required this.tasteTags,
+    this.location,
+    this.storeLocation,
+    this.updatedAt,
+  });
+
+  final String postId;
+  final String title;
+  final String review;
+  final String? source;
+  final List<String> imageAssetIds;
+  final List<String> images;
+  final AuthorRecipe? authorRecipe;
+  final String? takeawayStore;
+  final String? dineInAddress;
+  final int? avgPrice;
+  final List<String> tasteTags;
+  final SavedLocation? location;
+  final StoreLocation? storeLocation;
+  final String? updatedAt;
+
+  factory DraftDetail.fromJson(Map<String, dynamic> json) {
+    final imageAssetIds = json['imageAssetIds'];
+    final images = json['images'];
+    final authorRecipe = json['authorRecipe'];
+    final tasteTags = json['tasteTags'];
+    final location = json['location'];
+    final storeLocation = json['storeLocation'];
+    return DraftDetail(
+      postId: json['postId'] as String? ?? '',
+      title: json['title'] as String? ?? '',
+      review: json['review'] as String? ?? '',
+      source: json['source'] as String?,
+      imageAssetIds: imageAssetIds is List
+          ? imageAssetIds.map((item) => item as String).toList(growable: false)
+          : const [],
+      images: images is List
+          ? images.map((item) => item as String).toList(growable: false)
+          : const [],
+      authorRecipe: authorRecipe is Map<String, dynamic>
+          ? AuthorRecipe.fromJson(authorRecipe)
+          : null,
+      takeawayStore: json['takeawayStore'] as String?,
+      dineInAddress: json['dineInAddress'] as String?,
+      avgPrice: json['avgPrice'] as int?,
+      tasteTags: tasteTags is List
+          ? tasteTags.map((item) => item as String).toList(growable: false)
+          : const [],
+      location: location is Map<String, dynamic>
+          ? SavedLocation.fromJson(location)
+          : null,
+      storeLocation: storeLocation is Map<String, dynamic>
+          ? StoreLocation.fromJson(storeLocation)
+          : null,
+      updatedAt: json['updatedAt'] as String?,
+    );
+  }
+}
+
+/// 草稿保存结果。
+class DraftSaveResult {
+  const DraftSaveResult({
+    required this.postId,
+    required this.status,
+    this.updatedAt,
+  });
+
+  final String postId;
+  final String status;
+  final String? updatedAt;
+
+  factory DraftSaveResult.fromJson(Map<String, dynamic> json) =>
+      DraftSaveResult(
+        postId: json['postId'] as String? ?? '',
+        status: json['status'] as String? ?? 'draft',
+        updatedAt: json['updatedAt'] as String?,
+      );
+}
+
+/// 删除结果（软删除，只改状态）。
+class DeletePostResult {
+  const DeletePostResult({
+    required this.postId,
+    required this.status,
+    this.deletedAt,
+  });
+
+  final String postId;
+  final String status;
+  final String? deletedAt;
+
+  factory DeletePostResult.fromJson(Map<String, dynamic> json) =>
+      DeletePostResult(
+        postId: json['postId'] as String? ?? '',
+        status: json['status'] as String? ?? 'deleted',
+        deletedAt: json['deletedAt'] as String?,
+      );
 }

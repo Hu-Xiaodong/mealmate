@@ -5,6 +5,7 @@ import io
 from conftest import API, auth_headers, data_of, login
 from PIL import Image
 
+from app.services.map_service import parse_place_items
 from app.utils.time import business_date
 
 
@@ -335,3 +336,310 @@ async def test_media_rejects_non_image(client):
     )
     assert resp.status_code == 400
     assert resp.json()["code"] == "FILE_INVALID"
+
+
+async def _upload_png(client, headers) -> dict:
+    """上传一张最小可用的 PNG，返回媒体信息。
+
+    多个用例都需要“自己的图片”，抽成小函数避免重复代码。
+    """
+    buffer = io.BytesIO()
+    Image.new("RGB", (400, 300), (204, 70, 44)).save(buffer, format="PNG")
+    upload = await client.post(
+        f"{API}/media",
+        files={"file": ("meal.png", buffer.getvalue(), "image/png")},
+        headers=headers,
+    )
+    return data_of(upload)
+
+
+async def test_post_price_tags_and_store_location(client):
+    """人均价格、口味标签与店铺坐标能写入并在详情中返回。"""
+    seeded = data_of(await client.get(f"{API}/posts/p_1003"))
+    assert seeded["avgPrice"] == 28
+    assert seeded["tasteTags"] == ["咸鲜"]
+    assert seeded["storeLocation"]["lat"] == 31.2305
+    assert seeded["storeLocation"]["lng"] == 121.4737
+
+    session = await login(client)
+    headers = auth_headers(session["token"])
+    media = await _upload_png(client, headers)
+    body = {
+        "title": "带标签的饭帖",
+        "review": "微辣，很下饭。",
+        "source": "takeaway",
+        "imageAssetIds": [media["assetId"]],
+        "takeawayStore": "测试小馆",
+        "avgPrice": 35,
+        "tasteTags": ["微辣", "重口下饭"],
+        "storeLocation": {"lat": 31.2299, "lng": 121.4711, "poiId": "B0TEST001"},
+        # 重复标签会被去重，保留用户选择的顺序。
+        "location": {"lat": 31.2299, "lng": 121.4711, "area": "测试商圈", "publicConsent": True},
+    }
+    created = data_of(
+        await client.post(
+            f"{API}/posts",
+            json=body,
+            headers={**headers, "Idempotency-Key": "publish-tags-0001"},
+        )
+    )
+    detail = data_of(await client.get(f"{API}/posts/{created['postId']}"))
+    assert detail["avgPrice"] == 35
+    assert detail["tasteTags"] == ["微辣", "重口下饭"]
+    assert detail["storeLocation"] == {
+        "lat": 31.2299,
+        "lng": 121.4711,
+        "poiId": "B0TEST001",
+    }
+    # 粗略位置只保留三位小数。
+    assert detail["coarseArea"] == "测试商圈"
+
+
+async def test_taste_tags_are_limited_and_validated(client):
+    session = await login(client)
+    headers = auth_headers(session["token"])
+    base = {
+        "title": "标签校验",
+        "review": "验证标签数量和枚举。",
+        "source": "self",
+        "imageAssetIds": ["m_seed_1"],
+    }
+    too_many = await client.post(
+        f"{API}/posts",
+        json={**base, "tasteTags": ["清淡", "微辣", "特辣", "酸甜"]},
+        headers={**headers, "Idempotency-Key": "publish-tags-0002"},
+    )
+    assert too_many.status_code == 422
+    assert too_many.json()["code"] == "VALIDATION_FAILED"
+
+    unknown = await client.post(
+        f"{API}/posts",
+        json={**base, "tasteTags": ["超级辣"]},
+        headers={**headers, "Idempotency-Key": "publish-tags-0003"},
+    )
+    assert unknown.status_code == 422
+    assert unknown.json()["code"] == "VALIDATION_FAILED"
+
+
+async def test_draft_create_update_and_publish(client):
+    """草稿可以反复保存、不出现在公开列表，补全后才能发布。"""
+    session = await login(client)
+    headers = auth_headers(session["token"])
+
+    draft = data_of(
+        await client.post(
+            f"{API}/posts/drafts",
+            json={"title": "写到一半", "review": "", "imageAssetIds": []},
+            headers=headers,
+        )
+    )
+    assert draft["status"] == "draft"
+
+    # 草稿不能通过公开详情访问。
+    hidden = await client.get(f"{API}/posts/{draft['postId']}")
+    assert hidden.status_code == 404
+
+    drafts = data_of(await client.get(f"{API}/me/drafts", headers=headers))
+    assert [item["id"] for item in drafts["items"]] == [draft["postId"]]
+
+    # 编辑页需要拿到原始字段，而不是公开详情的裁剪结果。
+    editable = data_of(
+        await client.get(f"{API}/me/drafts/{draft['postId']}", headers=headers)
+    )
+    assert editable["title"] == "写到一半"
+    assert editable["imageAssetIds"] == []
+    assert editable["avgPrice"] is None
+    assert editable["tasteTags"] == []
+
+    media = await _upload_png(client, headers)
+    updated = data_of(
+        await client.put(
+            f"{API}/posts/{draft['postId']}/draft",
+            json={
+                "title": "草稿补全",
+                "review": "补上评价。",
+                "source": "self",
+                "imageAssetIds": [media["assetId"]],
+                "avgPrice": 20,
+                "tasteTags": ["清淡"],
+            },
+            headers=headers,
+        )
+    )
+    assert updated["status"] == "draft"
+
+    # 草稿内容不完整时仍然不能发布，发布必须走完整校验。
+    incomplete = await client.post(
+        f"{API}/posts/{draft['postId']}/publish",
+        json={
+            "title": "草稿补全",
+            "review": "",
+            "source": "self",
+            "imageAssetIds": [media["assetId"]],
+        },
+        headers=headers,
+    )
+    assert incomplete.status_code == 422
+
+    published = data_of(
+        await client.post(
+            f"{API}/posts/{draft['postId']}/publish",
+            json={
+                "title": "草稿补全",
+                "review": "补上评价。",
+                "source": "self",
+                "imageAssetIds": [media["assetId"]],
+                "avgPrice": 20,
+                "tasteTags": ["清淡"],
+            },
+            headers=headers,
+        )
+    )
+    assert published["status"] == "published"
+
+    after = data_of(await client.get(f"{API}/me/drafts", headers=headers))
+    assert after["items"] == []
+    mine = data_of(await client.get(f"{API}/me/posts", headers=headers))
+    assert mine["items"][0]["id"] == draft["postId"]
+
+    # 已发布的草稿再次发布会得到明确的业务错误，而不是重复创建内容。
+    again = await client.post(
+        f"{API}/posts/{draft['postId']}/publish",
+        json={
+            "title": "草稿补全",
+            "review": "补上评价。",
+            "source": "self",
+            "imageAssetIds": [media["assetId"]],
+        },
+        headers=headers,
+    )
+    assert again.status_code == 400
+    assert again.json()["code"] == "POST_NOT_DRAFT"
+
+
+async def test_delete_own_post_and_draft(client):
+    """作者可以软删除自己的饭帖，删除后公开入口与我的发布都不再返回。"""
+    session = await login(client)
+    headers = auth_headers(session["token"])
+    media = await _upload_png(client, headers)
+    created = data_of(
+        await client.post(
+            f"{API}/posts",
+            json={
+                "title": "待删除",
+                "review": "这条稍后会删掉。",
+                "source": "self",
+                "imageAssetIds": [media["assetId"]],
+            },
+            headers={**headers, "Idempotency-Key": "publish-delete-0001"},
+        )
+    )
+
+    removed = data_of(
+        await client.delete(f"{API}/posts/{created['postId']}", headers=headers)
+    )
+    assert removed["status"] == "deleted"
+    assert removed["deletedAt"]
+
+    assert (await client.get(f"{API}/posts/{created['postId']}")).status_code == 404
+    mine = data_of(await client.get(f"{API}/me/posts", headers=headers))
+    assert all(item["id"] != created["postId"] for item in mine["items"])
+
+    # 重复删除返回 404，不会把删除时间刷新。
+    second = await client.delete(f"{API}/posts/{created['postId']}", headers=headers)
+    assert second.status_code == 404
+
+    # 不能删除别人的饭帖，接口同样用 404 隐藏内容是否存在。
+    others = await client.delete(f"{API}/posts/p_1001", headers=headers)
+    assert others.status_code == 404
+
+    # 草稿也支持直接删除。
+    draft = data_of(
+        await client.post(
+            f"{API}/posts/drafts",
+            json={"title": "废弃草稿"},
+            headers=headers,
+        )
+    )
+    deleted_draft = data_of(
+        await client.delete(f"{API}/posts/{draft['postId']}", headers=headers)
+    )
+    assert deleted_draft["status"] == "deleted"
+    drafts = data_of(await client.get(f"{API}/me/drafts", headers=headers))
+    assert all(item["id"] != draft["postId"] for item in drafts["items"])
+
+
+async def test_map_endpoints_require_key_and_login(client):
+    """未配置地图 Key 时给出可降级的 503，而不是让客户端无限等待。"""
+    config = data_of(await client.get(f"{API}/maps/config"))
+    assert config["enabled"] is False
+
+    anonymous = await client.get(f"{API}/maps/places", params={"keyword": "粉店"})
+    assert anonymous.status_code == 401
+
+    session = await login(client)
+    headers = auth_headers(session["token"])
+    places = await client.get(
+        f"{API}/maps/places", params={"keyword": "粉店"}, headers=headers
+    )
+    assert places.status_code == 503
+    assert places.json()["code"] == "MAP_NOT_CONFIGURED"
+
+    static = await client.get(f"{API}/maps/static", params={"lat": 31.23, "lng": 121.47})
+    assert static.status_code == 503
+    assert static.json()["code"] == "MAP_NOT_CONFIGURED"
+
+
+def test_tencent_place_response_parsing():
+    """腾讯地点搜索的响应要映射成客户端统一的 name/address/lat/lng 字段。"""
+    body = {
+        "status": 0,
+        "message": "query ok",
+        "count": 3,
+        "data": [
+            {
+                "id": "poi-1",
+                "title": "老王牛肉粉",
+                "address": "演示路 12 号",
+                "location": {"lat": 31.2286, "lng": 121.469},
+                "_distance": 320,
+            },
+            # 没有坐标的地点无法导航，应被跳过。
+            {"id": "poi-2", "title": "没有坐标的店", "location": None},
+            # 附近搜索也可能不返回距离，地址也可能缺失，字段要安全降级为空字符串。
+            {
+                "id": "poi-3",
+                "title": "缺少距离的店",
+                "address": None,
+                "location": {"lat": 31.23, "lng": 121.47},
+            },
+        ],
+    }
+    items = parse_place_items(body)
+    assert [item["id"] for item in items] == ["poi-1", "poi-3"]
+    assert items[0] == {
+        "id": "poi-1",
+        "name": "老王牛肉粉",
+        "address": "演示路 12 号",
+        "lat": 31.2286,
+        "lng": 121.469,
+        "distanceMeters": 320,
+    }
+    assert items[1]["address"] == ""
+    assert items[1]["distanceMeters"] is None
+
+
+async def test_map_search_requires_location(monkeypatch):
+    """没有定位时直接给出 400，避免腾讯“全国”范围返回空列表误导用户。"""
+    from app.core.config import settings
+    from app.core.errors import AppError
+    from app.services.map_service import search_places
+
+    monkeypatch.setattr(settings, "tencent_map_key", "test-key")
+    try:
+        await search_places("KFC")
+    except AppError as error:
+        assert error.code == "LOCATION_REQUIRED"
+        assert error.status_code == 400
+    else:
+        raise AssertionError("没有定位时应当拒绝搜索")

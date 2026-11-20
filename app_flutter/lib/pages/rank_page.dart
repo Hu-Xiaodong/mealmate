@@ -5,7 +5,6 @@ import '../api/models.dart';
 import '../core/format.dart';
 import '../theme/app_theme.dart';
 import '../widgets/app_header.dart';
-import '../widgets/common.dart';
 import '../widgets/empty_state.dart';
 import 'post_detail_page.dart';
 
@@ -18,7 +17,6 @@ class RankPage extends StatefulWidget {
 
 class _RankPageState extends State<RankPage> {
   List<RankItem> _items = const [];
-  String _statDate = '';
   bool _loading = false;
   bool _loaded = false;
 
@@ -33,10 +31,7 @@ class _RankPageState extends State<RankPage> {
     try {
       final data = await apiClient.rank();
       if (!mounted) return;
-      setState(() {
-        _items = data.items;
-        _statDate = data.statDate;
-      });
+      setState(() => _items = data.items);
     } on ApiException catch (error) {
       if (mounted) showError(context, error);
     } finally {
@@ -59,35 +54,13 @@ class _RankPageState extends State<RankPage> {
 
   @override
   Widget build(BuildContext context) {
-    final subtitle = _statDate.isEmpty
-        ? '今日有效赞排序'
-        : '$_statDate · 有效赞排序';
-
     return Scaffold(
-      backgroundColor: AppColors.bg,
+      backgroundColor: AppColors.card,
       body: SafeArea(
         bottom: false,
         child: Column(
           children: [
-            AppHeader(title: '热榜', subtitle: subtitle),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 8, 20, 14),
-              child: Container(
-                padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
-                decoration: BoxDecoration(
-                  color: AppColors.peach,
-                  borderRadius: BorderRadius.circular(AppRadius.sm),
-                ),
-                child: const Text(
-                  '每天按有效赞数排序，最多 20 条。榜单每天零点重新开始。',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: AppColors.primaryDeep,
-                    height: 1.5,
-                  ),
-                ),
-              ),
-            ),
+            const AppHeader(title: '今日热榜', compact: true),
             Expanded(
               child: RefreshIndicator(
                 color: AppColors.primary,
@@ -96,7 +69,22 @@ class _RankPageState extends State<RankPage> {
                   physics: const AlwaysScrollableScrollPhysics(),
                   padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
                   children: [
-                    for (final item in _items) _RankRow(item: item, onTap: _open),
+                    const Text(
+                      '今日点赞 TOP20',
+                      style: TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w500,
+                        color: AppColors.text,
+                      ),
+                    ),
+                    const SizedBox(height: 3),
+                    const Text(
+                      '今天大家看了最想吃的饭',
+                      style: TextStyle(fontSize: 13, color: AppColors.muted),
+                    ),
+                    const SizedBox(height: 12),
+                    for (final item in _items)
+                      _RankRow(item: item, onTap: () => _open(item)),
                     if (_loading && _items.isEmpty)
                       const Padding(
                         padding: EdgeInsets.symmetric(vertical: 24),
@@ -130,64 +118,49 @@ class _RankRow extends StatelessWidget {
   const _RankRow({required this.item, required this.onTap});
 
   final RankItem item;
-  final ValueChanged<RankItem> onTap;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    final top = item.rank <= 3;
     final ingredients = item.mainIngredients.take(3).toList(growable: false);
     final cover = resolveMedia(item.post.coverImage);
     final author = item.post.author?.nickname ?? '饭友';
 
     return GestureDetector(
-      onTap: () => onTap(item),
+      onTap: onTap,
       behavior: HitTestBehavior.opaque,
       child: Container(
-        margin: const EdgeInsets.only(bottom: 10),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: AppColors.card,
-          borderRadius: BorderRadius.circular(AppRadius.md),
-          boxShadow: const [
-            BoxShadow(
-              color: Color(0x0D242424),
-              blurRadius: 14,
-              offset: Offset(0, 4),
-            ),
-          ],
+        padding: const EdgeInsets.symmetric(vertical: 16),
+        decoration: const BoxDecoration(
+          border: Border(bottom: BorderSide(color: AppColors.line)),
         ),
         child: Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            Container(
-              width: 28,
-              height: 28,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: top ? AppColors.primary : AppColors.bg,
-                shape: BoxShape.circle,
-              ),
-              child: Text(
-                '${item.rank}',
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
-                  color: top ? Colors.white : AppColors.muted,
-                ),
-              ),
-            ),
-            const SizedBox(width: 12),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(12),
-              child: SizedBox(
-                width: 88,
-                height: 88,
-                child: cover.isEmpty
-                    ? const _ThumbPlaceholder()
-                    : Image.network(
-                        cover,
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, _, _) => const _ThumbPlaceholder(),
-                      ),
+            SizedBox(
+              width: 88,
+              height: 88,
+              child: Stack(
+                children: [
+                  Positioned.fill(
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(12),
+                      child: cover.isEmpty
+                          ? const _ThumbPlaceholder()
+                          : Image.network(
+                              cover,
+                              fit: BoxFit.cover,
+                              errorBuilder: (_, _, _) =>
+                                  const _ThumbPlaceholder(),
+                            ),
+                    ),
+                  ),
+                  Positioned(
+                    top: 5,
+                    left: 5,
+                    child: _RankBadge(rank: item.rank),
+                  ),
+                ],
               ),
             ),
             const SizedBox(width: 12),
@@ -197,46 +170,76 @@ class _RankRow extends StatelessWidget {
                 children: [
                   Text(
                     item.post.title,
-                    maxLines: 1,
+                    maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.w700,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w500,
+                      height: 1.4,
                       color: AppColors.text,
                     ),
                   ),
-                  const SizedBox(height: 6),
-                  Wrap(
-                    spacing: 6,
-                    runSpacing: 6,
-                    children: ingredients.isEmpty
-                        ? [InfoChip(label: sourceLabel(item.post.source))]
-                        : [
-                            for (final name in ingredients)
-                              InfoChip(label: name),
-                          ],
-                  ),
+                  if (ingredients.isNotEmpty) ...[
+                    const SizedBox(height: 7),
+                    Wrap(
+                      spacing: 5,
+                      runSpacing: 5,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        if (item.ingredientOrigin == 'platform_reference')
+                          const Text(
+                            '参考食材',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: AppColors.muted,
+                            ),
+                          ),
+                        for (final name in ingredients)
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 7,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: AppColors.bg,
+                              borderRadius: BorderRadius.circular(5),
+                            ),
+                            child: Text(
+                              name,
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: AppColors.muted,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ],
                   const SizedBox(height: 8),
                   Row(
                     children: [
-                      Text(
-                        '♥ ${item.effectiveLikeCount}',
-                        style: const TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                          color: AppColors.primary,
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Flexible(
+                      Expanded(
                         child: Text(
-                          author,
+                          '$author · ${sourceLabel(item.post.source)}',
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
                             fontSize: 12,
-                            color: AppColors.faint,
+                            color: AppColors.muted,
                           ),
+                        ),
+                      ),
+                      const Icon(
+                        Icons.favorite,
+                        size: 14,
+                        color: AppColors.primary,
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        '${item.effectiveLikeCount}',
+                        style: const TextStyle(
+                          fontSize: 13,
+                          color: AppColors.primary,
                         ),
                       ),
                     ],
@@ -251,13 +254,57 @@ class _RankRow extends StatelessWidget {
   }
 }
 
+class _RankBadge extends StatelessWidget {
+  const _RankBadge({required this.rank});
+
+  final int rank;
+
+  @override
+  Widget build(BuildContext context) {
+    final (background, foreground) = switch (rank) {
+      1 => (AppColors.primary, Colors.white),
+      2 => (const Color(0xFFE5E8ED), const Color(0xFF35383D)),
+      3 => (const Color(0xFFF1CFB7), const Color(0xFF5A3218)),
+      _ => (const Color(0xFF4B4E54), Colors.white),
+    };
+
+    return Container(
+      constraints: const BoxConstraints(minWidth: 24),
+      height: 24,
+      padding: const EdgeInsets.symmetric(horizontal: 5),
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(6),
+        boxShadow: rank == 1
+            ? const [
+                BoxShadow(
+                  color: Color(0x3DCC462C),
+                  blurRadius: 5,
+                  offset: Offset(0, 2),
+                ),
+              ]
+            : null,
+      ),
+      child: Text(
+        '$rank',
+        style: TextStyle(
+          fontSize: 12,
+          fontWeight: FontWeight.w500,
+          color: foreground,
+        ),
+      ),
+    );
+  }
+}
+
 class _ThumbPlaceholder extends StatelessWidget {
   const _ThumbPlaceholder();
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      color: AppColors.peach,
+      color: AppColors.bg,
       alignment: Alignment.center,
       child: const Icon(
         Icons.restaurant,

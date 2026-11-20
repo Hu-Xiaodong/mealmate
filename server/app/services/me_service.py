@@ -8,6 +8,7 @@ from app.api.serializers import iso, media_map
 from app.core.errors import AppError
 from app.db.models import Favorite, MealPost, Recipe, User
 from app.services.post_service import load_cards
+from app.services.post_write_service import draft_payload
 from app.services.storage import object_url
 from app.utils.cursor import decode_cursor, encode_cursor
 
@@ -29,7 +30,12 @@ async def my_posts(
     db: AsyncSession, viewer: User, cursor: str | None, limit: int
 ) -> dict[str, Any]:
     limit = min(max(limit, 1), MAX_PAGE_SIZE)
-    conditions = [MealPost.author_id == viewer.id]
+    # “我的发布”只展示作者自己需要管理的正式内容：
+    # 草稿有单独的草稿箱，已删除的内容不应再出现在列表里。
+    conditions = [
+        MealPost.author_id == viewer.id,
+        MealPost.status.notin_(["draft", "deleted"]),
+    ]
     cursor_data = decode_cursor(cursor)
     if cursor:
         created = _parse_dt(cursor_data.get("createdAt") if cursor_data else None)
@@ -64,6 +70,61 @@ async def my_posts(
         last = page[-1]
         next_cursor = encode_cursor({"createdAt": last.created_at.isoformat(), "id": last.id})
     return {"items": items, "nextCursor": next_cursor, "hasMore": has_more}
+
+
+async def my_drafts(
+    db: AsyncSession, viewer: User, cursor: str | None, limit: int
+) -> dict[str, Any]:
+    """草稿箱列表。
+
+    排序使用 updated_at 而不是 created_at：
+    用户更关心“最近改过哪一条”，而不是“最早什么时候建的草稿”。
+    分页游标也对应地携带 updatedAt，避免翻页时顺序错乱。
+    """
+    limit = min(max(limit, 1), MAX_PAGE_SIZE)
+    conditions = [MealPost.author_id == viewer.id, MealPost.status == "draft"]
+    cursor_data = decode_cursor(cursor)
+    if cursor:
+        updated = _parse_dt(cursor_data.get("updatedAt") if cursor_data else None)
+        cursor_id = cursor_data.get("id") if cursor_data else None
+        if updated is None or not cursor_id:
+            raise AppError("CURSOR_INVALID", "分页游标无效，请刷新后重试")
+        conditions.append(
+            or_(
+                MealPost.updated_at < updated,
+                and_(MealPost.updated_at == updated, MealPost.id < cursor_id),
+            )
+        )
+
+    rows = (
+        await db.scalars(
+            select(MealPost)
+            .where(*conditions)
+            .order_by(MealPost.updated_at.desc(), MealPost.id.desc())
+            .limit(limit + 1)
+        )
+    ).all()
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    items = await load_cards(db, page, viewer.id)
+    for item, post in zip(items, page, strict=False):
+        item["updatedAt"] = iso(post.updated_at)
+    next_cursor = None
+    if has_more and page:
+        last = page[-1]
+        next_cursor = encode_cursor(
+            {"updatedAt": last.updated_at.isoformat(), "id": last.id}
+        )
+    return {"items": items, "nextCursor": next_cursor, "hasMore": has_more}
+
+
+async def draft_detail(db: AsyncSession, viewer: User, post_id: str) -> dict[str, Any]:
+    """读取自己的草稿原始字段，供编辑页回填。"""
+    post = await db.get(MealPost, post_id)
+    # 同样用 404 而不是 403，避免别人枚举草稿编号。
+    if post is None or post.author_id != viewer.id or post.status != "draft":
+        raise AppError("POST_NOT_FOUND", "草稿不存在或已发布", status_code=404)
+    return await draft_payload(db, post)
 
 
 async def my_favorites(

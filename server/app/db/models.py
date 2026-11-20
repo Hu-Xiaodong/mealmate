@@ -226,10 +226,32 @@ class MealPost(Base):
     )
     takeaway_store: Mapped[str | None] = mapped_column(String(80), nullable=True)
     dine_in_address: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    # 人均价格，单位元。允许为空，因为很多用户只记得“花了多少钱”而不想精确到分。
+    # 使用整数而不是小数：餐饮人均极少精确到角，整数足够，也避免浮点误差。
+    avg_price: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 口味标签，存 JSON 数组，例如 ["微辣", "重口下饭"]。
+    # 为什么不建单独的标签关联表：标签是固定枚举、数量少、只用于展示和筛选，
+    # 用 JSON 数组读写更简单；如果以后要按标签做热门统计，再拆表也不迟。
+    taste_tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # 店铺坐标：与 coarse_lat/coarse_lng 区分开。
+    # coarse_* 是发布者本人的粗略位置，用于“附近”推荐；
+    # store_* 是餐厅的精确位置，只用于详情页地图与导航，不参与附近排序。
+    store_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    store_lng: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 地图服务的地点编号（当前为腾讯地点搜索返回的 id），便于以后重新拉取该店铺信息或去重。
+    store_poi_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 发布者本人的粗略位置，用于“附近”推荐，只保留三位小数。
     coarse_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
     coarse_lng: Mapped[float | None] = mapped_column(Float, nullable=True)
     coarse_area: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    # 状态取值：draft 草稿、pending_review 待审核、published 已发布、
+    # rejected 已拒绝、unpublished 已下架、deleted 作者已删除。
     status: Mapped[str] = mapped_column(String(20), default="pending_review", index=True)
+    # 软删除时间。作者删除饭帖时只改状态并记录时间，不物理删除数据。
+    # 这样做一是保留审计与统计口径，二是避免点赞、收藏等外键悬空。
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # 审核记录：谁审的、什么时候审的、拒绝或下架的原因。
     # reviewed_by 指向管理员表，但不做级联删除，历史审核记录必须保留。
     reviewed_by: Mapped[str | None] = mapped_column(
