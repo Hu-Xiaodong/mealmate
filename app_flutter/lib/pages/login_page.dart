@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../api/api_client.dart';
+import '../core/analytics.dart';
 import '../core/format.dart';
 import '../session/session_store.dart';
 import '../theme/app_theme.dart';
@@ -11,7 +12,10 @@ import '../widgets/app_header.dart';
 import '../widgets/common.dart';
 
 class LoginPage extends StatefulWidget {
-  const LoginPage({super.key});
+  const LoginPage({super.key, this.entry = 'gate'});
+
+  /// 登录页来源：首页、详情页或发布页，仅用于埋点归因。
+  final String entry;
 
   @override
   State<LoginPage> createState() => _LoginPageState();
@@ -28,6 +32,12 @@ class _LoginPageState extends State<LoginPage> {
   bool _submitting = false;
   int _countdown = 0;
   Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    analytics.pageView('login', entry: widget.entry);
+  }
 
   @override
   void dispose() {
@@ -63,6 +73,7 @@ class _LoginPageState extends State<LoginPage> {
       return;
     }
     setState(() => _sending = true);
+    final startedAt = DateTime.now();
     try {
       final result = await apiClient.sendSmsCode(phone);
       if (!mounted) return;
@@ -75,7 +86,27 @@ class _LoginPageState extends State<LoginPage> {
       });
       _startCountdown(result.retryAfter);
       showMessage(context, '验证码已发送');
+      analytics.track(
+        'verification_requested',
+        pageName: 'login',
+        properties: {
+          'entry': widget.entry,
+          'challengeRef': result.challengeId,
+          'resultCode': 'ok',
+          'latencyMs': DateTime.now().difference(startedAt).inMilliseconds,
+        },
+      );
     } on ApiException catch (error) {
+      analytics.track(
+        'verification_requested',
+        pageName: 'login',
+        properties: {
+          'entry': widget.entry,
+          'resultCode': '${error.code}',
+          'latencyMs': DateTime.now().difference(startedAt).inMilliseconds,
+        },
+      );
+      analytics.clientError(module: 'login_sms', errorCode: error.code);
       if (!mounted) return;
       if (error.code == 'SMS_RATE_LIMITED') {
         final data = error.data;
@@ -103,6 +134,7 @@ class _LoginPageState extends State<LoginPage> {
       return;
     }
     setState(() => _submitting = true);
+    final startedAt = DateTime.now();
     try {
       final result = await apiClient.login(
         challengeId: _challengeId,
@@ -111,9 +143,30 @@ class _LoginPageState extends State<LoginPage> {
       );
       await sessionStore.apply(result);
       if (!mounted) return;
+      analytics.track(
+        'login_result',
+        pageName: 'login',
+        properties: {
+          'entry': widget.entry,
+          'outcome': 'success',
+          'isNewAccount': result.isNewAccount,
+          'durationMs': DateTime.now().difference(startedAt).inMilliseconds,
+        },
+      );
       showMessage(context, result.isNewAccount ? '欢迎加入' : '登录成功');
       Navigator.of(context).pop(true);
     } on ApiException catch (error) {
+      analytics.track(
+        'login_result',
+        pageName: 'login',
+        properties: {
+          'entry': widget.entry,
+          'outcome': 'failure',
+          'errorCode': '${error.code}',
+          'durationMs': DateTime.now().difference(startedAt).inMilliseconds,
+        },
+      );
+      analytics.clientError(module: 'login_submit', errorCode: error.code);
       if (mounted) showError(context, error);
     } finally {
       if (mounted) setState(() => _submitting = false);

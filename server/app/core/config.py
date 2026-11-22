@@ -28,7 +28,10 @@ class Settings(BaseSettings):
     redis_url: str = ""
     secret_key: str = "dev-only-change-me-in-production"
 
-    session_ttl_days: int = 30
+    # 普通用户会话有效期，单位天。产品要求“60 天免登录”，
+    # 即在 60 天内重复打开 App 不需要重新输入验证码；
+    # 管理员会话单独用分钟级配置，避免高权限凭证长期有效。
+    session_ttl_days: int = 60
     sms_code_ttl_seconds: int = 300
     sms_resend_seconds: int = 60
     sms_max_attempts: int = 5
@@ -47,8 +50,9 @@ class Settings(BaseSettings):
     )
 
     # ---- 管理后台 ----
-    # 管理员会话有效期，单位分钟。高权限账号使用短会话，泄露后的窗口更小。
-    admin_session_ttl_minutes: int = 120
+    # 管理员会话有效期，单位分钟。产品要求 1 天（1440 分钟）；
+    # 管理员权限高，虽然比普通用户的 60 天短很多，但仍要保留可主动撤销能力。
+    admin_session_ttl_minutes: int = 1440
     # 登录失败统计窗口，单位分钟。
     admin_login_window_minutes: int = 10
     # 同一用户名 + 同一来源地址在窗口内允许的失败次数。
@@ -59,10 +63,8 @@ class Settings(BaseSettings):
     admin_initial_username: str = "admin"
     admin_initial_password: str = ""
 
-    ai_provider: str = "mock"
-    ai_api_base: str = ""
-    ai_api_key: str = ""
-    ai_model: str = ""
+    # 模型供应商（地址、密钥、模型名、优先级）改由管理后台维护，见 ai_providers 表。
+    # 这里只保留所有环境共用的配额，避免“配置分散在环境变量和数据库两处”。
     guest_ai_daily_limit: int = 5
     user_ai_daily_limit: int = 20
 

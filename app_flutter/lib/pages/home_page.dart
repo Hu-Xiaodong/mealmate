@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../api/api_client.dart';
 import '../api/models.dart';
+import '../core/analytics.dart';
 import '../core/format.dart';
 import '../core/location.dart';
 import '../core/login_gate.dart';
@@ -14,7 +15,13 @@ import 'post_detail_page.dart';
 import 'publish_page.dart';
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+  const HomePage({super.key, this.onAiOpen, this.onAiDragStart});
+
+  /// 由 [MainShell] 统一打开 AI 面板：首页只负责发起，不重复处理埋点。
+  final VoidCallback? onAiOpen;
+
+  /// 拖动悬钮时通知外层取消“首次 AI 提示”的等待。
+  final VoidCallback? onAiDragStart;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -96,7 +103,34 @@ class _HomePageState extends State<HomePage> {
         _cursor = page.nextCursor;
         _hasMore = page.hasMore;
       });
+      // 曝光埋点用“首批已加载卡片”近似“至少一半可见 1 秒”：
+      // 首屏最多同时看到 6 张，重置加载时各记一次，翻页不重复记。
+      if (reset) {
+        for (var i = 0; i < _posts.length && i < 6; i++) {
+          analytics.track(
+            'meal_impression',
+            pageName: 'home',
+            properties: {
+              'postId': _posts[i].id,
+              'listType': effectiveFilter == 'near' ? 'nearby' : 'all',
+              'position': i + 1,
+            },
+          );
+        }
+      }
+      if (reset && effectiveFilter == 'near') {
+        analytics.track(
+          'nearby_result',
+          pageName: 'home',
+          properties: {
+            'permissionState': _coords != null ? 'granted' : 'unavailable',
+            'resultCode': 'ok',
+            'countBucket': _countBucket(page.items.length),
+          },
+        );
+      }
     } on ApiException catch (error) {
+      analytics.clientError(module: 'home_feed', errorCode: error.code);
       if (mounted) showError(context, error);
     } finally {
       if (mounted) {
@@ -121,6 +155,14 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  /// 结果数量分桶，避免把精确数量当成业务指标上报。
+  String _countBucket(int count) {
+    if (count <= 0) return '0';
+    if (count <= 5) return '1-5';
+    if (count <= 20) return '6-20';
+    return '20+';
+  }
+
   void _switchFilter(String next) {
     if (_filter == next) return;
     setState(() => _filter = next);
@@ -130,15 +172,36 @@ class _HomePageState extends State<HomePage> {
   Future<void> _toggleLike(PostCard post) async {
     await requireLogin(
       context,
+      entry: 'home',
+      pendingAction: 'like',
       action: () async {
+        final desired = !post.likedByMe;
         try {
-          final result = await apiClient.setLike(post.id, !post.likedByMe);
+          final result = await apiClient.setLike(post.id, desired);
           if (!mounted) return;
           setState(() {
             post.likedByMe = result.liked;
             post.likeCount = result.likeCount;
           });
+          analytics.track(
+            'like_result',
+            pageName: 'home',
+            properties: {
+              'postId': post.id,
+              'desiredState': desired ? 'liked' : 'unliked',
+              'resultCode': 'ok',
+            },
+          );
         } on ApiException catch (error) {
+          analytics.track(
+            'like_result',
+            pageName: 'home',
+            properties: {
+              'postId': post.id,
+              'desiredState': desired ? 'liked' : 'unliked',
+              'resultCode': '${error.code}',
+            },
+          );
           if (!mounted) return;
           showError(context, error);
         }
@@ -149,16 +212,23 @@ class _HomePageState extends State<HomePage> {
   Future<void> _openPublish() async {
     await requireLogin(
       context,
+      entry: 'home',
+      pendingAction: 'publish',
       action: () async {
-        await Navigator.of(context)
-            .push(MaterialPageRoute<void>(builder: (_) => const PublishPage()));
+        await Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => const PublishPage(entry: 'home'),
+          ),
+        );
       },
     );
   }
 
   void _openPost(PostCard post) {
     Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => PostDetailPage(postId: post.id)),
+      MaterialPageRoute<void>(
+        builder: (_) => PostDetailPage(postId: post.id, entry: 'home'),
+      ),
     );
   }
 
@@ -233,7 +303,15 @@ class _HomePageState extends State<HomePage> {
             ),
             Positioned.fill(
               child: DraggableAiFab(
-                onTap: () => showAiChatSheet(context),
+                onTap: () {
+                  // 打开动作交给 MainShell：它负责埋点和“已用过 AI”标记。
+                  if (widget.onAiOpen != null) {
+                    widget.onAiOpen!();
+                  } else {
+                    showAiChatSheet(context);
+                  }
+                },
+                onDragStart: widget.onAiDragStart,
               ),
             ),
           ],

@@ -18,6 +18,10 @@ dependencies = [
     "argon2-cffi>=23.1",
     "httpx>=0.27",
     "redis>=5.2",
+    # AI 调用层：LangChain 统一封装 OpenAI 兼容协议。
+    # langchain-core 提供消息模型，langchain-openai 提供 ChatOpenAI。
+    "langchain-core>=1.8,<2.0",
+    "langchain-openai>=1.8,<2.0",
     # Windows 不自带 IANA 时区库，zoneinfo 需要 tzdata。
     "tzdata>=2024.1",
 ]

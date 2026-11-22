@@ -9,6 +9,7 @@ from datetime import timedelta
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import ALL_PERMISSIONS
 from app.core.config import settings
 from app.core.security import encrypt_phone, hash_password, new_id, phone_lookup_key
 from app.db.models import (
@@ -35,28 +36,22 @@ SEED_AUTHORS = [
 SEED_ASSETS = [f"m_seed_{index}" for index in range(1, 7)]
 
 
-# 权限点是最小操作单位。角色只负责把权限点打包，
+# 权限点集中定义在 app/core/permissions.py，角色只负责把权限点打包。
 # 接口用 require_permission("post.review") 逐条声明自己需要的权限。
-ALL_PERMISSIONS = [
-    "post.review",
-    "post.unpublish",
-    "user.read",
-    "user.ban",
-    "recipe.manage",
-    "ai.log.read",
-    "ai.config.write",
-    "kb.document.manage",
-    "kb.search.test",
-    "audit.read",
-    "admin.manage",
-]
-
 ROLE_DEFINITIONS = [
     ("super_admin", "超级管理员", ALL_PERMISSIONS),
     (
         "content_operator",
         "内容运营",
-        ["post.review", "post.unpublish", "user.read", "user.ban", "recipe.manage"],
+        [
+            "post.review",
+            "post.unpublish",
+            "user.read",
+            "user.ban",
+            "recipe.manage",
+            "taste_tag.manage",
+            "dashboard.read",
+        ],
     ),
     (
         "ai_operator",

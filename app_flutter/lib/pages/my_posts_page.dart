@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../api/api_client.dart';
 import '../api/models.dart';
+import '../core/analytics.dart';
 import '../core/format.dart';
 import '../core/login_gate.dart';
 import '../session/session_store.dart';
@@ -38,6 +39,10 @@ class _MyPostsPageState extends State<MyPostsPage> {
   @override
   void initState() {
     super.initState();
+    analytics.pageView(
+      widget.draftOnly ? 'drafts' : 'my_posts',
+      entry: 'mine',
+    );
     _scroll.addListener(_onScroll);
     _load(reset: true);
   }
@@ -85,7 +90,9 @@ class _MyPostsPageState extends State<MyPostsPage> {
 
   Future<void> _goPublish() async {
     await Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => const PublishPage()),
+      MaterialPageRoute<void>(
+        builder: (_) => const PublishPage(entry: 'my_posts'),
+      ),
     );
     if (!mounted) return;
     await _load(reset: true);
@@ -93,7 +100,9 @@ class _MyPostsPageState extends State<MyPostsPage> {
 
   Future<void> _openDraft(PostCard draft) async {
     await Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => PublishPage(draftId: draft.id)),
+      MaterialPageRoute<void>(
+        builder: (_) => PublishPage(draftId: draft.id, entry: 'my_posts'),
+      ),
     );
     if (!mounted) return;
     await _load(reset: true);
@@ -102,15 +111,36 @@ class _MyPostsPageState extends State<MyPostsPage> {
   Future<void> _toggleLike(PostCard post) async {
     await requireLogin(
       context,
+      entry: 'my_posts',
+      pendingAction: 'like',
       action: () async {
+        final desired = !post.likedByMe;
         try {
-          final result = await apiClient.setLike(post.id, !post.likedByMe);
+          final result = await apiClient.setLike(post.id, desired);
           if (!mounted) return;
           setState(() {
             post.likedByMe = result.liked;
             post.likeCount = result.likeCount;
           });
+          analytics.track(
+            'like_result',
+            pageName: 'my_posts',
+            properties: {
+              'postId': post.id,
+              'desiredState': desired ? 'liked' : 'unliked',
+              'resultCode': 'ok',
+            },
+          );
         } on ApiException catch (error) {
+          analytics.track(
+            'like_result',
+            pageName: 'my_posts',
+            properties: {
+              'postId': post.id,
+              'desiredState': desired ? 'liked' : 'unliked',
+              'resultCode': '${error.code}',
+            },
+          );
           if (!mounted) return;
           showError(context, error);
         }
@@ -121,7 +151,7 @@ class _MyPostsPageState extends State<MyPostsPage> {
   void _open(PostCard post) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => PostDetailPage(postId: post.id),
+        builder: (_) => PostDetailPage(postId: post.id, entry: 'my_posts'),
       ),
     );
   }

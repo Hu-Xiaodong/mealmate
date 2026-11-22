@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../api/api_client.dart';
 import '../api/models.dart';
+import '../core/analytics.dart';
 import '../core/format.dart';
 import '../core/login_gate.dart';
 import '../session/session_store.dart';
@@ -30,6 +31,7 @@ class _FavoritesPageState extends State<FavoritesPage> {
   @override
   void initState() {
     super.initState();
+    analytics.pageView('favorites', entry: 'mine');
     _scroll.addListener(_onScroll);
     _load(reset: true);
   }
@@ -66,6 +68,7 @@ class _FavoritesPageState extends State<FavoritesPage> {
         _loadedOnce = true;
       });
     } on ApiException catch (error) {
+      analytics.clientError(module: 'favorites', errorCode: error.code);
       if (mounted) showError(context, error);
     } finally {
       if (mounted) setState(() => _loading = false);
@@ -79,10 +82,16 @@ class _FavoritesPageState extends State<FavoritesPage> {
     }
     final route = item.targetType == 'post'
         ? MaterialPageRoute<void>(
-            builder: (_) => PostDetailPage(postId: item.targetId),
+            builder: (_) => PostDetailPage(
+              postId: item.targetId,
+              entry: 'favorites',
+            ),
           )
         : MaterialPageRoute<void>(
-            builder: (_) => RecipeDetailPage(recipeId: item.targetId),
+            builder: (_) => RecipeDetailPage(
+              recipeId: item.targetId,
+              entry: 'favorites',
+            ),
           );
     Navigator.of(context).push(route);
   }
@@ -105,7 +114,27 @@ class _FavoritesPageState extends State<FavoritesPage> {
             .toList(growable: false);
       });
       showMessage(context, '已取消收藏');
+      analytics.track(
+        'favorite_result',
+        pageName: 'favorites',
+        properties: {
+          'targetType': item.targetType,
+          'targetId': item.targetId,
+          'desiredState': 'unsaved',
+          'resultCode': 'ok',
+        },
+      );
     } on ApiException catch (error) {
+      analytics.track(
+        'favorite_result',
+        pageName: 'favorites',
+        properties: {
+          'targetType': item.targetType,
+          'targetId': item.targetId,
+          'desiredState': 'unsaved',
+          'resultCode': '${error.code}',
+        },
+      );
       if (mounted) showError(context, error);
     }
   }

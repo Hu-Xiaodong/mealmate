@@ -3,10 +3,11 @@
 与普通用户认证完全独立：
 - 账号来自 admin_users，不使用手机号；
 - 密码使用 Argon2id 哈希校验；
-- 会话来自 admin_sessions，默认 2 小时过期；
+- 会话来自 admin_sessions，默认 1 天（1440 分钟）过期；
 - 登录失败按“用户名 + 来源地址”计数并锁定。
 """
 
+import hmac
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -17,10 +18,11 @@ from app.api.serializers import iso
 from app.core.config import settings
 from app.core.errors import AppError
 from app.core.security import (
-    admin_new_token,
     admin_token_digest,
     hash_password,
+    issue_session_token,
     new_id,
+    read_session_token,
     verify_password,
 )
 from app.db.models import (
@@ -132,13 +134,15 @@ async def login_admin(
     if attempt is not None:
         await db.delete(attempt)
     admin.last_login_at = now
-    token = admin_new_token()
+    # 与用户端一致：先生成会话编号，再加密成令牌返回，数据库只存摘要。
+    session_id = new_id("as")
+    token, payload = issue_session_token(session_id, prefix="adm_")
     expires_at = now + timedelta(minutes=settings.admin_session_ttl_minutes)
     db.add(
         AdminSession(
-            id=new_id("as"),
+            id=session_id,
             admin_id=admin.id,
-            token_digest=admin_token_digest(token),
+            token_digest=admin_token_digest(payload),
             expires_at=expires_at,
             ip=ip,
         )
@@ -197,21 +201,19 @@ async def _record_failure(
 async def resolve_admin_session(db: AsyncSession, token: str) -> AdminUser | None:
     """根据令牌解析当前管理员。
 
-    数据库里只保存令牌摘要，所以先把请求带来的令牌做同样摘要再查询。
+    令牌先解密得到会话编号，再读取会话并比对摘要。
     会话过期、已注销、账号停用三种情况都返回 None，由接口层统一返回 401。
     """
-    if not token:
+    parsed = read_session_token(token, prefix="adm_")
+    if parsed is None:
         return None
-    session = await db.scalar(
-        select(AdminSession)
-        .where(
-            AdminSession.token_digest == admin_token_digest(token),
-            AdminSession.revoked_at.is_(None),
-        )
-        .order_by(AdminSession.created_at.desc())
-        .limit(1)
-    )
-    if session is None or as_utc(session.expires_at) < now_utc():
+    session_id, payload = parsed
+    session = await db.get(AdminSession, session_id)
+    if session is None or session.revoked_at is not None:
+        return None
+    if not hmac.compare_digest(session.token_digest, admin_token_digest(payload)):
+        return None
+    if as_utc(session.expires_at) < now_utc():
         return None
     admin = await db.get(AdminUser, session.admin_id)
     if admin is None or admin.status != "active":
@@ -224,13 +226,16 @@ async def revoke_admin_session(db: AsyncSession, token: str) -> None:
 
     不删除会话行，而是写入 revoked_at。保留记录便于审计“谁在什么时候退出”。
     """
-    session = await db.scalar(
-        select(AdminSession).where(
-            AdminSession.token_digest == admin_token_digest(token),
-            AdminSession.revoked_at.is_(None),
-        )
-    )
-    if session is not None:
+    parsed = read_session_token(token, prefix="adm_")
+    if parsed is None:
+        return
+    session_id, payload = parsed
+    session = await db.get(AdminSession, session_id)
+    if (
+        session is not None
+        and session.revoked_at is None
+        and hmac.compare_digest(session.token_digest, admin_token_digest(payload))
+    ):
         session.revoked_at = now_utc()
         await db.commit()
 

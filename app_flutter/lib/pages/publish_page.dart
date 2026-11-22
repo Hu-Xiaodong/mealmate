@@ -8,6 +8,7 @@ import 'package:image_picker/image_picker.dart';
 
 import '../api/api_client.dart';
 import '../api/models.dart';
+import '../core/analytics.dart';
 import '../core/format.dart';
 import '../core/location.dart';
 import '../core/login_gate.dart';
@@ -20,10 +21,13 @@ import '../widgets/segmented_tabs.dart';
 import 'store_map_page.dart';
 
 class PublishPage extends StatefulWidget {
-  const PublishPage({super.key, this.draftId});
+  const PublishPage({super.key, this.draftId, this.entry = 'unknown'});
 
   /// 传入草稿编号时进入“继续编辑草稿”模式。
   final String? draftId;
+
+  /// 从哪个入口进入发布页：首页、我的或我的发布，仅用于埋点。
+  final String entry;
 
   @override
   State<PublishPage> createState() => _PublishPageState();
@@ -78,6 +82,15 @@ class _PublishPageState extends State<PublishPage> {
   void initState() {
     super.initState();
     _draftId = widget.draftId;
+    analytics.pageView('publish', entry: widget.entry);
+    analytics.track(
+      'publish_start',
+      pageName: 'publish',
+      properties: {
+        'entry': widget.entry,
+        'draftRestored': widget.draftId != null,
+      },
+    );
     _bootstrap();
   }
 
@@ -215,6 +228,16 @@ class _PublishPageState extends State<PublishPage> {
   /// 切换来源：自己做不需要定位；外卖 / 到店必须先拿到定位。
   Future<void> _selectSource(String value) async {
     if (value == _source) return;
+    final fromSource = _source;
+    // 只有真正切换成功才记 source_change；定位失败导致没切过去时不记。
+    void trackChange() {
+      analytics.track(
+        'source_change',
+        pageName: 'publish',
+        properties: {'fromSource': fromSource, 'toSource': value},
+      );
+    }
+
     if (value == 'self') {
       setState(() {
         _source = 'self';
@@ -223,6 +246,7 @@ class _PublishPageState extends State<PublishPage> {
         _store.clear();
         _address.clear();
       });
+      trackChange();
       return;
     }
     final coords = await _resolveLocation(force: true);
@@ -233,6 +257,7 @@ class _PublishPageState extends State<PublishPage> {
       _store.clear();
       _address.clear();
     });
+    trackChange();
   }
 
   /// 打开全屏地图选点页，并把结果回填到店名 / 地址字段。
@@ -502,7 +527,11 @@ class _PublishPageState extends State<PublishPage> {
 
   Future<void> _submit() async {
     if (!sessionStore.isLoggedIn) {
-      await requireLogin(context);
+      await requireLogin(
+        context,
+        entry: 'publish',
+        pendingAction: 'publish',
+      );
       if (!mounted || !sessionStore.isLoggedIn) return;
     }
     if (_submitting) return;
@@ -549,20 +578,45 @@ class _PublishPageState extends State<PublishPage> {
     final payload = _payload();
 
     setState(() => _submitting = true);
+    final stopwatch = Stopwatch()..start();
     try {
       final draftId = _draftId;
       final result = draftId == null
           ? await apiClient.createPost(payload, _idempotencyKey)
           : await apiClient.publishDraft(draftId, payload);
       if (draftId == null) _idempotencyKey = _makeKey();
+      analytics.track(
+        'publish_result',
+        pageName: 'publish',
+        properties: {
+          'source': _source,
+          'imageCount': _images.length,
+          'hasAuthorRecipe': _recipeOpen,
+          'resultCode': result.reviewRequired ? 'pending_review' : 'published',
+          'durationMs': stopwatch.elapsedMilliseconds,
+        },
+      );
       if (!mounted) return;
       // 提示和返回同时发生：先插入浮层，再立刻返回上一页。
       // 浮层挂在 Navigator 的 Overlay 上，不会随发布页一起销毁，会在上一页继续淡出。
       _showPublishResult(result.reviewRequired ? '已提交审核' : '发布成功');
       Navigator.of(context).pop();
     } on ApiException catch (error) {
+      analytics.track(
+        'publish_result',
+        pageName: 'publish',
+        properties: {
+          'source': _source,
+          'imageCount': _images.length,
+          'hasAuthorRecipe': _recipeOpen,
+          'resultCode': '${error.code}',
+          'durationMs': stopwatch.elapsedMilliseconds,
+        },
+      );
+      analytics.clientError(module: 'publish', errorCode: error.code);
       if (mounted) showError(context, error);
     } finally {
+      stopwatch.stop();
       if (mounted) setState(() => _submitting = false);
     }
   }

@@ -3,7 +3,7 @@ import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 
-import { approvePost, listPosts, rejectPost, unpublishPost } from '@/api/admin'
+import { approvePost, batchReviewPosts, listPosts, rejectPost, unpublishPost } from '@/api/admin'
 import type { AdminPost } from '@/api/types'
 import {
   formatDateTime,
@@ -20,6 +20,15 @@ const nextCursor = ref<string | null>(null)
 
 const drawerVisible = ref(false)
 const activePostId = ref('')
+const tableRef = ref()
+const selectedRows = ref<AdminPost[]>([])
+
+const batchDialog = reactive({
+  visible: false,
+  action: 'approve' as 'approve' | 'reject',
+  reason: '',
+  submitting: false,
+})
 
 const reasonDialog = reactive({
   visible: false,
@@ -65,6 +74,8 @@ async function load(reset = false) {
     items.value = reset ? data.items : [...items.value, ...data.items]
     nextCursor.value = data.nextCursor
     hasMore.value = data.hasMore
+    selectedRows.value = []
+    tableRef.value?.clearSelection()
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '加载饭帖失败')
   } finally {
@@ -77,9 +88,73 @@ function reload() {
   return load(true)
 }
 
-function openDetail(row: AdminPost) {
+function openDetail(row: AdminPost, column?: { type?: string }) {
+  // 勾选框那一列不触发详情，否则批量选择时会被抽屉打断。
+  if (column?.type === 'selection') return
   activePostId.value = row.id
   drawerVisible.value = true
+}
+
+function handleSelectionChange(rows: AdminPost[]) {
+  selectedRows.value = rows
+}
+
+async function openBatch(action: 'approve' | 'reject') {
+  if (!selectedRows.value.length) {
+    ElMessage.warning('请先勾选要处理的饭帖')
+    return
+  }
+  if (action === 'reject') {
+    batchDialog.action = 'reject'
+    batchDialog.reason = ''
+    batchDialog.visible = true
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `确认批量通过已勾选的 ${selectedRows.value.length} 条饭帖？`,
+      '批量通过',
+      { type: 'warning', confirmButtonText: '确认通过', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  submitBatch('approve')
+}
+
+async function submitBatch(action: 'approve' | 'reject') {
+  const ids = selectedRows.value.map((row) => row.id)
+  if (!ids.length) {
+    ElMessage.warning('请先勾选要处理的饭帖')
+    return
+  }
+  if (action === 'reject' && batchDialog.reason.trim().length < 2) {
+    ElMessage.warning('请填写至少 2 个字的拒绝原因')
+    return
+  }
+  batchDialog.submitting = true
+  try {
+    const result = await batchReviewPosts(
+      ids,
+      action,
+      action === 'reject' ? batchDialog.reason.trim() : undefined,
+    )
+    const failed = result.results.filter((item) => !item.ok)
+    if (result.failed) {
+      const first = failed[0]
+      ElMessage.warning(
+        `成功 ${result.succeeded} 条，失败 ${result.failed} 条。首条失败原因：${first?.message || first?.errorCode || '未知'}`,
+      )
+    } else {
+      ElMessage.success(`已${action === 'approve' ? '通过' : '拒绝'} ${result.succeeded} 条`)
+    }
+    batchDialog.visible = false
+    await reload()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '批量操作失败')
+  } finally {
+    batchDialog.submitting = false
+  }
 }
 
 async function approve(row: AdminPost) {
@@ -174,18 +249,30 @@ onMounted(() => load(true))
           </el-radio-button>
         </el-radio-group>
         <span class="toolbar-spacer" />
+        <template v-if="selectedRows.length">
+          <span class="muted">已选 {{ selectedRows.length }} 条</span>
+          <el-button size="small" type="success" plain @click="openBatch('approve')">
+            批量通过
+          </el-button>
+          <el-button size="small" type="danger" plain @click="openBatch('reject')">
+            批量拒绝
+          </el-button>
+        </template>
         <span class="muted">共加载 {{ items.length }} 条</span>
       </div>
     </section>
 
     <section class="panel">
       <el-table
+        ref="tableRef"
         :data="items"
         v-loading="loading"
         row-key="id"
         row-class-name="clickable-row"
         @row-click="openDetail"
+        @selection-change="handleSelectionChange"
       >
+        <el-table-column type="selection" width="46" reserve-selection />
         <el-table-column label="封面" width="82">
           <template #default="{ row }">
             <el-image
@@ -276,6 +363,35 @@ onMounted(() => load(true))
         <el-button :loading="loading" @click="load(false)">加载更多</el-button>
       </div>
     </section>
+
+    <el-dialog
+      v-model="batchDialog.visible"
+      title="批量拒绝"
+      width="480px"
+      destroy-on-close
+    >
+      <p class="dialog-tip">
+        将拒绝已勾选的 {{ selectedRows.length }} 条饭帖，每一条都会写入审核原因与审计日志。
+      </p>
+      <el-input
+        v-model="batchDialog.reason"
+        type="textarea"
+        :rows="4"
+        maxlength="200"
+        show-word-limit
+        placeholder="请填写具体原因，至少 2 个字"
+      />
+      <template #footer>
+        <el-button @click="batchDialog.visible = false">取消</el-button>
+        <el-button
+          type="danger"
+          :loading="batchDialog.submitting"
+          @click="submitBatch('reject')"
+        >
+          确认批量拒绝
+        </el-button>
+      </template>
+    </el-dialog>
 
     <PostDetailDrawer v-model="drawerVisible" :post-id="activePostId" />
 

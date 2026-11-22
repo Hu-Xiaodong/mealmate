@@ -11,8 +11,14 @@ declare module 'vue-router' {
 }
 
 export const NAV_ITEMS = [
+  { path: '/dashboard', label: '数据看板', permission: 'dashboard.read' },
   { path: '/posts', label: '饭帖审核', permission: 'post.review' },
+  { path: '/recipes', label: '菜谱管理', permission: 'recipe.manage' },
+  { path: '/taste-tags', label: '口味标签', permission: 'taste_tag.manage' },
+  { path: '/ai-providers', label: '模型配置', permission: 'ai.config.write' },
+  { path: '/ai-call-logs', label: 'AI 调用日志', permission: 'ai.log.read' },
   { path: '/users', label: '用户管理', permission: 'user.read' },
+  { path: '/admins', label: '管理员与角色', permission: 'admin.manage' },
   { path: '/audit-logs', label: '审计日志', permission: 'audit.read' },
 ]
 
@@ -39,8 +45,14 @@ const router = createRouter({
     {
       path: '/',
       component: () => import('@/layouts/AdminLayout.vue'),
-      redirect: '/posts',
+      redirect: '/dashboard',
       children: [
+        {
+          path: 'dashboard',
+          name: 'dashboard',
+          component: () => import('@/views/dashboard/DashboardView.vue'),
+          meta: { title: '数据看板', permission: 'dashboard.read' },
+        },
         {
           path: 'posts',
           name: 'posts',
@@ -48,10 +60,40 @@ const router = createRouter({
           meta: { title: '饭帖审核', permission: 'post.review' },
         },
         {
+          path: 'recipes',
+          name: 'recipes',
+          component: () => import('@/views/recipes/RecipeListView.vue'),
+          meta: { title: '菜谱管理', permission: 'recipe.manage' },
+        },
+        {
+          path: 'taste-tags',
+          name: 'taste-tags',
+          component: () => import('@/views/tags/TasteTagView.vue'),
+          meta: { title: '口味标签', permission: 'taste_tag.manage' },
+        },
+        {
+          path: 'ai-providers',
+          name: 'ai-providers',
+          component: () => import('@/views/ai/AIProviderView.vue'),
+          meta: { title: '模型配置', permission: 'ai.config.write' },
+        },
+        {
+          path: 'ai-call-logs',
+          name: 'ai-call-logs',
+          component: () => import('@/views/ai/AICallLogView.vue'),
+          meta: { title: 'AI 调用日志', permission: 'ai.log.read' },
+        },
+        {
           path: 'users',
           name: 'users',
           component: () => import('@/views/users/UserListView.vue'),
           meta: { title: '用户管理', permission: 'user.read' },
+        },
+        {
+          path: 'admins',
+          name: 'admins',
+          component: () => import('@/views/admins/AdminListView.vue'),
+          meta: { title: '管理员与角色', permission: 'admin.manage' },
         },
         {
           path: 'audit-logs',

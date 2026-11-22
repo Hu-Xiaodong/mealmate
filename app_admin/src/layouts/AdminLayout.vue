@@ -3,10 +3,16 @@ import { computed, type Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
+  Avatar,
   ArrowDown,
+  Cpu,
+  DataAnalysis,
+  Dish,
   Document,
   List,
+  PriceTag,
   SwitchButton,
+  Tickets,
   User,
 } from '@element-plus/icons-vue'
 
@@ -18,8 +24,14 @@ const router = useRouter()
 const store = useAdminStore()
 
 const iconMap: Record<string, Component> = {
+  '/dashboard': DataAnalysis,
   '/posts': Document,
+  '/recipes': Dish,
+  '/taste-tags': PriceTag,
+  '/ai-providers': Cpu,
+  '/ai-call-logs': Tickets,
   '/users': User,
+  '/admins': Avatar,
   '/audit-logs': List,
 }
 

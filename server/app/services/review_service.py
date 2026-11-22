@@ -100,16 +100,21 @@ async def list_admin_posts(
     status: str | None,
     cursor: str | None,
     limit: int,
+    author_id: str | None = None,
 ) -> dict[str, Any]:
-    """后台饭帖列表，支持按状态筛选和游标分页。
+    """后台饭帖列表，支持按状态、作者筛选和游标分页。
 
     默认按创建时间倒序：新提交的内容排在前面，审核人员先处理最新的。
+    author_id 用于用户详情的“查看发布”，复用同一套返回字段，
+    避免后台出现两套饭帖摘要格式。
     """
     if status and status not in POST_STATUSES:
         raise AppError("POST_STATUS_INVALID", "饭帖状态筛选值不正确")
 
     limit = min(max(limit, 1), MAX_PAGE_SIZE)
     conditions = []
+    if author_id:
+        conditions.append(MealPost.author_id == author_id)
     if status:
         conditions.append(MealPost.status == status)
     else:

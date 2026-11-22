@@ -9,7 +9,6 @@ os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_placeholder.db"
 os.environ["SECRET_KEY"] = "test-secret-key"
 os.environ["ALLOW_DEV_AUTH_CODE"] = "true"
 os.environ["DEV_AUTH_CODE"] = "123456"
-os.environ["AI_PROVIDER"] = "mock"
 os.environ["SEED_DEMO_DATA"] = "true"
 os.environ["RANK_CACHE_SECONDS"] = "10"
 # 测试不访问真实地图服务：把腾讯地图 Key 与 Secret Key 都置空，

@@ -14,10 +14,14 @@ class MinePage extends StatelessWidget {
 
   Future<void> _openProtected(
     BuildContext context,
-    WidgetBuilder builder,
-  ) async {
+    WidgetBuilder builder, {
+    String entry = 'mine',
+    String pendingAction = 'open_page',
+  }) async {
     await requireLogin(
       context,
+      entry: entry,
+      pendingAction: pendingAction,
       action: () async {
         await Navigator.of(
           context,
@@ -115,7 +119,11 @@ class MinePage extends StatelessWidget {
           ),
           const SizedBox(height: 18),
           GestureDetector(
-            onTap: () => requireLogin(context),
+            onTap: () => requireLogin(
+              context,
+              entry: 'mine',
+              pendingAction: 'login',
+            ),
             behavior: HitTestBehavior.opaque,
             child: Container(
               padding: const EdgeInsets.symmetric(
@@ -230,6 +238,7 @@ class MinePage extends StatelessWidget {
             () => _openProtected(
               context,
               (_) => const MyPostsPage(),
+              pendingAction: 'open_my_posts',
             ),
           ),
           _divider(),
@@ -238,6 +247,7 @@ class MinePage extends StatelessWidget {
             () => _openProtected(
               context,
               (_) => const MyPostsPage(draftOnly: true),
+              pendingAction: 'open_drafts',
             ),
           ),
           _divider(),
@@ -246,6 +256,7 @@ class MinePage extends StatelessWidget {
             () => _openProtected(
               context,
               (_) => const FavoritesPage(),
+              pendingAction: 'open_favorites',
             ),
           ),
           _divider(),
@@ -253,7 +264,8 @@ class MinePage extends StatelessWidget {
             '发布今天的饭',
             () => _openProtected(
               context,
-              (_) => const PublishPage(),
+              (_) => const PublishPage(entry: 'mine'),
+              pendingAction: 'publish',
             ),
           ),
         ],

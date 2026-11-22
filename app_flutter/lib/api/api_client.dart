@@ -48,6 +48,9 @@ class ApiClient {
   String? token;
   String deviceId = '';
 
+  /// 会话失效时的回调，由 SessionStore 注入，用于清理本地保存的令牌与资料。
+  Future<void> Function()? onSessionExpired;
+
   static const Duration _timeout = Duration(seconds: 15);
 
   Map<String, String> _headers({bool auth = true}) {
@@ -132,6 +135,32 @@ class ApiClient {
     }
 
     final response = await _send(run);
+    try {
+      return _parseResponse(response, expectMap: expectMap);
+    } on ApiException catch (error) {
+      // 本地保存的令牌可能因为过期、被撤销或服务端更换签名密钥而失效。
+      // 公开接口（例如首页内容流）允许匿名访问，此时不能把“令牌失效”
+      // 当成“没有内容”或直接报错，而应清理本地会话后以游客身份重试一次。
+      final expired =
+          error.code == 'SESSION_EXPIRED' || error.code == 'UNAUTHORIZED';
+      final current = token;
+      if (!expired || !auth || current == null || current.isEmpty) {
+        rethrow;
+      }
+      token = null;
+      final callback = onSessionExpired;
+      if (callback != null) {
+        await callback();
+      }
+      final retry = await _send(run);
+      return _parseResponse(retry, expectMap: expectMap);
+    }
+  }
+
+  Map<String, dynamic> _parseResponse(
+    http.Response response, {
+    required bool expectMap,
+  }) {
     if (!expectMap) {
       // 仅用于确认 data 为 null 的成功响应。
       final decoded = jsonDecode(utf8.decode(response.bodyBytes));
@@ -438,6 +467,19 @@ class ApiClient {
       headers: {'Idempotency-Key': idempotencyKey},
     );
     return PublishResult.fromJson(data);
+  }
+
+  /// 批量上报客户端埋点。
+  ///
+  /// 这个接口允许游客调用；如果当前已登录，会带上令牌，
+  /// 后端据此回填账号归属，事件体里不传任何账号信息。
+  Future<void> reportEvents(List<Map<String, Object?>> events) async {
+    await _request(
+      '/api/v1/analytics/events',
+      method: 'POST',
+      body: {'events': events},
+      expectMap: false,
+    );
   }
 
   Future<AIChatResult> aiChat({

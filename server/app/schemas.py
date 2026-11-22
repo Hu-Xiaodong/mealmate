@@ -1,6 +1,7 @@
 """请求体模型。响应由 serializer 输出 camelCase 字典。"""
 
-from typing import Literal
+from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic.alias_generators import to_camel
@@ -221,6 +222,46 @@ class AIChatRequest(CamelModel):
     constraints: AIConstraints = Field(default_factory=AIConstraints)
 
 
+class AIProviderCreateRequest(CamelModel):
+    """后台新增一个模型供应商。
+
+    这里只放“运营需要填写的字段”，不接收供应商编号与时间：
+    编号由服务端生成，时间由数据库自动维护，客户端传了也不会被采用。
+    """
+
+    name: str = Field(min_length=1, max_length=40)
+    # 目前只支持 OpenAI 兼容协议，写成 Literal 后，传其他值会直接返回 422。
+    provider_type: Literal["openai_compatible"] = "openai_compatible"
+    base_url: str = Field(min_length=1, max_length=255)
+    # 只在新增时必填；编辑时留空表示保留原密钥。
+    api_key: str = Field(min_length=1, max_length=300)
+    model: str = Field(min_length=1, max_length=80)
+    enabled: bool = True
+    # 数字越小越先尝试。范围限制是为了避免误填超大值导致排序不直观。
+    priority: int = Field(default=100, ge=0, le=9999)
+    timeout_seconds: int = Field(default=20, ge=3, le=120)
+    max_output_tokens: int = Field(default=800, ge=100, le=4000)
+
+
+class AIProviderUpdateRequest(CamelModel):
+    """编辑模型供应商。所有字段可选，只更新传了的字段。
+
+    api_key 特殊约定：不传、传空字符串都表示“保留原密钥”。
+    这样前端编辑页不必回填明文密钥（也不应该回填），
+    运营只改模型名或优先级时不会把密钥清掉。
+    """
+
+    name: str | None = Field(default=None, min_length=1, max_length=40)
+    provider_type: Literal["openai_compatible"] | None = None
+    base_url: str | None = Field(default=None, min_length=1, max_length=255)
+    api_key: str | None = Field(default=None, max_length=300)
+    model: str | None = Field(default=None, min_length=1, max_length=80)
+    enabled: bool | None = None
+    priority: int | None = Field(default=None, ge=0, le=9999)
+    timeout_seconds: int | None = Field(default=None, ge=3, le=120)
+    max_output_tokens: int | None = Field(default=None, ge=100, le=4000)
+
+
 class AdminLoginRequest(CamelModel):
     """管理员登录请求。
 
@@ -240,4 +281,153 @@ class ReasonRequest(CamelModel):
     """
 
     reason: str = Field(min_length=2, max_length=200)
+
+
+class BatchReviewRequest(CamelModel):
+    """批量审核请求。
+
+    为什么限制一次最多 20 条：批量操作会逐条写审计日志并提交事务，
+    条数过多会长时间占用数据库连接；20 条既能提升效率，也能保证失败可解释。
+    """
+
+    post_ids: list[str] = Field(min_length=1, max_length=20)
+    action: Literal["approve", "reject"]
+    reason: str | None = Field(default=None, max_length=200)
+
+    @model_validator(mode="after")
+    def _dedupe_and_validate(self):
+        # 去重但保留顺序，避免同一帖子在一次请求里被处理两次。
+        self.post_ids = list(dict.fromkeys(self.post_ids))
+        if self.action == "reject" and len((self.reason or "").strip()) < 2:
+            raise ValueError("批量拒绝需要填写至少 2 个字的原因")
+        return self
+
+
+class AnalyticsEventItem(CamelModel):
+    """单条客户端埋点。
+
+    eventId 由客户端生成，服务端用它做幂等：网络重试不会重复计数。
+    这里不接收 accountId，登录用户由后端从令牌解析，防止客户端伪造归属。
+    """
+
+    event_id: str = Field(min_length=8, max_length=64)
+    event_name: str = Field(min_length=2, max_length=40)
+    page_name: str | None = Field(default=None, max_length=40)
+    platform: str | None = Field(default=None, max_length=20)
+    app_version: str | None = Field(default=None, max_length=20)
+    session_ref: str | None = Field(default=None, max_length=64)
+    request_id: str | None = Field(default=None, max_length=64)
+    occurred_at: datetime | None = None
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+
+class AnalyticsBatchRequest(CamelModel):
+    """批量上报。单批最多 50 条，客户端失败后可整批重试。"""
+
+    events: list[AnalyticsEventItem] = Field(min_length=1, max_length=50)
+
+
+class RecipeIngredientInput(CamelModel):
+    name: str = Field(min_length=1, max_length=40)
+    amount: str = Field(min_length=1, max_length=40)
+
+
+class RecipeInput(CamelModel):
+    """后台新增或编辑菜谱。
+
+    菜谱是平台内容，不接收客户端传来的发布者编号。
+    mainIngredients 允许不填，后端会从 ingredients 的前三个名称派生，
+    避免运营重复录入同一份信息。
+    """
+
+    title: str = Field(min_length=1, max_length=40)
+    cover_url: str = Field(min_length=1, max_length=255)
+    total_minutes: int = Field(ge=1, le=180)
+    tool_codes: list[str] = Field(default_factory=list, max_length=8)
+    category_codes: list[str] = Field(default_factory=list, max_length=8)
+    servings: float = Field(default=1, gt=0, le=20)
+    main_ingredients: list[str] = Field(default_factory=list, max_length=3)
+    ingredients: list[RecipeIngredientInput] = Field(min_length=1, max_length=30)
+    steps: list[str] = Field(min_length=1, max_length=30)
+    preconditions: str | None = Field(default=None, max_length=200)
+    content_origin: Literal["platform", "editor"] = "platform"
+    validation_status: Literal["tested", "pending", "not_tested"] = "pending"
+    status: Literal["draft", "published", "archived"] = "published"
+
+    @model_validator(mode="after")
+    def _clean(self):
+        self.title = self.title.strip()
+        self.cover_url = self.cover_url.strip()
+        self.steps = [item.strip() for item in self.steps if item.strip()]
+        self.tool_codes = list(dict.fromkeys(code.strip() for code in self.tool_codes if code.strip()))
+        self.category_codes = list(
+            dict.fromkeys(code.strip() for code in self.category_codes if code.strip())
+        )
+        invalid = [item.name for item in self.ingredients if not item.name.strip()]
+        if invalid:
+            raise ValueError("食材名称不能为空")
+        if not self.steps:
+            raise ValueError("至少需要填写一个步骤")
+        if not self.main_ingredients:
+            self.main_ingredients = [
+                item.name.strip()[:12] for item in self.ingredients[:3]
+            ]
+        else:
+            self.main_ingredients = [name.strip() for name in self.main_ingredients if name.strip()][:3]
+        return self
+
+
+class TasteTagCreateRequest(CamelModel):
+    """口味标签字典新增。
+
+    标签名称是字典的主键语义，创建后不允许改名，
+    否则历史饭帖里的 JSON 标签会变成孤儿数据。
+    """
+
+    name: str = Field(min_length=1, max_length=16)
+    sort_order: int = Field(default=100, ge=0, le=9999)
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def _clean(self):
+        self.name = self.name.strip()
+        if not self.name:
+            raise ValueError("标签名称不能为空")
+        return self
+
+
+class TasteTagUpdateRequest(CamelModel):
+    """标签维护只允许调整排序和启停，避免改名破坏历史数据。"""
+
+    sort_order: int | None = Field(default=None, ge=0, le=9999)
+    enabled: bool | None = None
+
+
+class AdminCreateRequest(CamelModel):
+    """新增管理员。密码只在这里出现一次，服务端只保存 Argon2id 哈希。"""
+
+    username: str = Field(pattern=r"^[A-Za-z0-9_.-]{2,40}$")
+    password: str = Field(min_length=8, max_length=128)
+    display_name: str = Field(min_length=1, max_length=40)
+    role_ids: list[str] = Field(min_length=1, max_length=10)
+
+
+class AdminUpdateRequest(CamelModel):
+    """编辑管理员。字段全部可选，只更新传了的字段。"""
+
+    display_name: str | None = Field(default=None, min_length=1, max_length=40)
+    password: str | None = Field(default=None, min_length=8, max_length=128)
+    status: Literal["active", "disabled"] | None = None
+    role_ids: list[str] | None = Field(default=None, max_length=10)
+
+
+class AdminRoleRequest(CamelModel):
+    code: str = Field(pattern=r"^[a-z][a-z0-9_.-]{1,39}$")
+    name: str = Field(min_length=1, max_length=40)
+    permissions: list[str] = Field(default_factory=list, max_length=40)
+
+
+class AdminRoleUpdateRequest(CamelModel):
+    name: str | None = Field(default=None, min_length=1, max_length=40)
+    permissions: list[str] | None = Field(default=None, max_length=40)
 

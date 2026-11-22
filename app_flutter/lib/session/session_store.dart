@@ -45,6 +45,9 @@ class SessionStore extends ChangeNotifier {
     }
     api.deviceId = deviceId;
     api.token = _token;
+    // 服务端判定令牌失效时，接口层会回调这里清理本地会话，
+    // 避免“我的”页面仍显示已登录、但所有请求都被拒绝。
+    api.onSessionExpired = clear;
   }
 
   Future<void> apply(LoginResult result) async {

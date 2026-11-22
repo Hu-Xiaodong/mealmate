@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 
 import '../api/api_client.dart';
 import '../api/models.dart';
+import '../core/analytics.dart';
 import '../core/format.dart';
 import '../theme/app_theme.dart';
+import '../widgets/ai_assistant.dart';
 import '../widgets/empty_state.dart';
 import '../widgets/recipe_card_tile.dart';
 import 'recipe_detail_page.dart';
@@ -71,6 +73,7 @@ class _RecipesPageState extends State<RecipesPage> {
         _hasMore = page.hasMore;
       });
     } on ApiException catch (error) {
+      analytics.clientError(module: 'recipe_list', errorCode: error.code);
       if (mounted) showError(context, error);
     } finally {
       if (mounted) {
@@ -91,9 +94,19 @@ class _RecipesPageState extends State<RecipesPage> {
   void _open(Recipe recipe) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => RecipeDetailPage(recipeId: recipe.id),
+        builder: (_) => RecipeDetailPage(
+          recipeId: recipe.id,
+          entry: 'recipe_list',
+          category: _category,
+        ),
       ),
     );
+  }
+
+  /// 菜谱列表的 AI 入口：和首页共用同一个面板，但语境换成“帮你挑菜”。
+  void _openAi() {
+    analytics.trackAiOpen(contextType: 'recipe_list', entry: 'fab');
+    showAiChatSheet(context, contextType: 'recipe_list');
   }
 
   @override
@@ -102,76 +115,80 @@ class _RecipesPageState extends State<RecipesPage> {
       backgroundColor: AppColors.bg,
       body: SafeArea(
         bottom: false,
-        child: Column(
+        child: Stack(
           children: [
-            SizedBox(
-              height: 48,
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.fromLTRB(20, 12, 20, 10),
-                child: Row(
-                  children: [
-                    for (final item in _categories) ...[
-                      _CategoryChip(
-                        label: item.label,
-                        active: _category == item.code,
-                        onTap: () => _switchCategory(item.code),
-                      ),
-                      if (item != _categories.last) const SizedBox(width: 8),
+            Column(
+              children: [
+                // 不固定高度：分类按钮的高度由文字和上下内边距自然撑开。
+                // 之前写死 48，在字体放大或不同屏幕密度下会把文字上下裁掉。
+                SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.fromLTRB(20, 12, 20, 10),
+                  child: Row(
+                    children: [
+                      for (final item in _categories) ...[
+                        _CategoryChip(
+                          label: item.label,
+                          active: _category == item.code,
+                          onTap: () => _switchCategory(item.code),
+                        ),
+                        if (item != _categories.last) const SizedBox(width: 8),
+                      ],
                     ],
-                  ],
+                  ),
                 ),
-              ),
-            ),
-            Expanded(
-              child: RefreshIndicator(
-                color: AppColors.primary,
-                onRefresh: () => _load(reset: true),
-                child: ListView(
-                  controller: _scroll,
-                  physics: const AlwaysScrollableScrollPhysics(),
-                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
-                  children: [
-                    for (final recipe in _recipes)
-                      RecipeCardTile(
-                        recipe: recipe,
-                        onTap: () => _open(recipe),
-                      ),
-                    if (_loading && _recipes.isEmpty)
-                      const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 20),
-                        child: Center(
-                          child: Text(
-                            '加载中…',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: AppColors.faint,
+                Expanded(
+                  child: RefreshIndicator(
+                    color: AppColors.primary,
+                    onRefresh: () => _load(reset: true),
+                    child: ListView(
+                      controller: _scroll,
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 88),
+                      children: [
+                        for (final recipe in _recipes)
+                          RecipeCardTile(
+                            recipe: recipe,
+                            onTap: () => _open(recipe),
+                          ),
+                        if (_loading && _recipes.isEmpty)
+                          const Padding(
+                            padding: EdgeInsets.symmetric(vertical: 20),
+                            child: Center(
+                              child: Text(
+                                '加载中…',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: AppColors.faint,
+                                ),
+                              ),
+                            ),
+                          )
+                        else if (_loaded && _recipes.isEmpty)
+                          const EmptyState(
+                            title: '这个分类还没有菜谱',
+                            description: '菜谱需要经过试做和来源核对，我们会慢慢补齐。',
+                          )
+                        else if (_recipes.isNotEmpty && !_hasMore)
+                          const Padding(
+                            padding: EdgeInsets.symmetric(vertical: 20),
+                            child: Center(
+                              child: Text(
+                                '已经到底了',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: AppColors.faint,
+                                ),
+                              ),
                             ),
                           ),
-                        ),
-                      )
-                    else if (_loaded && _recipes.isEmpty)
-                      const EmptyState(
-                        title: '这个分类还没有菜谱',
-                        description: '菜谱需要经过试做和来源核对，我们会慢慢补齐。',
-                      )
-                    else if (_recipes.isNotEmpty && !_hasMore)
-                      const Padding(
-                        padding: EdgeInsets.symmetric(vertical: 20),
-                        child: Center(
-                          child: Text(
-                            '已经到底了',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: AppColors.faint,
-                            ),
-                          ),
-                        ),
-                      ),
-                  ],
+                      ],
+                    ),
+                  ),
                 ),
-              ),
+              ],
             ),
+            Positioned.fill(child: DraggableAiFab(onTap: _openAi)),
           ],
         ),
       ),
@@ -215,6 +232,8 @@ class _CategoryChip extends StatelessWidget {
         ),
         child: Text(
           label,
+          maxLines: 1,
+          softWrap: false,
           style: TextStyle(
             fontSize: 13,
             fontWeight: active ? FontWeight.w600 : FontWeight.w400,

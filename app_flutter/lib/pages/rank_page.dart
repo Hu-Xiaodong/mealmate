@@ -46,7 +46,7 @@ class _RankPageState extends State<RankPage> {
   void _open(RankItem item) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => PostDetailPage(postId: item.post.id),
+        builder: (_) => PostDetailPage(postId: item.post.id, entry: 'rank'),
       ),
     );
   }

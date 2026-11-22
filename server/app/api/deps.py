@@ -40,6 +40,26 @@ async def get_current_user(
     return user
 
 
+async def get_optional_user_silent(
+    request: Request, db: AsyncSession = Depends(get_db)
+) -> User | None:
+    """宽松版可选登录：令牌无效时按游客处理，不抛 401。
+
+    埋点上报使用它。原因是埋点不能反过来影响用户使用：
+    令牌刚好过期时，页面仍应能正常浏览，事件以匿名身份记录即可。
+    """
+    header = request.headers.get("authorization")
+    if not header:
+        return None
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    try:
+        return await resolve_session(db, token.strip())
+    except Exception:
+        return None
+
+
 def guest_subject(request: Request) -> str:
     device = (request.headers.get("x-device-id") or "").strip()
     if device:

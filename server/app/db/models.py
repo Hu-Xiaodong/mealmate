@@ -133,7 +133,7 @@ class AdminSession(Base):
     """管理员登录会话。
 
     与普通用户会话分开建表，原因有三点：
-    1. 有效期更短，默认 2 小时；
+    1. 有效期更短，默认 1 天（1440 分钟）；
     2. 可以按管理员整体撤销；
     3. 令牌摘要独立存储，两套令牌不能互相冒用。
     """
@@ -353,6 +353,98 @@ class AIUsage(Base):
     count: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class AIProvider(Base):
+    """大模型供应商配置。
+
+    为什么把模型配置放进数据库，而不是只写在环境变量里：
+    1. 产品要求运营可以在管理后台自行新增、停用、调整顺序，不需要改代码重启服务；
+    2. 需要同时配置多个模型做自动分配，环境变量只能表达“一个模型”；
+    3. 密钥需要加密保存、列表只显示掩码，这类操作必须经过后台权限与审计。
+
+    为什么单独建表，不塞进一张通用“系统配置”键值表：
+    模型配置有明确的结构（地址、模型名、超时、优先级、测试结果），
+    单独建表后字段有类型约束、可以建唯一索引，查询和校验都比解析一大段 JSON 可靠。
+
+    provider_type 当前只有 openai_compatible 一种：
+    市面上绝大多数模型服务（DeepSeek、通义千问、Kimi、智谱、OpenAI、以及自建的 vLLM）
+    都提供“OpenAI 兼容”的聊天接口，请求路径和字段基本一致。
+    抽象成一种类型后，新增一家供应商通常只需要填地址、密钥、模型名，不用改代码。
+    """
+
+    __tablename__ = "ai_providers"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    # 后台展示用的名称，例如“DeepSeek 主力”“通义备用”。唯一，避免运营选错。
+    name: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    provider_type: Mapped[str] = mapped_column(String(30), default="openai_compatible")
+    # 接口根地址，例如 https://api.deepseek.com/v1。
+    # 末尾补 /chat/completions 的逻辑集中在服务层，避免每家供应商各写一份。
+    base_url: Mapped[str] = mapped_column(String(255))
+    # 密钥只保存加密后的密文。Fernet 是对称加密：服务端能解密去调用模型，
+    # 但数据库泄露时攻击者没有 SECRET_KEY 仍然解不开。
+    api_key_encrypted: Mapped[str] = mapped_column(Text)
+    # 模型名，例如 deepseek-chat、qwen-plus。不同供应商的叫法不同，所以由运营填写。
+    model: Mapped[str] = mapped_column(String(80))
+    # 停用后不参与自动分配，但配置保留，方便随时恢复。
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 数字越小越先尝试。自动分配按优先级升序逐个调用，失败再换下一个。
+    priority: Mapped[int] = mapped_column(Integer, default=100)
+    # 单次调用超时时间，单位秒。模型服务变慢时不能一直占着用户请求。
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=20)
+    # 限制模型最多输出多少 token（模型计费与长度单位），防止异常长回复拖慢响应。
+    max_output_tokens: Mapped[int] = mapped_column(Integer, default=800)
+    # 最近一次“测试连接”的结果，便于运营在后台直接看到是否可用。
+    last_test_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_test_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    last_test_message: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class AICallLog(Base):
+    """AI 调用日志：每次尝试调用模型都记一行。
+
+    为什么必须落库而不是只写应用日志：
+    1. 需要回答“今天 AI 失败了几次、是哪个模型、错误码是什么”，应用日志检索成本高；
+    2. token 消耗是成本核算依据，必须能按供应商、模型聚合；
+    3. 多模型自动分配时，一次用户提问可能尝试多次，只有逐次记录才能还原过程。
+
+    为什么 provider_id 不做外键：供应商配置可能被删除，但历史调用记录必须保留。
+    这里同时保存 provider_name 快照，删除配置后日志仍然可读，
+    和审计日志保存操作人名称快照是同一个思路。
+    """
+
+    __tablename__ = "ai_call_logs"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    # 与接口响应头 X-Request-Id 一致，便于把一次用户提问和多次模型尝试串起来。
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # 调用者标识：登录用户是 user:xxx，游客是设备标识。不存手机号等个人信息。
+    subject_ref: Mapped[str] = mapped_column(String(80), index=True)
+    # 提问场景：home 首页、post 饭帖详情、recipe_list 菜谱列表，用于分析使用分布。
+    context_type: Mapped[str] = mapped_column(String(20))
+    provider_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    provider_name: Mapped[str] = mapped_column(String(40))
+    model: Mapped[str] = mapped_column(String(80))
+    # success 表示模型正常返回并通过了菜谱编号校验；failed 表示这次尝试失败。
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    # token 是模型服务计费和限流的计量单位，供应商会在响应的 usage 字段返回。
+    # 部分兼容接口不返回 usage，此时保持 0，不能因此判定调用失败。
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    error_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
 class TasteTag(Base):
     """口味标签字典表。
 
@@ -384,6 +476,43 @@ class TasteTag(Base):
     # 直接删行会让历史数据变成“查不到的标签”，排查问题时很麻烦。
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AnalyticsEvent(Base):
+    """客户端埋点事件。
+
+    为什么单独建表，而不是塞进日志文件：
+    1. 看板要按事件名、日期、平台做聚合，关系型表可以直接 group by；
+    2. event_id 作为主键天然去重，客户端重试不会把曝光量算两次；
+    3. 埋点属于分析数据，和业务表分开后可以单独设置保留期限与清理任务。
+
+    为什么 account_id 允许为空：游客也能浏览和打开详情，
+    匿名事件同样有价值；登录后由后端从令牌解析账号并回填，前端不传。
+    """
+
+    __tablename__ = "analytics_events"
+
+    # 客户端生成的事件唯一编号。用它做主键，重复上报会触发唯一约束而被跳过。
+    event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # 登录用户编号；游客为空。不做级联删除，历史统计仍需保留。
+    account_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )
+    event_name: Mapped[str] = mapped_column(String(40), index=True)
+    page_name: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    platform: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    app_version: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # 一次应用启动内稳定的随机编号，用于把同一次访问的事件串起来。
+    session_ref: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # 请求类事件可以带上接口返回的 requestId，便于和错误日志对齐。
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 事件专有属性。只存分析需要的字段，禁止写入手机号、令牌、原文。
+    properties: Mapped[dict] = mapped_column(JSON, default=dict)
+    # 事件实际发生时间（客户端时钟）与服务端接收时间，两者都保留以便排查时区问题。
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class UserLocation(Base):

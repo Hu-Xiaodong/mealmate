@@ -1,3 +1,4 @@
+import hmac
 from datetime import timedelta
 from typing import Any
 
@@ -10,11 +11,12 @@ from app.core.security import (
     code_digest,
     decrypt_phone,
     encrypt_phone,
+    issue_session_token,
     mask_phone,
     new_id,
-    new_token,
     phone_lookup_key,
     random_code,
+    read_session_token,
     token_digest,
 )
 from app.db.models import Session, User, VerificationChallenge
@@ -132,13 +134,16 @@ async def verify_login(
         db.add(user)
         await db.flush()
 
-    token = new_token()
+    # 先生成会话编号，再把它和随机串一起加密成令牌。
+    # 服务端只保存明文载荷的摘要，客户端拿到的是不可读密文。
+    session_id = new_id("s")
+    token, payload = issue_session_token(session_id)
     expires_at = now + timedelta(days=settings.session_ttl_days)
     db.add(
         Session(
-            id=new_id("s"),
+            id=session_id,
             account_id=user.id,
-            token_digest=token_digest(token),
+            token_digest=token_digest(payload),
             expires_at=expires_at,
             device_ref=device_ref,
         )
@@ -148,22 +153,36 @@ async def verify_login(
 
 
 async def revoke_session(db: AsyncSession, token: str) -> None:
-    session = await db.scalar(
-        select(Session).where(Session.token_digest == token_digest(token))
-    )
-    if session and session.revoked_at is None:
+    parsed = read_session_token(token)
+    if parsed is None:
+        return
+    session_id, payload = parsed
+    session = await db.get(Session, session_id)
+    if (
+        session is not None
+        and session.revoked_at is None
+        and hmac.compare_digest(session.token_digest, token_digest(payload))
+    ):
         session.revoked_at = now_utc()
         await db.commit()
 
 
 async def resolve_session(db: AsyncSession, token: str) -> User | None:
-    session = await db.scalar(
-        select(Session)
-        .where(Session.token_digest == token_digest(token), Session.revoked_at.is_(None))
-        .order_by(Session.created_at.desc())
-        .limit(1)
-    )
-    if session is None or as_utc(session.expires_at) < now_utc():
+    """根据客户端令牌解析当前用户。
+
+    流程：解密令牌 → 取得会话编号与明文载荷 → 读取会话 →
+    比对摘要 → 检查过期、撤销与账号状态。任何一步失败都按未登录处理。
+    """
+    parsed = read_session_token(token)
+    if parsed is None:
+        return None
+    session_id, payload = parsed
+    session = await db.get(Session, session_id)
+    if session is None or session.revoked_at is not None:
+        return None
+    if not hmac.compare_digest(session.token_digest, token_digest(payload)):
+        return None
+    if as_utc(session.expires_at) < now_utc():
         return None
     user = await db.get(User, session.account_id)
     if user is None or user.status != "active":

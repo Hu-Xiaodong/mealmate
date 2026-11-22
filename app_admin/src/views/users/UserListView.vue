@@ -3,9 +3,14 @@ import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Search } from '@element-plus/icons-vue'
 
-import { banUser, getUser, listUsers, unbanUser } from '@/api/admin'
-import type { AdminUserDetail, AdminUserItem } from '@/api/types'
-import { formatDateTime, USER_STATUS_META } from '@/utils/format'
+import { banUser, getUser, listUserPosts, listUsers, unbanUser } from '@/api/admin'
+import type { AdminPost, AdminUserDetail, AdminUserItem } from '@/api/types'
+import {
+  formatDateTime,
+  POST_STATUS_META,
+  SOURCE_LABELS,
+  USER_STATUS_META,
+} from '@/utils/format'
 
 const keyword = ref('')
 const statusFilter = ref('')
@@ -26,6 +31,21 @@ const banDialog = reactive({
   reason: '',
   submitting: false,
 })
+
+const userPosts = ref<AdminPost[]>([])
+const userPostsLoading = ref(false)
+const userPostsHasMore = ref(false)
+const userPostsCursor = ref<string | null>(null)
+const userPostsStatus = ref('')
+const previewPost = ref<AdminPost | null>(null)
+
+function postStatus(status: string) {
+  return POST_STATUS_META[status] || { label: status, type: 'info' as const, hint: '' }
+}
+
+function sourceLabel(source: string) {
+  return SOURCE_LABELS[source] || source
+}
 
 function userStatus(status: string) {
   return USER_STATUS_META[status] || { label: status, type: 'info' as const }
@@ -75,11 +95,36 @@ async function loadDetail(userId: string) {
   }
 }
 
+async function loadUserPosts(reset = true) {
+  if (!activeUserId.value) return
+  if (userPostsLoading.value) return
+  userPostsLoading.value = true
+  try {
+    const data = await listUserPosts(activeUserId.value, {
+      status: userPostsStatus.value || undefined,
+      cursor: reset ? undefined : userPostsCursor.value || undefined,
+      limit: 10,
+    })
+    userPosts.value = reset ? data.items : [...userPosts.value, ...data.items]
+    userPostsCursor.value = data.nextCursor
+    userPostsHasMore.value = data.hasMore
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '加载用户发布失败')
+  } finally {
+    userPostsLoading.value = false
+  }
+}
+
 function openDetail(row: AdminUserItem) {
   activeUserId.value = row.id
   detail.value = null
+  userPosts.value = []
+  userPostsCursor.value = null
+  userPostsHasMore.value = false
+  userPostsStatus.value = ''
   detailVisible.value = true
   loadDetail(row.id)
+  loadUserPosts(true)
 }
 
 function askBan(user: AdminUserItem | AdminUserDetail) {
@@ -297,6 +342,64 @@ onMounted(() => load(true))
           </div>
 
           <div class="drawer-section">
+            <div class="drawer-section__head">
+              <h3 class="drawer-section__title">Ta 的发布</h3>
+              <el-select
+                v-model="userPostsStatus"
+                size="small"
+                placeholder="全部状态"
+                clearable
+                style="width: 130px"
+                @change="loadUserPosts(true)"
+              >
+                <el-option label="待审核" value="pending_review" />
+                <el-option label="已公开" value="published" />
+                <el-option label="已拒绝" value="rejected" />
+                <el-option label="已下架" value="unpublished" />
+              </el-select>
+            </div>
+            <div v-loading="userPostsLoading" class="user-post-list">
+              <div
+                v-for="post in userPosts"
+                :key="post.id"
+                class="user-post"
+                @click="previewPost = post"
+              >
+                <el-image
+                  v-if="post.coverImage"
+                  :src="post.coverImage"
+                  fit="cover"
+                  class="user-post__cover"
+                />
+                <div v-else class="user-post__cover" />
+                <div class="user-post__main">
+                  <div class="user-post__title">
+                    {{ post.title }}
+                    <el-tag :type="postStatus(post.status).type" size="small">
+                      {{ postStatus(post.status).label }}
+                    </el-tag>
+                  </div>
+                  <div class="user-post__review">{{ post.review }}</div>
+                  <div class="user-post__meta">
+                    {{ sourceLabel(post.source) }} ·
+                    {{ formatDateTime(post.createdAt) }}
+                  </div>
+                </div>
+              </div>
+              <el-empty
+                v-if="!userPostsLoading && !userPosts.length"
+                description="该用户还没有公开或待审核内容"
+                :image-size="60"
+              />
+              <div v-if="userPostsHasMore" class="load-more">
+                <el-button size="small" :loading="userPostsLoading" @click="loadUserPosts(false)">
+                  加载更多
+                </el-button>
+              </div>
+            </div>
+          </div>
+
+          <div class="drawer-section">
             <h3 class="drawer-section__title">账号信息</h3>
             <el-descriptions :column="1" border size="small">
               <el-descriptions-item label="手机号">
@@ -341,6 +444,60 @@ onMounted(() => load(true))
         </template>
       </div>
     </el-drawer>
+
+    <el-dialog
+      :model-value="Boolean(previewPost)"
+      title="发布详情"
+      width="620px"
+      @close="previewPost = null"
+    >
+      <template v-if="previewPost">
+        <div class="preview-head">
+          <h3 class="preview-title">{{ previewPost.title }}</h3>
+          <el-tag :type="postStatus(previewPost.status).type">
+            {{ postStatus(previewPost.status).label }}
+          </el-tag>
+        </div>
+        <p class="preview-review">{{ previewPost.review }}</p>
+        <div v-if="previewPost.images.length" class="preview-images">
+          <el-image
+            v-for="(image, index) in previewPost.images"
+            :key="image + index"
+            :src="image"
+            :preview-src-list="previewPost.images"
+            :initial-index="index"
+            fit="cover"
+            preview-teleported
+          />
+        </div>
+        <el-descriptions :column="2" border size="small">
+          <el-descriptions-item label="来源">
+            {{ sourceLabel(previewPost.source) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="提交时间">
+            {{ formatDateTime(previewPost.createdAt) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="外卖店家">
+            {{ previewPost.takeawayStore || '-' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="到店地址">
+            {{ previewPost.dineInAddress || '-' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="粗略位置">
+            {{ previewPost.coarseArea || '-' }}
+          </el-descriptions-item>
+          <el-descriptions-item label="平台菜谱">
+            {{ previewPost.platformRecipeTitle || '-' }}
+          </el-descriptions-item>
+        </el-descriptions>
+        <p v-if="previewPost.reviewReason" class="phone-tip">
+          审核原因：{{ previewPost.reviewReason }}
+        </p>
+      </template>
+      <template #footer>
+        <el-button @click="previewPost = null">关闭</el-button>
+      </template>
+    </el-dialog>
 
     <el-dialog v-model="banDialog.visible" title="封禁用户" width="480px" destroy-on-close>
       <p class="dialog-tip">
@@ -406,5 +563,102 @@ onMounted(() => load(true))
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.drawer-section__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.drawer-section__head .drawer-section__title {
+  margin-bottom: 0;
+}
+
+.user-post-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.user-post {
+  display: flex;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--admin-line);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: border-color 0.2s ease;
+}
+
+.user-post:hover {
+  border-color: #e5a08f;
+}
+
+.user-post__cover {
+  width: 56px;
+  height: 56px;
+  flex: none;
+  border-radius: 8px;
+  background: #f2f3f5;
+}
+
+.user-post__main {
+  min-width: 0;
+}
+
+.user-post__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.user-post__review {
+  overflow: hidden;
+  margin-top: 4px;
+  color: #4b5563;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-post__meta {
+  margin-top: 6px;
+  color: #9aa0a8;
+  font-size: 11px;
+}
+
+.preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.preview-title {
+  margin: 0;
+  font-size: 17px;
+}
+
+.preview-review {
+  margin: 10px 0 14px;
+  color: #4b5563;
+  line-height: 1.7;
+}
+
+.preview-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.preview-images .el-image {
+  width: 100px;
+  height: 100px;
+  border-radius: 8px;
 }
 </style>

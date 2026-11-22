@@ -130,7 +130,7 @@ async function submit() {
         </el-form>
 
         <p class="login-card__hint">
-          登录状态 2 小时后失效；同一用户名与来源地址连续失败 5 次将锁定 15 分钟。
+          登录状态 1 天后失效；同一用户名与来源地址连续失败 5 次将锁定 15 分钟。
         </p>
       </div>
     </section>

@@ -3,18 +3,27 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../api/api_client.dart';
 import '../api/models.dart';
+import '../core/analytics.dart';
 import '../core/format.dart';
 import '../core/login_gate.dart';
 import '../theme/app_theme.dart';
+import '../widgets/ai_assistant.dart';
 import '../widgets/app_header.dart';
 import '../widgets/common.dart';
 import '../widgets/empty_state.dart';
 import 'recipe_detail_page.dart';
 
 class PostDetailPage extends StatefulWidget {
-  const PostDetailPage({super.key, required this.postId});
+  const PostDetailPage({
+    super.key,
+    required this.postId,
+    this.entry = 'unknown',
+  });
 
   final String postId;
+
+  /// 从哪个入口打开：首页、热榜、收藏或我的发布，用于埋点归因。
+  final String entry;
 
   @override
   State<PostDetailPage> createState() => _PostDetailPageState();
@@ -23,22 +32,23 @@ class PostDetailPage extends StatefulWidget {
 class _PostDetailPageState extends State<PostDetailPage> {
   PostDetail? _detail;
   bool _loading = true;
-  bool _aiOpen = false;
-  bool _aiSending = false;
-  AIChatResult? _aiResult;
   int _galleryIndex = 0;
-  final TextEditingController _aiController = TextEditingController();
 
   @override
   void initState() {
     super.initState();
+    analytics.pageView(
+      'post_detail',
+      entry: widget.entry,
+      targetType: 'post',
+      targetId: widget.postId,
+    );
+    analytics.track(
+      'meal_open',
+      pageName: 'post_detail',
+      properties: {'postId': widget.postId, 'entry': widget.entry},
+    );
     _load();
-  }
-
-  @override
-  void dispose() {
-    _aiController.dispose();
-    super.dispose();
   }
 
   Future<void> _load() async {
@@ -48,6 +58,7 @@ class _PostDetailPageState extends State<PostDetailPage> {
       if (!mounted) return;
       setState(() => _detail = data);
     } on ApiException catch (error) {
+      analytics.clientError(module: 'post_detail', errorCode: error.code);
       if (mounted) showError(context, error);
     } finally {
       if (mounted) setState(() => _loading = false);
@@ -59,15 +70,36 @@ class _PostDetailPageState extends State<PostDetailPage> {
     if (detail == null) return;
     await requireLogin(
       context,
+      entry: 'post_detail',
+      pendingAction: 'like',
       action: () async {
+        final desired = !detail.likedByMe;
         try {
-          final result = await apiClient.setLike(detail.id, !detail.likedByMe);
+          final result = await apiClient.setLike(detail.id, desired);
           if (!mounted) return;
           setState(() {
             detail.likedByMe = result.liked;
             detail.likeCount = result.likeCount;
           });
+          analytics.track(
+            'like_result',
+            pageName: 'post_detail',
+            properties: {
+              'postId': detail.id,
+              'desiredState': desired ? 'liked' : 'unliked',
+              'resultCode': 'ok',
+            },
+          );
         } on ApiException catch (error) {
+          analytics.track(
+            'like_result',
+            pageName: 'post_detail',
+            properties: {
+              'postId': detail.id,
+              'desiredState': desired ? 'liked' : 'unliked',
+              'resultCode': '${error.code}',
+            },
+          );
           if (!mounted) return;
           showError(context, error);
         }
@@ -80,17 +112,40 @@ class _PostDetailPageState extends State<PostDetailPage> {
     if (detail == null) return;
     await requireLogin(
       context,
+      entry: 'post_detail',
+      pendingAction: 'favorite',
       action: () async {
+        final desired = !detail.savedByMe;
         try {
           final result = await apiClient.setFavorite(
             targetType: 'post',
             targetId: detail.id,
-            saved: !detail.savedByMe,
+            saved: desired,
           );
           if (!mounted) return;
           setState(() => detail.savedByMe = result.saved);
           showMessage(context, result.saved ? '已收藏' : '已取消收藏');
+          analytics.track(
+            'favorite_result',
+            pageName: 'post_detail',
+            properties: {
+              'targetType': 'post',
+              'targetId': detail.id,
+              'desiredState': desired ? 'saved' : 'unsaved',
+              'resultCode': 'ok',
+            },
+          );
         } on ApiException catch (error) {
+          analytics.track(
+            'favorite_result',
+            pageName: 'post_detail',
+            properties: {
+              'targetType': 'post',
+              'targetId': detail.id,
+              'desiredState': desired ? 'saved' : 'unsaved',
+              'resultCode': '${error.code}',
+            },
+          );
           if (!mounted) return;
           showError(context, error);
         }
@@ -98,29 +153,23 @@ class _PostDetailPageState extends State<PostDetailPage> {
     );
   }
 
-  Future<void> _sendAi() async {
+  /// 打开 AI 悬浮按钮：带上当前饭帖的主键，让 AI 结合这条饭帖回答。
+  void _openAi() {
     final detail = _detail;
-    final message = _aiController.text.trim();
-    if (detail == null || message.isEmpty || _aiSending) return;
-    setState(() => _aiSending = true);
-    try {
-      final result = await apiClient.aiChat(
-        contextType: 'post',
-        contextId: detail.id,
-        message: message,
-      );
-      if (!mounted) return;
-      setState(() => _aiResult = result);
-    } on ApiException catch (error) {
-      if (mounted) showError(context, error);
-    } finally {
-      if (mounted) setState(() => _aiSending = false);
-    }
+    if (detail == null) return;
+    analytics.trackAiOpen(
+      contextType: 'post',
+      contextId: detail.id,
+      entry: 'fab',
+    );
+    showAiChatSheet(context, contextType: 'post', contextId: detail.id);
   }
 
   void _openRecipe(String id) {
     Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => RecipeDetailPage(recipeId: id)),
+      MaterialPageRoute<void>(
+        builder: (_) => RecipeDetailPage(recipeId: id, entry: 'post_detail'),
+      ),
     );
   }
 
@@ -139,18 +188,27 @@ class _PostDetailPageState extends State<PostDetailPage> {
               showBack: true,
             ),
             Expanded(
-              child: _loading && detail == null
-                  ? const Center(
+              child: Stack(
+                children: [
+                  if (_loading && detail == null)
+                    const Center(
                       child: CircularProgressIndicator(
                         color: AppColors.primary,
                       ),
                     )
-                  : detail == null
-                  ? const EmptyState(
+                  else if (detail == null)
+                    const EmptyState(
                       title: '这条饭帖看不到',
                       description: '可能已被作者删除或还未通过审核。',
                     )
-                  : _content(detail),
+                  else
+                    _content(detail),
+                  // AI 入口统一改成悬浮按钮：可长按拖动、贴边收起，
+                  // 不再占用正文和底部操作栏的空间。
+                  if (detail != null)
+                    Positioned.fill(child: DraggableAiFab(onTap: _openAi)),
+                ],
+              ),
             ),
           ],
         ),
@@ -165,7 +223,8 @@ class _PostDetailPageState extends State<PostDetailPage> {
     final recipeTitle = _recipeTitle(detail);
 
     return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
+      // 底部多留一段空白，避免最后一张卡片被 AI 悬浮按钮挡住。
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 96),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -333,7 +392,6 @@ class _PostDetailPageState extends State<PostDetailPage> {
                 ),
               ),
             ),
-          SectionCard(child: _aiPanel()),
         ],
       ),
     );
@@ -352,7 +410,9 @@ class _PostDetailPageState extends State<PostDetailPage> {
     if (store == null) return;
     final name = Uri.encodeComponent(_storeName(detail));
     final address = detail.dineInAddress?.trim() ?? '';
-    final addr = Uri.encodeComponent(address.isEmpty ? _storeName(detail) : address);
+    final addr = Uri.encodeComponent(
+      address.isEmpty ? _storeName(detail) : address,
+    );
     // 腾讯地图统一资源标识符：优先唤起已安装的腾讯地图应用，未安装时退回网页。
     // 坐标顺序是“纬度,经度”，与高德的“经度,纬度”相反；
     // coord、title、addr 三个属性都是腾讯要求必填的，referer 填应用名称。
@@ -422,7 +482,11 @@ class _PostDetailPageState extends State<PostDetailPage> {
               child: const Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Icon(Icons.navigation_outlined, size: 16, color: Colors.white),
+                  Icon(
+                    Icons.navigation_outlined,
+                    size: 16,
+                    color: Colors.white,
+                  ),
                   SizedBox(width: 6),
                   Text(
                     '打开地图导航',
@@ -451,7 +515,19 @@ class _PostDetailPageState extends State<PostDetailPage> {
           children: [
             PageView.builder(
               itemCount: images.length,
-              onPageChanged: (index) => setState(() => _galleryIndex = index),
+              onPageChanged: (index) {
+                setState(() => _galleryIndex = index);
+                analytics.track(
+                  'gallery_change',
+                  pageName: 'post_detail',
+                  properties: {
+                    'postId': widget.postId,
+                    'index': index,
+                    'imageCount': images.length,
+                    'trigger': 'swipe',
+                  },
+                );
+              },
               itemBuilder: (context, index) {
                 final url = resolveMedia(images[index]);
                 return url.isEmpty
@@ -495,166 +571,6 @@ class _PostDetailPageState extends State<PostDetailPage> {
     );
   }
 
-  Widget _aiPanel() {
-    final result = _aiResult;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        GestureDetector(
-          onTap: () => setState(() => _aiOpen = !_aiOpen),
-          behavior: HitTestBehavior.opaque,
-          child: Row(
-            children: [
-              const Expanded(
-                child: Text(
-                  '问问 AI',
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w700,
-                    color: AppColors.text,
-                  ),
-                ),
-              ),
-              Text(
-                _aiOpen ? '收起' : '展开',
-                style: const TextStyle(fontSize: 12, color: AppColors.faint),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 6),
-        const Text(
-          '结合这条饭帖帮你再想想，只推荐平台核对过的菜谱。',
-          style: TextStyle(
-            fontSize: 12,
-            color: AppColors.muted,
-            height: 1.5,
-          ),
-        ),
-        if (_aiOpen) ...[
-          const SizedBox(height: 14),
-          TextField(
-            controller: _aiController,
-            maxLength: 200,
-            maxLines: 3,
-            style: const TextStyle(fontSize: 14, color: AppColors.text),
-            decoration: InputDecoration(
-              filled: true,
-              fillColor: AppColors.bg,
-              hintText: '例如：只有 15 分钟，还能加点什么？',
-              hintStyle: const TextStyle(
-                fontSize: 13,
-                color: AppColors.faint,
-              ),
-              contentPadding: const EdgeInsets.all(12),
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(AppRadius.sm),
-                borderSide: BorderSide.none,
-              ),
-              enabledBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(AppRadius.sm),
-                borderSide: BorderSide.none,
-              ),
-              focusedBorder: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(AppRadius.sm),
-                borderSide: const BorderSide(
-                  color: AppColors.primary,
-                  width: 1.2,
-                ),
-              ),
-            ),
-          ),
-          Align(
-            alignment: Alignment.centerRight,
-            child: PillButton(
-              label: _aiSending ? '思考中…' : '发送',
-              busy: _aiSending,
-              small: true,
-              onTap: _sendAi,
-            ),
-          ),
-          if (result != null) ...[
-            const SizedBox(height: 14),
-            Container(height: 1, color: AppColors.line),
-            const SizedBox(height: 14),
-            Text(
-              result.message,
-              style: const TextStyle(
-                fontSize: 13,
-                color: AppColors.muted,
-                height: 1.7,
-              ),
-            ),
-            const SizedBox(height: 10),
-            for (final item in result.recommendations) ...[
-              GestureDetector(
-                onTap: () => _openRecipe(item.targetId),
-                behavior: HitTestBehavior.opaque,
-                child: Container(
-                  padding: const EdgeInsets.all(8),
-                  margin: const EdgeInsets.only(bottom: 8),
-                  decoration: BoxDecoration(
-                    color: AppColors.bg,
-                    borderRadius: BorderRadius.circular(AppRadius.sm),
-                  ),
-                  child: Row(
-                    children: [
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
-                        child: SizedBox(
-                          width: 64,
-                          height: 64,
-                          child: resolveMedia(item.coverImage).isEmpty
-                              ? const _MiniCover()
-                              : Image.network(
-                                  resolveMedia(item.coverImage),
-                                  fit: BoxFit.cover,
-                                  errorBuilder: (_, _, _) =>
-                                      const _MiniCover(),
-                                ),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              item.title,
-                              style: const TextStyle(
-                                fontSize: 14,
-                                fontWeight: FontWeight.w600,
-                                color: AppColors.text,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              item.reason,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontSize: 11,
-                                color: AppColors.muted,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-            Text(
-              '今日剩余 ${result.quota.remaining} 次',
-              style: const TextStyle(fontSize: 11, color: AppColors.faint),
-            ),
-          ],
-        ],
-      ],
-    );
-  }
-
   Widget _buildBar(PostDetail detail) {
     return Container(
       decoration: BoxDecoration(
@@ -664,8 +580,11 @@ class _PostDetailPageState extends State<PostDetailPage> {
       child: SafeArea(
         top: false,
         child: Padding(
+          // 只保留点赞和收藏，并整体靠右；
+          // 原来占满剩余宽度的“问 AI 今晚吃啥”按钮已经改成悬浮按钮。
           padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
           child: Row(
+            mainAxisAlignment: MainAxisAlignment.end,
             children: [
               GestureDetector(
                 onTap: _toggleLike,
@@ -724,29 +643,6 @@ class _PostDetailPageState extends State<PostDetailPage> {
                         ),
                       ),
                     ],
-                  ),
-                ),
-              ),
-              const SizedBox(width: 6),
-              Expanded(
-                child: GestureDetector(
-                  onTap: () => setState(() => _aiOpen = !_aiOpen),
-                  behavior: HitTestBehavior.opaque,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(vertical: 11),
-                    decoration: BoxDecoration(
-                      color: AppColors.primary,
-                      borderRadius: BorderRadius.circular(999),
-                    ),
-                    child: const Text(
-                      '问 AI 今晚吃啥',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                        color: Colors.white,
-                      ),
-                    ),
                   ),
                 ),
               ),
@@ -886,23 +782,6 @@ class _SectionLabel extends StatelessWidget {
         fontSize: 13,
         fontWeight: FontWeight.w600,
         color: AppColors.muted,
-      ),
-    );
-  }
-}
-
-class _MiniCover extends StatelessWidget {
-  const _MiniCover();
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      color: AppColors.peach,
-      alignment: Alignment.center,
-      child: const Icon(
-        Icons.menu_book_outlined,
-        size: 20,
-        color: AppColors.primaryDeep,
       ),
     );
   }

@@ -1,15 +1,30 @@
 import { request } from './client'
 import type {
+  AdminItem,
   AdminPost,
+  AdminRecipe,
+  AdminRoleItem,
   AdminUserDetail,
   AdminUserItem,
+  AICallLogItem,
+  AICallLogParams,
+  AIProviderForm,
+  AIProviderItem,
+  AIProviderTestResult,
   AuditListParams,
   AuditLogItem,
+  BatchReviewResult,
+  DashboardSummary,
   LoginResult,
   MeResult,
   PageResult,
   PostListParams,
+  RecipeForm,
+  RecipeListParams,
+  RoleListResult,
+  TasteTagItem,
   UserListParams,
+  UserPostParams,
 } from './types'
 
 export function login(username: string, password: string) {
@@ -94,6 +109,217 @@ export function unbanUser(userId: string) {
 export function listAuditLogs(params: AuditListParams) {
   return request<PageResult<AuditLogItem>>({
     url: '/admin/audit-logs',
+    params,
+  })
+}
+
+export function batchReviewPosts(
+  postIds: string[],
+  action: 'approve' | 'reject',
+  reason?: string,
+) {
+  return request<BatchReviewResult>({
+    url: '/admin/posts/batch-review',
+    method: 'post',
+    data: { postIds, action, reason },
+  })
+}
+
+export function listUserPosts(userId: string, params: UserPostParams) {
+  return request<PageResult<AdminPost>>({
+    url: `/admin/users/${userId}/posts`,
+    params,
+  })
+}
+
+export function getDashboard(days = 7) {
+  return request<DashboardSummary>({
+    url: '/admin/dashboard',
+    params: { days },
+  })
+}
+
+export function listRecipes(params: RecipeListParams) {
+  return request<PageResult<AdminRecipe>>({
+    url: '/admin/recipes',
+    params,
+  })
+}
+
+export function getRecipe(recipeId: string) {
+  return request<AdminRecipe>({ url: `/admin/recipes/${recipeId}` })
+}
+
+export function createRecipe(data: RecipeForm) {
+  return request<AdminRecipe>({
+    url: '/admin/recipes',
+    method: 'post',
+    data,
+  })
+}
+
+export function updateRecipe(recipeId: string, data: RecipeForm) {
+  return request<AdminRecipe>({
+    url: `/admin/recipes/${recipeId}`,
+    method: 'put',
+    data,
+  })
+}
+
+export function archiveRecipe(recipeId: string) {
+  return request<{ id: string; status: string; changed: boolean }>({
+    url: `/admin/recipes/${recipeId}/archive`,
+    method: 'post',
+  })
+}
+
+export function listTasteTags() {
+  return request<{ items: TasteTagItem[] }>({ url: '/admin/taste-tags' })
+}
+
+export function createTasteTag(data: {
+  name: string
+  sortOrder: number
+  enabled: boolean
+}) {
+  return request<TasteTagItem>({
+    url: '/admin/taste-tags',
+    method: 'post',
+    data,
+  })
+}
+
+export function updateTasteTag(
+  name: string,
+  data: { sortOrder?: number; enabled?: boolean },
+) {
+  return request<TasteTagItem>({
+    url: `/admin/taste-tags/${encodeURIComponent(name)}`,
+    method: 'put',
+    data,
+  })
+}
+
+export function deleteTasteTag(name: string) {
+  return request<{ name: string; deleted: boolean }>({
+    url: `/admin/taste-tags/${encodeURIComponent(name)}`,
+    method: 'delete',
+  })
+}
+
+export function listAdmins(params: {
+  keyword?: string
+  status?: string
+}) {
+  return request<{ items: AdminItem[] }>({
+    url: '/admin/admins',
+    params,
+  })
+}
+
+export function createAdmin(data: {
+  username: string
+  password: string
+  displayName: string
+  roleIds: string[]
+}) {
+  return request<AdminItem>({
+    url: '/admin/admins',
+    method: 'post',
+    data,
+  })
+}
+
+export function updateAdmin(
+  adminId: string,
+  data: {
+    displayName?: string
+    password?: string
+    status?: 'active' | 'disabled'
+    roleIds?: string[]
+  },
+) {
+  return request<AdminItem>({
+    url: `/admin/admins/${adminId}`,
+    method: 'put',
+    data,
+  })
+}
+
+export function listRoles() {
+  return request<RoleListResult>({ url: '/admin/roles' })
+}
+
+export function createRole(data: {
+  code: string
+  name: string
+  permissions: string[]
+}) {
+  return request<AdminRoleItem>({
+    url: '/admin/roles',
+    method: 'post',
+    data,
+  })
+}
+
+export function updateRole(
+  roleId: string,
+  data: { name?: string; permissions?: string[] },
+) {
+  return request<AdminRoleItem>({
+    url: `/admin/roles/${roleId}`,
+    method: 'put',
+    data,
+  })
+}
+
+export function deleteRole(roleId: string) {
+  return request<{ id: string; deleted: boolean }>({
+    url: `/admin/roles/${roleId}`,
+    method: 'delete',
+  })
+}
+
+export function listAIProviders() {
+  return request<{ items: AIProviderItem[] }>({ url: '/admin/ai-providers' })
+}
+
+export function createAIProvider(data: AIProviderForm) {
+  return request<AIProviderItem>({
+    url: '/admin/ai-providers',
+    method: 'post',
+    data,
+  })
+}
+
+export function updateAIProvider(
+  providerId: string,
+  data: Partial<AIProviderForm>,
+) {
+  return request<AIProviderItem>({
+    url: `/admin/ai-providers/${providerId}`,
+    method: 'put',
+    data,
+  })
+}
+
+export function deleteAIProvider(providerId: string) {
+  return request<{ id: string; deleted: boolean }>({
+    url: `/admin/ai-providers/${providerId}`,
+    method: 'delete',
+  })
+}
+
+export function testAIProvider(providerId: string) {
+  return request<AIProviderTestResult>({
+    url: `/admin/ai-providers/${providerId}/test`,
+    method: 'post',
+  })
+}
+
+export function listAICallLogs(params: AICallLogParams) {
+  return request<{ items: AICallLogItem[] }>({
+    url: '/admin/ai-call-logs',
     params,
   })
 }

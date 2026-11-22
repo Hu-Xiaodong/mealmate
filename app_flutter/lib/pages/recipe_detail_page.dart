@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../api/api_client.dart';
 import '../api/models.dart';
+import '../core/analytics.dart';
 import '../core/format.dart';
 import '../core/login_gate.dart';
 import '../theme/app_theme.dart';
@@ -10,9 +11,20 @@ import '../widgets/common.dart';
 import '../widgets/empty_state.dart';
 
 class RecipeDetailPage extends StatefulWidget {
-  const RecipeDetailPage({super.key, required this.recipeId});
+  const RecipeDetailPage({
+    super.key,
+    required this.recipeId,
+    this.entry = 'unknown',
+    this.category,
+  });
 
   final String recipeId;
+
+  /// 从哪个入口打开：列表、饭帖详情、AI 推荐或收藏，用于埋点区分意图。
+  final String entry;
+
+  /// 菜谱列表当前分类，只用于埋点，不影响详情内容。
+  final String? category;
 
   @override
   State<RecipeDetailPage> createState() => _RecipeDetailPageState();
@@ -25,6 +37,21 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
   @override
   void initState() {
     super.initState();
+    analytics.pageView(
+      'recipe_detail',
+      entry: widget.entry,
+      targetType: 'recipe',
+      targetId: widget.recipeId,
+    );
+    analytics.track(
+      'recipe_open',
+      pageName: 'recipe_detail',
+      properties: {
+        'recipeId': widget.recipeId,
+        'entry': widget.entry,
+        if (widget.category != null) 'category': widget.category,
+      },
+    );
     _load();
   }
 
@@ -35,6 +62,7 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
       if (!mounted) return;
       setState(() => _recipe = data);
     } on ApiException catch (error) {
+      analytics.clientError(module: 'recipe_detail', errorCode: error.code);
       if (mounted) showError(context, error);
     } finally {
       if (mounted) setState(() => _loading = false);
@@ -46,17 +74,40 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
     if (recipe == null) return;
     await requireLogin(
       context,
+      entry: 'recipe_detail',
+      pendingAction: 'favorite',
       action: () async {
+        final desired = !recipe.savedByMe;
         try {
           final result = await apiClient.setFavorite(
             targetType: 'recipe',
             targetId: recipe.id,
-            saved: !recipe.savedByMe,
+            saved: desired,
           );
           if (!mounted) return;
           setState(() => recipe.savedByMe = result.saved);
           showMessage(context, result.saved ? '已收藏菜谱' : '已取消收藏');
+          analytics.track(
+            'favorite_result',
+            pageName: 'recipe_detail',
+            properties: {
+              'targetType': 'recipe',
+              'targetId': recipe.id,
+              'desiredState': desired ? 'saved' : 'unsaved',
+              'resultCode': 'ok',
+            },
+          );
         } on ApiException catch (error) {
+          analytics.track(
+            'favorite_result',
+            pageName: 'recipe_detail',
+            properties: {
+              'targetType': 'recipe',
+              'targetId': recipe.id,
+              'desiredState': desired ? 'saved' : 'unsaved',
+              'resultCode': '${error.code}',
+            },
+          );
           if (!mounted) return;
           showError(context, error);
         }
