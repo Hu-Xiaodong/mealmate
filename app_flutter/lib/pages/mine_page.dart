@@ -234,6 +234,14 @@ class MinePage extends StatelessWidget {
           ),
           _divider(),
           _menuItem(
+            '我的草稿',
+            () => _openProtected(
+              context,
+              (_) => const MyPostsPage(draftOnly: true),
+            ),
+          ),
+          _divider(),
+          _menuItem(
             '我的收藏',
             () => _openProtected(
               context,

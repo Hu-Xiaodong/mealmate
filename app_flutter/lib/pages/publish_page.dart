@@ -156,8 +156,8 @@ class _PublishPageState extends State<PublishPage> {
       final current = await currentLocationIfPermitted();
       if (current != null) {
         if (mounted) setState(() => _coords = current);
-        // 写入历史定位失败不影响本次发布，所以不等待、不提示。
-        apiClient.saveMyLocation(lat: current.lat, lng: current.lng).ignore();
+        // 交给统一的节流写入：24 小时内且移动不超过 500 米时不会重复请求。
+        rememberLocation(current).ignore();
         return current;
       }
       final history = await apiClient.myLocation();

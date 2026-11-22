@@ -9,12 +9,17 @@ import '../theme/app_theme.dart';
 import '../widgets/app_header.dart';
 import '../widgets/empty_state.dart';
 import '../widgets/post_card_tile.dart';
-import '../widgets/segmented_tabs.dart';
 import 'post_detail_page.dart';
 import 'publish_page.dart';
 
+/// 我的发布 / 我的草稿共用的列表页。
+///
+/// [draftOnly] 为 true 时只请求草稿箱，反之只请求已发布内容；
+/// 两个入口在“我的”页里拆成独立菜单，页面内不再提供页签切换。
 class MyPostsPage extends StatefulWidget {
-  const MyPostsPage({super.key});
+  const MyPostsPage({super.key, this.draftOnly = false});
+
+  final bool draftOnly;
 
   @override
   State<MyPostsPage> createState() => _MyPostsPageState();
@@ -23,7 +28,6 @@ class MyPostsPage extends StatefulWidget {
 class _MyPostsPageState extends State<MyPostsPage> {
   final ScrollController _scroll = ScrollController();
 
-  String _tab = 'published';
   List<PostCard> _posts = const [];
   String? _cursor;
   bool _hasMore = false;
@@ -51,29 +55,16 @@ class _MyPostsPageState extends State<MyPostsPage> {
     }
   }
 
-  void _switchTab(String next) {
-    if (_tab == next) return;
-    setState(() {
-      _tab = next;
-      _posts = const [];
-      _cursor = null;
-      _hasMore = false;
-      _loadedOnce = false;
-    });
-    _load(reset: true);
-  }
-
   Future<void> _load({required bool reset}) async {
     if (!reset && _loading) return;
     if (!sessionStore.isLoggedIn) return;
-    final tab = _tab;
     final requestId = ++_requestId;
     setState(() {
       _loading = true;
       if (reset) _cursor = null;
     });
     try {
-      final page = tab == 'draft'
+      final page = widget.draftOnly
           ? await apiClient.myDrafts(cursor: reset ? null : _cursor, limit: 20)
           : await apiClient.myPosts(cursor: reset ? null : _cursor, limit: 20);
       if (!mounted || requestId != _requestId) return;
@@ -136,7 +127,7 @@ class _MyPostsPageState extends State<MyPostsPage> {
   }
 
   Future<void> _delete(PostCard post) async {
-    final isDraft = _tab == 'draft';
+    final isDraft = widget.draftOnly;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
@@ -201,7 +192,7 @@ class _MyPostsPageState extends State<MyPostsPage> {
                     borderRadius: BorderRadius.circular(999),
                   ),
                   child: const Text(
-                    '发布',
+                    '去发布',
                     style: TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.w600,
@@ -211,23 +202,14 @@ class _MyPostsPageState extends State<MyPostsPage> {
                 ),
               ),
             ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 6, 20, 10),
-              child: SegmentedTabs<String>(
-                selected: _tab,
-                onSelected: _switchTab,
-                options: const [
-                  SegmentOption('published', '已发布'),
-                  SegmentOption('draft', '草稿'),
-                ],
-              ),
-            ),
             Expanded(
               child: !sessionStore.isLoggedIn
                   ? SingleChildScrollView(
                       child: EmptyState(
-                        title: '登录后查看发布',
-                        description: '登录后可以管理自己发布的饭帖和审核状态。',
+                        title: widget.draftOnly ? '登录后查看草稿' : '登录后查看发布',
+                        description: widget.draftOnly
+                            ? '登录后可以继续编辑存下的草稿。'
+                            : '登录后可以管理自己发布的饭帖和审核状态。',
                         actionText: '手机号登录',
                         onAction: () => requireLogin(context),
                       ),
@@ -238,10 +220,10 @@ class _MyPostsPageState extends State<MyPostsPage> {
                       child: ListView(
                         controller: _scroll,
                         physics: const AlwaysScrollableScrollPhysics(),
-                        padding: const EdgeInsets.fromLTRB(16, 4, 16, 32),
+                        padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
                         children: [
                           for (final post in _posts)
-                            if (_tab == 'draft')
+                            if (widget.draftOnly)
                               _DraftTile(
                                 draft: post,
                                 onTap: () => _openDraft(post),
@@ -268,7 +250,7 @@ class _MyPostsPageState extends State<MyPostsPage> {
                               ),
                             )
                           else if (_loadedOnce && _posts.isEmpty)
-                            _tab == 'draft'
+                            widget.draftOnly
                                 ? EmptyState(
                                     title: '还没有草稿',
                                     description: '在发布页点「存草稿」，先放这里，想好了再发。',
@@ -286,7 +268,9 @@ class _MyPostsPageState extends State<MyPostsPage> {
                               padding: const EdgeInsets.symmetric(vertical: 18),
                               child: Center(
                                 child: Text(
-                                  _tab == 'draft' ? '草稿都在这里了' : '发布记录都在这里了',
+                                  widget.draftOnly
+                                      ? '草稿都在这里了'
+                                      : '发布记录都在这里了',
                                   style: const TextStyle(
                                     fontSize: 12,
                                     color: AppColors.faint,

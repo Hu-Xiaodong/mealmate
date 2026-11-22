@@ -1,6 +1,9 @@
 import 'package:geolocator/geolocator.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
+import '../api/api_client.dart';
 import '../api/models.dart';
+import '../session/session_store.dart';
 
 class LocationFailure implements Exception {
   const LocationFailure(this.message);
@@ -40,6 +43,91 @@ Future<Coordinates?> currentLocationIfPermitted() async {
     // 超时、定位服务异常等都按“没拿到当前位置”处理，不在这里打扰用户。
     return null;
   }
+}
+
+/// “最近定位”写入节流参数。
+///
+/// 为什么需要节流：
+/// 最近定位只在“手机定位不可用”时用来兜底，不要求秒级精确。
+/// 如果每次启动、每次切换附近都写一次，会白白消耗流量、服务端写入和电量，
+/// 也放大敏感信息的产生频率。所以只在“位置明显变化”或“间隔足够久”时才写。
+const double _locationMinDistanceMeters = 500;
+const Duration _locationMinInterval = Duration(hours: 24);
+
+/// 节流记录按账号分开保存：换账号登录时互不影响，也不会读到上一个账号的时间。
+String _throttleKey(String field, String accountId) =>
+    'mealmate_last_location_${field}_$accountId';
+
+/// 把已经拿到的坐标写入服务端“最近定位”，按距离和时间做节流。
+///
+/// 调用方不需要等待结果：这是兜底数据，写失败不影响当前操作，下次再补。
+Future<void> rememberLocation(Coordinates coords) async {
+  // 接口要求登录；游客没有服务端账号，跳过即可。
+  if (!sessionStore.isLoggedIn) return;
+  final accountId = sessionStore.profile?.accountId;
+  final prefs = await SharedPreferences.getInstance();
+
+  if (accountId != null && accountId.isNotEmpty) {
+    final savedAt = prefs.getInt(_throttleKey('at', accountId));
+    final savedLat = prefs.getDouble(_throttleKey('lat', accountId));
+    final savedLng = prefs.getDouble(_throttleKey('lng', accountId));
+    if (savedAt != null && savedLat != null && savedLng != null) {
+      final age = DateTime.now().difference(
+        DateTime.fromMillisecondsSinceEpoch(savedAt),
+      );
+      final moved = Geolocator.distanceBetween(
+        savedLat,
+        savedLng,
+        coords.lat,
+        coords.lng,
+      );
+      // 既没明显移动、也没超过时间间隔：本次不写，省掉一次无意义的请求。
+      if (age < _locationMinInterval && moved < _locationMinDistanceMeters) {
+        return;
+      }
+    }
+  }
+
+  try {
+    await apiClient.saveMyLocation(lat: coords.lat, lng: coords.lng);
+  } on ApiException {
+    // 兜底数据写失败就留到下次，不打断用户当前流程，也不弹错误。
+    return;
+  }
+
+  if (accountId != null && accountId.isNotEmpty) {
+    await prefs.setInt(
+      _throttleKey('at', accountId),
+      DateTime.now().millisecondsSinceEpoch,
+    );
+    await prefs.setDouble(_throttleKey('lat', accountId), coords.lat);
+    await prefs.setDouble(_throttleKey('lng', accountId), coords.lng);
+  }
+}
+
+/// 冷启动或回到前台时，静默补一次“最近定位”。
+///
+/// 只有以下条件全部满足才真正取位置：
+/// 1. 已登录：接口要求登录，游客没有保存的意义；
+/// 2. 距上次成功写入已超过 24 小时：避免每次启停都唤醒定位，省电省流量；
+/// 3. 系统定位已开启且 App 已有权限：这里绝不弹系统授权框。
+///
+/// 这样“只看不发”的用户也会逐步拥有历史定位，供首页“附近”和发布页兜底。
+Future<void> refreshRememberedLocationIfStale() async {
+  if (!sessionStore.isLoggedIn) return;
+  final accountId = sessionStore.profile?.accountId;
+  if (accountId == null || accountId.isEmpty) return;
+  final prefs = await SharedPreferences.getInstance();
+  final savedAt = prefs.getInt(_throttleKey('at', accountId));
+  if (savedAt != null) {
+    final age = DateTime.now().difference(
+      DateTime.fromMillisecondsSinceEpoch(savedAt),
+    );
+    if (age < _locationMinInterval) return;
+  }
+  final coords = await currentLocationIfPermitted();
+  if (coords == null) return;
+  await rememberLocation(coords);
 }
 
 /// 请求一次低精度定位；拒绝授权或失败时抛出可展示的 [LocationFailure]。

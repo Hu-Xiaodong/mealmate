@@ -5,6 +5,7 @@ import '../api/models.dart';
 import '../core/format.dart';
 import '../core/location.dart';
 import '../core/login_gate.dart';
+import '../session/session_store.dart';
 import '../theme/app_theme.dart';
 import '../widgets/ai_assistant.dart';
 import '../widgets/empty_state.dart';
@@ -60,12 +61,24 @@ class _HomePageState extends State<HomePage> {
     var effectiveFilter = _filter;
     if (effectiveFilter == 'near' && _coords == null) {
       try {
-        _coords = await locateCoarse();
+        final coords = await locateCoarse();
+        _coords = coords;
+        // 浏览用户可能永远不进发布页，这里顺手保存最近定位：
+        // 只写一份、带节流，换来下次定位失败时仍有兜底。
+        rememberLocation(coords).ignore();
       } on LocationFailure catch (error) {
-        _filter = 'all';
-        _coords = null;
-        effectiveFilter = 'all';
-        if (mounted) showMessage(context, error.message);
+        // 当前定位失败时先退到服务端保存的最近定位；
+        // 连历史定位也没有，才降级为“全部”并提示原因。
+        final history = await _loadRememberedLocation();
+        if (history != null) {
+          _coords = history;
+          if (mounted) showMessage(context, '定位暂不可用，已使用上次的位置');
+        } else {
+          _filter = 'all';
+          _coords = null;
+          effectiveFilter = 'all';
+          if (mounted) showMessage(context, error.message);
+        }
       }
     }
 
@@ -92,6 +105,19 @@ class _HomePageState extends State<HomePage> {
           _firstLoaded = true;
         });
       }
+    }
+  }
+
+  /// 读取服务端保存的最近定位；游客或请求失败都按“没有历史定位”处理。
+  ///
+  /// 这里不展示错误：它只是兜底分支，失败后页面还有“降级为全部”的最终方案，
+  /// 再弹一次错误提示只会打扰用户。
+  Future<Coordinates?> _loadRememberedLocation() async {
+    if (!sessionStore.isLoggedIn) return null;
+    try {
+      return await apiClient.myLocation();
+    } on ApiException {
+      return null;
     }
   }
 
