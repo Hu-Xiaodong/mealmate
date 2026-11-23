@@ -30,22 +30,26 @@ MealMate 是帮助人们决定这一餐吃什么的工具：用附近真实饭�
 
 ### 5. 管理后台
 
-- 饭帖审核：通过、拒绝、下架，拒绝和下架必须填原因。
-- 用户管理：列表、详情、封禁、解封；封禁会撤销该用户全部未注销会话。
-- 审计日志：只追加，不修改、不删除；拒绝、下架、封禁与日志在同一个数据库事务中提交。
+- 数据看板：内容、用户、互动与 AI 调用统计。
+- 饭帖审核：通过、拒绝、下架、批量审核，拒绝和下架必须填原因。
+- 菜谱与口味标签：菜谱新增、编辑、下架；口味标签启用、排序、删除限制。
+- 模型配置与调用日志：对话/嵌入两类供应商分开配置，按优先级切换；每次调用记录耗时与状态。
+- 知识库：上传 `.md` / `.txt`，同步完成切片与向量化；可查看切片、重建、切换索引版本，并用“检索测试”查看相似度排名。
+- 用户管理：列表、详情（含发布记录）、封禁、解封；封禁会撤销该用户全部未注销会话。
+- 管理员与角色、审计日志：权限点服务端校验；审计日志只追加，不修改、不删除，操作与日志在同一个数据库事务中提交。
 
 ## 技术栈
 
 | 层 | 选型 | 原因 |
 | --- | --- | --- |
 | 后端 | Python 3.12 + FastAPI + Pydantic v2 | 与 PRD 的强类型接口契约贴合，自动生成 OpenAPI，异步 IO 适合图片与配额逻辑 |
-| 数据 | PostgreSQL（本地与生产）/ SQLite（仅自动化测试与未配置时的兜底） | 同一套 SQLAlchemy 2.0 async 模型；本地与生产统一使用 PostgreSQL，减少数据库方言差异 |
+| 数据 | PostgreSQL 18 + pgvector（本地与生产）/ SQLite（仅自动化测试与未配置时的兜底） | 同一套 SQLAlchemy 2.0 async 模型；知识库向量在 PostgreSQL 用 `vector(1024)` 与 HNSW 索引，SQLite 退化为 JSON 文本并由 Python 计算余弦 |
 | 缓存 | Redis 7（可选） | 热榜短缓存与配额计数，未配置时自动降级为数据库实现 |
-| Android / iOS | Flutter 3 | 一套 Dart 代码同时覆盖两端，原生性能与一致的交互体验 |
+| Android / iOS / Web | Flutter 3 | 一套 Dart 代码同时覆盖两端，Web 用于快速预览与演示 |
 | 微信小程序 / H5 | uni-app + Vue 3 + TypeScript + Vite + Pinia | 小程序与 H5 共享一套代码，同时保留独立的发布节奏 |
 | 管理后台 | Vue 3 + TypeScript + Element Plus + Pinia | 内部系统以表格、表单和权限控制为主，组件库成熟；独立工程不打包进用户端 |
 | 媒体 | 本地磁盘 + 可替换存储适配器 | 本地开发简单，生产可平滑替换为 OSS/CDN |
-| AI | LangChain 调用层 + 自研模型网关 + 平台内容检索 | LangChain 统一不同厂商的 OpenAI 兼容调用；网关层负责多模型优先级切换、严格 JSON 与菜谱编号校验、配额、调用日志和本地规则回退，避免编造 |
+| AI | LangChain 调用层 + 自研模型网关 + RAG 知识库 | LangChain 统一不同厂商的 OpenAI 兼容调用；网关层负责多模型优先级切换、严格 JSON 与菜谱编号校验、配额、调用日志和本地规则回退；知识库负责切片、1024 维嵌入与余弦检索，为后续问答提供可引用资料 |
 | 部署 | Docker Compose | API、PostgreSQL、Redis 一条命令起齐 |
 
 两套客户端是刻意分开的：Flutter 负责原生体验，uni-app 负责微信生态与 H5 分享，二者共用同一套 HTTP 契约。
@@ -57,12 +61,14 @@ docs/                    PRD、待确认项与工程验收稿
 mealmate/               移动端交互原型（MealMate）
 server/                  FastAPI 后端
   app/api/               路由与依赖注入
-  app/services/          业务服务（认证、内容流、热榜、菜谱、互动、媒体、AI）
+  app/services/          业务服务（认证、内容流、热榜、菜谱、互动、媒体、AI、知识库）
   app/db/                模型、会话与演示数据
+  migrations/            手写数据库迁移脚本
+  scripts/               数据导入试运行等运维脚本
   tests/                 API 级 pytest
 app_mini/                uni-app（微信小程序 + H5）
 app_admin/               管理后台（Vue 3 + Element Plus）
-app_flutter/             Flutter（Android + iOS）
+app_flutter/             Flutter（Android + iOS + Web）
 docker-compose.yml       API + PostgreSQL + Redis 生产编排
 ```
 
@@ -110,7 +116,8 @@ npm run build    # 类型检查并产出 dist
 
 - 首次启动时，后端从 `server/.env` 的 `ADMIN_INITIAL_USERNAME` 与 `ADMIN_INITIAL_PASSWORD` 创建超级管理员。本地示例为 `admin / Admin@123456`，只在本地使用，生产必须改成强密码。
 - 未配置 `ADMIN_INITIAL_PASSWORD` 时不会创建任何管理员账号，代码中也没有默认密码。
-- 第一阶段页面：登录、饭帖审核（通过、拒绝、下架）、用户管理（列表、详情、封禁、解封）、审计日志。
+- 页面：数据看板、饭帖审核（含批量）、菜谱管理、口味标签、模型配置、AI 调用日志、知识库、用户管理、管理员与角色、审计日志。
+- 知识库使用前先在“模型配置”新增一个用途为“嵌入模型”的供应商（维度固定 1024），再上传 `.md` / `.txt` 文档；没有可用嵌入供应商时，文档会进入失败状态并显示原因。
 - 登录状态 1 天失效；同一用户名与来源地址 10 分钟内失败 5 次，锁定 15 分钟。
 
 ### Flutter
@@ -122,6 +129,7 @@ flutter run --dart-define=API_BASE=http://10.0.2.2:8000
 ```
 
 - Android 模拟器访问宿主机 API 用 `10.0.2.2`；iOS 模拟器用 `127.0.0.1`；真机用局域网 IP。
+- 浏览器预览：`flutter run -d chrome --dart-define=API_BASE=http://127.0.0.1:8000`。
 - Android 需要 `android.permission.INTERNET`，iOS 调试直连 HTTP 需在 Info.plist 放行 ATS。
 - 本机已把 Flutter SDK 放在 `E:\tools\flutter`（ASCII 路径，避免 Gradle 读取中文路径时乱码）。未加入 PATH 时先设置：
 
@@ -141,7 +149,7 @@ pytest
 ruff check .
 ```
 
-当前 20 条测试覆盖登录限流与错误码、分页游标、附近筛选、热榜排序、菜谱与作者做法优先、点赞/收藏、发布幂等、图片校验、AI 游客配额，以及管理后台登录锁定、角色权限、审核状态流转、下架缓存失效、封禁撤销会话与审计日志。
+当前 57 条测试覆盖登录限流与错误码、分页游标、附近筛选、热榜排序、菜谱与作者做法优先、点赞/收藏、发布幂等、图片校验、AI 游客配额、管理后台登录锁定、角色权限、审核状态流转、下架缓存失效、封禁撤销会话与审计日志、HowToCook 解析与导入模型，以及知识库切片与重叠、上传去重、索引版本切换与重建、缺少嵌入供应商的失败分支、检索排序与权限。
 
 ## 生产部署
 
@@ -203,6 +211,16 @@ docker compose up -d --build
 | POST | `/users/{id}/ban` | 封禁并撤销会话 | `user.ban` |
 | POST | `/users/{id}/unban` | 解封 | `user.ban` |
 | GET | `/audit-logs` | 审计日志，只读 | `audit.read` |
+| GET | `/kb/documents` | 知识库文档列表 | `kb.document.manage` |
+| POST | `/kb/documents` | 上传 `.md` / `.txt`，同步切片与嵌入 | `kb.document.manage` |
+| GET | `/kb/documents/{id}` | 文档详情与状态 | `kb.document.manage` |
+| POST | `/kb/documents/{id}/reindex` | 用当前启用版本重建切片与向量 | `kb.document.manage` |
+| DELETE | `/kb/documents/{id}` | 删除文档、切片与存储文件 | `kb.document.manage` |
+| GET | `/kb/documents/{id}/chunks` | 切片分页 | `kb.document.manage` |
+| GET | `/kb/index-versions` | 索引版本列表 | `kb.document.manage` |
+| POST | `/kb/index-versions` | 新建索引版本（含切片长度与重叠） | `kb.document.manage` |
+| POST | `/kb/index-versions/{id}/activate` | 启用版本，旧版本自动归档 | `kb.document.manage` |
+| POST | `/kb/search-test` | 检索测试：返回片段、相似度与耗时 | `kb.search.test` |
 
 ## 关键业务约定
 
@@ -214,6 +232,7 @@ docker compose up -d --build
 - AI 只引用平台真实菜谱 ID，硬性筛选条件为最长耗时、厨具、食材和忌口，支持一餐菜单组合；预算、人数等自然语言条件尚未结构化。游客每日 5 次、登录每日 20 次。模型在后台“模型配置”维护，按优先级自动切换；未配置或全部失败时回退本地规则推荐，不会伪造外部结果。
 - 手机号使用 Fernet 加密存储，检索走 HMAC 索引；会话令牌只存 SHA-256 摘要。
 - 管理后台使用独立账号表、独立会话表与独立鉴权依赖，权限点在服务端校验；前端隐藏按钮不作为安全边界。
+- 知识库切片默认目标 400 字、上限 800 字、相邻重叠 80 字，每片带“文档标题｜章节路径”上下文头；嵌入维度固定 1024，同一时间只有一个启用的索引版本；重建只影响当前文档，不自动切换版本。
 - 饭帖状态只允许 `pending_review -> published/rejected` 与 `published -> unpublished`，重复审核返回当前状态而不重复写入。
 - 审计日志只追加、不修改、不删除；拒绝、下架、封禁必须填写原因，操作与日志在同一个数据库事务中提交。
 - 封禁用户会撤销其全部未注销会话；后台列表中的手机号默认脱敏。
@@ -237,4 +256,6 @@ docker compose up -d --build
 - AI 主流程已接通：后台可配置多个 OpenAI 兼容模型，按优先级自动切换，未配置或全部失败时回退本地规则推荐。真实供应商需要在管理后台填入有效的接口地址、模型名与 API Key 后，用“测试连接”验证。
 - 主场景的“选店”目前依赖附近饭帖和热榜；AI 只推荐平台菜谱，尚未把附近饭帖、距离和预算纳入候选，这是下一阶段的产品缺口。
 - 媒体为本地磁盘存储，生产替换 OSS 需实现 `media_service` 的存储适配。
-- 管理后台已完成：数据看板、饭帖审核（含批量）、菜谱、口味标签、模型配置、AI 调用日志、用户管理、管理员与角色、审计日志。举报、知识库管理与多级复核仍属于后续阶段。
+- 管理后台已完成：数据看板、饭帖审核（含批量）、菜谱、口味标签、模型配置、AI 调用日志、知识库、用户管理、管理员与角色、审计日志。举报、多级复核仍属于后续阶段。
+- 知识库首版只支持 UTF-8 的 `.md` / `.txt`，上传后同步完成切片与向量化；PDF/Word 解析、独立异步任务进程、把检索结果接入 AI 问答与引用校验留待后续阶段。
+- HowToCook 解析器与导入批次、后台任务两张表已完成，试运行覆盖 374 份菜谱；正式导入应用与后台页面尚未接入，目前菜谱数据仍以演示数据为主。
