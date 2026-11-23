@@ -19,6 +19,9 @@ tools/
 # 交互原型仓库（独立 Git 项目，远程为 Hu-Xiaodong/mealmate）
 /mealmate/
 
+# 测试产物（QA 报告、截图、日志，仅本地留存）
+qa/
+
 # Node / uni-app
 node_modules/
 app_mini/dist/
