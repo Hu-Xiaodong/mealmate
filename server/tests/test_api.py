@@ -1,12 +1,15 @@
 """核心 API 契约测试：覆盖 PRD 的浏览、登录、互动、发布、AI 配额主流程。"""
 
 import io
+from datetime import timedelta
 
 from conftest import API, auth_headers, data_of, login
 from PIL import Image
 
+from app.db.models import MealPost
+from app.main import app
 from app.services.map_service import parse_place_items
-from app.utils.time import business_date
+from app.utils.time import business_date, now_utc
 
 
 async def test_healthz_and_request_id(client):
@@ -18,7 +21,7 @@ async def test_healthz_and_request_id(client):
     assert resp.headers["x-request-id"] == "trace-123"
 
 
-async def test_feed_returns_today_posts_with_cursor(client):
+async def test_feed_returns_published_posts_with_cursor(client):
     first = await client.get(f"{API}/feed", params={"limit": 3})
     assert first.status_code == 200
     page1 = data_of(first)
@@ -34,6 +37,21 @@ async def test_feed_returns_today_posts_with_cursor(client):
     page2 = data_of(second)
     assert [item["id"] for item in page2["items"]] == ["p_1006", "p_1005", "p_1004"]
     assert page2["hasMore"] is True
+
+
+async def test_feed_includes_older_posts_not_only_today(client):
+    """首页应展示全部已发布饭帖，旧内容也要按时间倒序出现在后面。"""
+    factory = app.state.test_session_factory
+    async with factory() as db:
+        post = await db.get(MealPost, "p_1001")
+        post.published_at = now_utc() - timedelta(days=3)
+        await db.commit()
+
+    data = data_of(await client.get(f"{API}/feed", params={"limit": 50}))
+    ids = [item["id"] for item in data["items"]]
+    assert "p_1001" in ids
+    assert ids[-1] == "p_1001"
+    assert len(ids) > 3
 
 
 async def test_feed_rejects_broken_cursor(client):

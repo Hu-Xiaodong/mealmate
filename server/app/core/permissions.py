@@ -8,6 +8,7 @@
 PERMISSION_LABELS: dict[str, str] = {
     "post.review": "审核饭帖",
     "post.unpublish": "下架饭帖",
+    "post.delete": "删除饭帖",
     "user.read": "查看用户",
     "user.ban": "封禁与解封用户",
     "recipe.manage": "菜谱管理",

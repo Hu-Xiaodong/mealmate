@@ -1,16 +1,27 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 
-import { approvePost, batchReviewPosts, listPosts, rejectPost, unpublishPost } from '@/api/admin'
+import {
+  approvePost,
+  batchDeletePosts,
+  batchReviewPosts,
+  listPosts,
+  rejectPost,
+  unpublishPost,
+} from '@/api/admin'
 import type { AdminPost } from '@/api/types'
+import { useAdminStore } from '@/stores/admin'
 import {
   formatDateTime,
   POST_STATUS_META,
   SOURCE_LABELS,
 } from '@/utils/format'
 import PostDetailDrawer from './PostDetailDrawer.vue'
+
+const store = useAdminStore()
+const canDelete = computed(() => store.hasPermission('post.delete'))
 
 const statusFilter = ref('pending_review')
 const items = ref<AdminPost[]>([])
@@ -25,10 +36,13 @@ const selectedRows = ref<AdminPost[]>([])
 
 const batchDialog = reactive({
   visible: false,
-  action: 'approve' as 'approve' | 'reject',
+  action: 'approve' as 'approve' | 'reject' | 'delete',
   reason: '',
   submitting: false,
 })
+const batchDialogTitle = computed(() =>
+  batchDialog.action === 'delete' ? '批量删除' : '批量拒绝',
+)
 
 const reasonDialog = reactive({
   visible: false,
@@ -99,13 +113,13 @@ function handleSelectionChange(rows: AdminPost[]) {
   selectedRows.value = rows
 }
 
-async function openBatch(action: 'approve' | 'reject') {
+async function openBatch(action: 'approve' | 'reject' | 'delete') {
   if (!selectedRows.value.length) {
     ElMessage.warning('请先勾选要处理的饭帖')
     return
   }
-  if (action === 'reject') {
-    batchDialog.action = 'reject'
+  if (action === 'reject' || action === 'delete') {
+    batchDialog.action = action
     batchDialog.reason = ''
     batchDialog.visible = true
     return
@@ -122,23 +136,30 @@ async function openBatch(action: 'approve' | 'reject') {
   submitBatch('approve')
 }
 
-async function submitBatch(action: 'approve' | 'reject') {
+async function submitBatch(action: 'approve' | 'reject' | 'delete') {
   const ids = selectedRows.value.map((row) => row.id)
   if (!ids.length) {
     ElMessage.warning('请先勾选要处理的饭帖')
     return
   }
-  if (action === 'reject' && batchDialog.reason.trim().length < 2) {
-    ElMessage.warning('请填写至少 2 个字的拒绝原因')
+  if ((action === 'reject' || action === 'delete') && batchDialog.reason.trim().length < 2) {
+    ElMessage.warning(
+      action === 'delete'
+        ? '请填写至少 2 个字的删除原因'
+        : '请填写至少 2 个字的拒绝原因',
+    )
     return
   }
   batchDialog.submitting = true
   try {
-    const result = await batchReviewPosts(
-      ids,
-      action,
-      action === 'reject' ? batchDialog.reason.trim() : undefined,
-    )
+    const result =
+      action === 'delete'
+        ? await batchDeletePosts(ids, batchDialog.reason.trim())
+        : await batchReviewPosts(
+            ids,
+            action,
+            action === 'reject' ? batchDialog.reason.trim() : undefined,
+          )
     const failed = result.results.filter((item) => !item.ok)
     if (result.failed) {
       const first = failed[0]
@@ -146,7 +167,9 @@ async function submitBatch(action: 'approve' | 'reject') {
         `成功 ${result.succeeded} 条，失败 ${result.failed} 条。首条失败原因：${first?.message || first?.errorCode || '未知'}`,
       )
     } else {
-      ElMessage.success(`已${action === 'approve' ? '通过' : '拒绝'} ${result.succeeded} 条`)
+      const actionLabel =
+        action === 'approve' ? '通过' : action === 'reject' ? '拒绝' : '删除'
+      ElMessage.success(`已${actionLabel} ${result.succeeded} 条`)
     }
     batchDialog.visible = false
     await reload()
@@ -257,6 +280,14 @@ onMounted(() => load(true))
           <el-button size="small" type="danger" plain @click="openBatch('reject')">
             批量拒绝
           </el-button>
+          <el-button
+            v-if="canDelete"
+            size="small"
+            type="danger"
+            @click="openBatch('delete')"
+          >
+            批量删除
+          </el-button>
         </template>
         <span class="muted">共加载 {{ items.length }} 条</span>
       </div>
@@ -366,12 +397,18 @@ onMounted(() => load(true))
 
     <el-dialog
       v-model="batchDialog.visible"
-      title="批量拒绝"
+      :title="batchDialogTitle"
       width="480px"
       destroy-on-close
     >
       <p class="dialog-tip">
-        将拒绝已勾选的 {{ selectedRows.length }} 条饭帖，每一条都会写入审核原因与审计日志。
+        <template v-if="batchDialog.action === 'delete'">
+          将删除已勾选的 {{ selectedRows.length }} 条饭帖。删除后后台列表与公开页面都不再展示，
+          记录保留在数据库中，可在审计日志追溯；每条都会写入删除原因。
+        </template>
+        <template v-else>
+          将拒绝已勾选的 {{ selectedRows.length }} 条饭帖，每一条都会写入审核原因与审计日志。
+        </template>
       </p>
       <el-input
         v-model="batchDialog.reason"
@@ -386,9 +423,9 @@ onMounted(() => load(true))
         <el-button
           type="danger"
           :loading="batchDialog.submitting"
-          @click="submitBatch('reject')"
+          @click="submitBatch(batchDialog.action)"
         >
-          确认批量拒绝
+          {{ batchDialog.action === 'delete' ? '确认批量删除' : '确认批量拒绝' }}
         </el-button>
       </template>
     </el-dialog>

@@ -5,9 +5,10 @@ from app.api.admin_deps import AdminPrincipal, client_ip, require_permission
 from app.core.errors import AppError
 from app.core.responses import ok
 from app.db.session import get_db
-from app.schemas import BatchReviewRequest, ReasonRequest
+from app.schemas import BatchDeleteRequest, BatchReviewRequest, ReasonRequest
 from app.services.review_service import (
     approve_post,
+    delete_post,
     get_admin_post,
     list_admin_posts,
     reject_post,
@@ -66,6 +67,56 @@ async def batch_review(
                 data = await reject_post(
                     db, principal.admin, post_id, body.reason or "", ip
                 )
+            succeeded += 1
+            results.append(
+                {
+                    "postId": post_id,
+                    "ok": True,
+                    "status": data.get("status"),
+                    "changed": data.get("changed", False),
+                }
+            )
+        except AppError as exc:
+            results.append(
+                {
+                    "postId": post_id,
+                    "ok": False,
+                    "errorCode": exc.code,
+                    "message": exc.message,
+                }
+            )
+    failed = len(results) - succeeded
+    return ok(
+        {
+            "succeeded": succeeded,
+            "failed": failed,
+            "results": results,
+        },
+        f"已处理 {len(results)} 条，成功 {succeeded} 条，失败 {failed} 条",
+    )
+
+
+@router.post("/batch-delete")
+async def batch_delete(
+    body: BatchDeleteRequest,
+    request: Request,
+    principal: AdminPrincipal = Depends(require_permission("post.delete")),
+    db: AsyncSession = Depends(get_db),
+):
+    """批量删除饭帖（软删除）。
+
+    删除权限与审核、下架分开：只有拥有 post.delete 的管理员才能调用。
+    每条独立处理、独立提交，一条失败不会回滚其他条目；
+    返回逐条结果，前端可以准确提示成功多少条、失败原因是什么。
+    """
+    results = []
+    succeeded = 0
+    ip = client_ip(request)
+    for post_id in body.post_ids:
+        try:
+            data = await delete_post(
+                db, principal.admin, post_id, body.reason, ip
+            )
             succeeded += 1
             results.append(
                 {

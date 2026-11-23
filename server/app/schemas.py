@@ -358,6 +358,28 @@ class BatchReviewRequest(CamelModel):
         return self
 
 
+class BatchDeleteRequest(CamelModel):
+    """批量删除饭帖请求。
+
+    删除比“下架”影响更大：下架只是从公开列表移除，记录仍能参与审核与统计；
+    删除则会让饭帖从后台列表和公开页面同时消失。因此：
+    1. 单独使用 post.delete 权限点，不与审核、下架权限混在一起；
+    2. 必须填写原因，原因写入审计日志，便于事后追溯；
+    3. 一次最多 20 条，和批量审核保持一致，避免长时间占用数据库连接。
+    """
+
+    post_ids: list[str] = Field(min_length=1, max_length=20)
+    reason: str = Field(min_length=2, max_length=200)
+
+    @model_validator(mode="after")
+    def _dedupe(self):
+        # 去重但保留顺序，避免同一条饭帖在一次请求里被删除两次。
+        self.post_ids = list(dict.fromkeys(self.post_ids))
+        if len(self.reason.strip()) < 2:
+            raise ValueError("批量删除需要填写至少 2 个字的原因")
+        return self
+
+
 class AnalyticsEventItem(CamelModel):
     """单条客户端埋点。
 

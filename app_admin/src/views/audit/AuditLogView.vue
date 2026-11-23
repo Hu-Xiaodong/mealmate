@@ -30,7 +30,7 @@ function actionTagType(action: string) {
   if (action === 'post.approve' || action === 'user.unban') {
     return 'success'
   }
-  if (action === 'post.reject' || action === 'user.ban') {
+  if (action === 'post.reject' || action === 'user.ban' || action === 'post.delete') {
     return 'danger'
   }
   if (action === 'post.unpublish') {
@@ -124,7 +124,7 @@ onMounted(() => load(true))
         <el-date-picker
           v-model="filters.range"
           type="datetimerange"
-          value-format="YYYY-MM-DDTHH:mm:ss"
+          value-format="YYYY-MM-DDTHH:mm:ssZ"
           range-separator="至"
           start-placeholder="开始时间"
           end-placeholder="结束时间"

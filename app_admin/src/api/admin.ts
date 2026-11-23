@@ -131,6 +131,14 @@ export function batchReviewPosts(
   })
 }
 
+export function batchDeletePosts(postIds: string[], reason: string) {
+  return request<BatchReviewResult>({
+    url: '/admin/posts/batch-delete',
+    method: 'post',
+    data: { postIds, reason },
+  })
+}
+
 export function listUserPosts(userId: string, params: UserPostParams) {
   return request<PageResult<AdminPost>>({
     url: `/admin/users/${userId}/posts`,

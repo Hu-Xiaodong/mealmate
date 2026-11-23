@@ -1,9 +1,10 @@
 """饭帖审核服务。
 
-审核是一个明确的状态机，只允许三条路径：
+审核是一个明确的状态机，只允许这些路径：
     pending_review -> published   （通过）
     pending_review -> rejected    （拒绝）
     published      -> unpublished （下架）
+    任意可见状态   -> deleted      （删除，软删除）
 
 其他组合一律拒绝。重复点击同一个操作时返回当前状态而不是报错，
 这样前端网络重试、用户连点都不会产生重复写入。
@@ -24,7 +25,7 @@ from app.services.cache import delete_key
 from app.utils.cursor import decode_cursor, encode_cursor
 from app.utils.time import business_date, now_utc
 
-POST_STATUSES = {"pending_review", "published", "rejected", "unpublished"}
+POST_STATUSES = {"pending_review", "published", "rejected", "unpublished", "deleted"}
 MAX_PAGE_SIZE = 50
 
 
@@ -46,6 +47,7 @@ def _snapshot(post: MealPost) -> dict[str, Any]:
         "reviewedAt": iso(post.reviewed_at),
         "reviewReason": post.review_reason,
         "publishedAt": iso(post.published_at),
+        "deletedAt": iso(post.deleted_at),
     }
 
 
@@ -354,5 +356,53 @@ async def unpublish_post(
     )
     await db.commit()
     # 下架后公开列表和热榜都必须立即看不到它。
+    await _invalidate_rank_cache()
+    return _result(post, changed=True)
+
+
+async def delete_post(
+    db: AsyncSession, admin: AdminUser, post_id: str, reason: str, ip: str | None
+) -> dict[str, Any]:
+    """删除饭帖：任意可见状态 -> deleted，必须填写原因。
+
+    这里做的是“软删除”：只把状态改成 deleted 并记录删除时间，
+    数据库里的行、图片关联和点赞记录都保留。原因是：
+    1. 后台需要可追溯，误删时还能人工恢复；
+    2. 审计日志的 before/after 快照仍然指向一条真实存在的记录；
+    3. 用户侧内容可能涉及申诉与统计，物理删除会让历史数据对不上。
+    公开列表、后台默认列表都已经排除 deleted，所以用户看不到它。
+
+    草稿不允许在后台删除：草稿是用户没写完的私人内容，后台列表本来
+    就不展示；如果确实要清理，应由用户自己在草稿箱删除。
+    """
+    post = await _require_post(db, post_id)
+    text = _normalize_reason(reason)
+
+    # 重复删除按幂等成功处理，网络重试不会重复写审计日志。
+    if post.status == "deleted":
+        return _result(post, changed=False)
+    if post.status == "draft":
+        raise _invalid_transition(post)
+
+    before = _snapshot(post)
+    now = now_utc()
+    post.status = "deleted"
+    post.deleted_at = now
+    post.reviewed_by = admin.id
+    post.reviewed_at = now
+    post.review_reason = text
+    write_audit(
+        db,
+        actor=admin,
+        action="post.delete",
+        target_type="meal_post",
+        target_id=post.id,
+        reason=text,
+        before=before,
+        after=_snapshot(post),
+        ip=ip,
+    )
+    await db.commit()
+    # 删除已公开内容后，首页与热榜也必须立即看不到它。
     await _invalidate_rank_cache()
     return _result(post, changed=True)

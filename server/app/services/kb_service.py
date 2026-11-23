@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.serializers import iso
@@ -813,6 +813,140 @@ async def _search_sqlite(
     return items
 
 
+_KEYWORD_STOPWORDS = (
+    "请问",
+    "怎么",
+    "如何",
+    "什么",
+    "哪些",
+    "哪个",
+    "哪里",
+    "为什么",
+    "能不能",
+    "可不可以",
+    "可以",
+    "介绍",
+    "一下",
+    "告诉",
+    "帮我",
+)
+
+
+def _keyword_terms(query: str) -> list[str]:
+    """把自然语言问题拆成可用于 LIKE 的关键词。
+
+    为什么需要拆：
+        中文问题没有空格，直接拿整句“番茄怎么挑”去匹配，
+        文档里通常不会出现一模一样的句子。这里去掉“怎么”“如何”等
+        疑问词，再把连续中文切成二元组（番茄、茄挑），
+        只要片段包含“番茄”就能被召回。
+    返回：
+        去重后的关键词，最多 8 个，避免 SQL 条件过长。
+    """
+    text = query.strip()
+    if not text:
+        return []
+
+    cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", " ", text)
+    for word in _KEYWORD_STOPWORDS:
+        cleaned = cleaned.replace(word, " ")
+    compact = cleaned.replace(" ", "")
+
+    terms: list[str] = [text]
+    if compact and compact != text:
+        terms.append(compact)
+    for word in cleaned.split():
+        if len(word) >= 2:
+            terms.append(word)
+
+    # 中文二元组：把“番茄挑”拆成“番茄”“茄挑”，提高字面召回率。
+    for run in re.findall(r"[\u4e00-\u9fff]{2,}", compact):
+        if len(run) <= 4:
+            terms.append(run)
+        for index in range(len(run) - 1):
+            terms.append(run[index : index + 2])
+
+    deduped = list(dict.fromkeys(term for term in terms if len(term) >= 2))
+    return deduped[:8]
+
+
+def _keyword_pattern(term: str) -> str:
+    """把关键词包成 LIKE 模式，并转义 % 和 _ 这两个通配符。"""
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _keyword_score(content: str, terms: list[str]) -> float:
+    """按“命中的最长关键词长度 / 最长关键词长度”给出 0 到 1 的分数。
+
+    这个分数只用于关键词降级模式，表示字面匹配程度，
+    不能和向量余弦相似度直接比较。
+    """
+    longest = max((len(term) for term in terms), default=0)
+    if not longest:
+        return 0.0
+    lowered = content.lower()
+    matched = max((len(term) for term in terms if term in lowered), default=0)
+    return round(matched / longest, 4)
+
+
+async def _search_keyword(
+    db: AsyncSession,
+    *,
+    version_id: str,
+    query: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """嵌入模型不可用时的兜底检索：按关键词做字面匹配。
+
+    和向量检索返回同样的片段结构，只把 score 换成关键词匹配度，
+    上层接口通过 mode=keyword 告诉前端“这不是语义检索”。
+    先限制最多取 200 个候选，再在 Python 里打分排序，
+    避免一次把整库切片读进内存。
+    """
+    terms = _keyword_terms(query)
+    if not terms:
+        return []
+
+    conditions = [
+        KbChunk.content.ilike(_keyword_pattern(term), escape="\\") for term in terms
+    ]
+    rows = (
+        await db.execute(
+            select(
+                KbChunk.id,
+                KbChunk.document_id,
+                KbChunk.ordinal,
+                KbChunk.content,
+                KbChunk.chunk_metadata,
+                KbDocument.title,
+            )
+            .join(KbDocument, KbDocument.id == KbChunk.document_id)
+            .where(
+                KbChunk.index_version_id == version_id,
+                or_(*conditions),
+            )
+            .limit(200)
+        )
+    ).all()
+
+    items = [
+        {
+            "chunkId": row.id,
+            "documentId": row.document_id,
+            "documentTitle": row.title or "",
+            "ordinal": row.ordinal,
+            "content": row.content,
+            "score": _keyword_score(row.content, terms),
+            "metadata": row.chunk_metadata,
+        }
+        for row in rows
+    ]
+    items = [item for item in items if item["score"] > 0]
+    items.sort(key=lambda item: (item["score"], -item["ordinal"]), reverse=True)
+    return items[:limit]
+
+
 async def search_test(
     db: AsyncSession,
     admin: AdminUser,
@@ -823,6 +957,14 @@ async def search_test(
     这是后台验证知识库是否好用的唯一手段：
     运营改完切片参数或换完模型后，应该先用真实问题试一次，
     确认排在前面的内容确实是想要的，再让问答功能使用。
+
+    兜底策略：
+        嵌入模型可能因为没配密钥、欠费、网络不通而不可用。
+        这时如果直接抛错，整个检索功能就不可用了。为了让运营至少能
+        确认“文档切片是否包含需要的内容”，这里自动降级为关键词检索：
+        仍返回 200 和片段，用 mode=keyword 与 warning 说明当前不是语义检索。
+        注意：降级只能检索已经写入数据库的切片；如果上传时就没有嵌入模型，
+        文档仍会按原有逻辑进入 failed，不会产生切片。
     """
     started = time.perf_counter()
     version = await _active_version(db)
@@ -831,18 +973,32 @@ async def search_test(
             "KB_INDEX_NOT_READY", "尚未启用任何索引版本", status_code=409
         )
 
-    result = await embedding_service.embed_texts(
-        db, [body.query], subject_ref=f"admin:{admin.id}"
-    )
-    vector = result.vectors[0]
     limit = min(max(body.top_k, 1), 20)
+    mode = "vector"
+    warning: str | None = None
 
-    if db.get_bind().dialect.name == "postgresql":
-        items = await _search_postgres(
-            db, version_id=version.id, vector=vector, limit=limit
+    try:
+        result = await embedding_service.embed_texts(
+            db, [body.query], subject_ref=f"admin:{admin.id}"
+        )
+    except embedding_service.EmbeddingError as exc:
+        # 失败调用日志已经由 embed_texts 写入当前事务，稍后统一提交。
+        mode = "keyword"
+        warning = (
+            f"嵌入模型暂不可用（{exc.message}），已自动降级为关键词检索；"
+            "结果按字面匹配排序，不代表语义相似度"
+        )
+        items = await _search_keyword(
+            db, version_id=version.id, query=body.query, limit=limit
         )
     else:
-        items = await _search_sqlite(db, version_id=version.id, vector=vector)
+        vector = result.vectors[0]
+        if db.get_bind().dialect.name == "postgresql":
+            items = await _search_postgres(
+                db, version_id=version.id, vector=vector, limit=limit
+            )
+        else:
+            items = await _search_sqlite(db, version_id=version.id, vector=vector)
 
     filtered = [item for item in items if item["score"] >= body.threshold]
     filtered.sort(key=lambda item: item["score"], reverse=True)
@@ -854,6 +1010,8 @@ async def search_test(
         "query": body.query,
         "topK": limit,
         "threshold": body.threshold,
+        "mode": mode,
+        "warning": warning,
         "indexVersion": _version_payload(version),
         "tookMs": int((time.perf_counter() - started) * 1000),
         "items": filtered,

@@ -396,6 +396,10 @@ export interface KbSearchResult {
   query: string
   topK: number
   threshold: number
+  /** vector：语义检索；keyword：嵌入模型不可用时的关键词降级检索。 */
+  mode: 'vector' | 'keyword'
+  /** 降级原因，正常语义检索时为空。 */
+  warning: string | null
   indexVersion: KbIndexVersionItem
   tookMs: number
   items: KbSearchItem[]

@@ -9,7 +9,7 @@ from app.core.errors import AppError
 from app.db.models import MealPost, User
 from app.services.post_service import load_cards
 from app.utils.cursor import decode_cursor, encode_cursor
-from app.utils.time import business_date, business_day_bounds
+from app.utils.time import business_date
 
 PAGE_SIZE = 20
 MAX_PAGE_SIZE = 50
@@ -46,13 +46,11 @@ async def list_feed(
     radius_m: int,
 ) -> dict[str, Any]:
     limit = min(max(limit, 1), MAX_PAGE_SIZE)
-    start, end = business_day_bounds(business_date())
 
-    conditions = [
-        MealPost.status == "published",
-        MealPost.published_at >= start,
-        MealPost.published_at < end,
-    ]
+    # 首页不再只看“今天”：所有已发布饭帖按发布时间倒序展示，
+    # 新发布的排在最前面。分页游标已经按 published_at + id 排序，
+    # 因此去掉按自然日的起止时间条件即可，其他筛选逻辑保持不变。
+    conditions = [MealPost.status == "published"]
 
     cursor_data = decode_cursor(cursor)
     if cursor:

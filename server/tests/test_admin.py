@@ -9,6 +9,8 @@
 6. 审计日志记录操作人、动作、对象、原因与请求标识。
 """
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from sqlalchemy import select
 
@@ -21,6 +23,7 @@ from app.db.models import (
     MealPost,
 )
 from app.main import app
+from app.utils.time import BUSINESS_TZ
 from tests.conftest import API, auth_headers, data_of, login
 
 ADMIN_PASSWORD = "Admin@123456"
@@ -330,3 +333,107 @@ async def test_ban_user_revokes_sessions_and_writes_audit(client):
     # 审计日志没有修改和删除接口。
     delete = await client.delete(f"{API}/admin/audit-logs", headers=headers)
     assert delete.status_code == 405
+
+
+async def test_batch_delete_published_posts_is_soft_delete(client):
+    """批量删除已上架饭帖：后台与公开列表都不可见，但记录和审计保留。"""
+    headers = auth_headers(await login_as_admin(client))
+
+    result = data_of(
+        await client.post(
+            f"{API}/admin/posts/batch-delete",
+            json={
+                "postIds": ["p_1001", "p_missing"],
+                "reason": "内容重复，测试批量删除",
+            },
+            headers=headers,
+        )
+    )
+    assert result["succeeded"] == 1
+    assert result["failed"] == 1
+    assert result["results"][0]["status"] == "deleted"
+    assert result["results"][0]["changed"] is True
+    assert result["results"][1]["errorCode"] == "POST_NOT_FOUND"
+
+    # 公开首页不再展示。
+    feed_ids = {item["id"] for item in data_of(await client.get(f"{API}/feed"))["items"]}
+    assert "p_1001" not in feed_ids
+
+    # 后台默认列表也不再展示；显式筛 deleted 仍可追溯。
+    admin_ids = {
+        item["id"]
+        for item in data_of(
+            await client.get(f"{API}/admin/posts", headers=headers)
+        )["items"]
+    }
+    assert "p_1001" not in admin_ids
+    deleted_ids = {
+        item["id"]
+        for item in data_of(
+            await client.get(
+                f"{API}/admin/posts?status=deleted", headers=headers
+            )
+        )["items"]
+    }
+    assert "p_1001" in deleted_ids
+
+    # 删除原因写入审计日志，动作是 post.delete。
+    logs = data_of(
+        await client.get(
+            f"{API}/admin/audit-logs?targetId=p_1001&action=post.delete",
+            headers=headers,
+        )
+    )
+    assert logs["items"]
+    assert logs["items"][0]["reason"] == "内容重复，测试批量删除"
+
+    # 重复删除是幂等的，不会重复写状态。
+    again = data_of(
+        await client.post(
+            f"{API}/admin/posts/batch-delete",
+            json={"postIds": ["p_1001"], "reason": "重复删除"},
+            headers=headers,
+        )
+    )
+    assert again["succeeded"] == 1
+    assert again["results"][0]["changed"] is False
+
+
+async def test_batch_delete_requires_post_delete_permission(client):
+    """内容运营只有审核与下架权限，不能调用删除接口。"""
+    await create_admin("content02", ADMIN_PASSWORD, "content_operator")
+    login_response = await client.post(
+        f"{API}/admin/auth/login",
+        json={"username": "content02", "password": ADMIN_PASSWORD},
+    )
+    headers = auth_headers(data_of(login_response)["token"])
+    denied = await client.post(
+        f"{API}/admin/posts/batch-delete",
+        json={"postIds": ["p_1002"], "reason": "越权删除测试"},
+        headers=headers,
+    )
+    assert denied.status_code == 403
+    assert denied.json()["code"] == "ADMIN_PERMISSION_DENIED"
+
+
+async def test_audit_filter_interprets_naive_time_as_business_timezone(client):
+    """前端不带时区的时间按北京时间解释，不能整体偏移 8 小时。"""
+    await create_pending_posts()
+    headers = auth_headers(await login_as_admin(client))
+
+    approved = await client.post(
+        f"{API}/admin/posts/p_admin_approve/approve", headers=headers
+    )
+    assert approved.status_code == 200, approved.text
+
+    # 用“现在的北京时间”构造一个前后 10 分钟的无时区窗口。
+    now_local = datetime.now(UTC).astimezone(BUSINESS_TZ)
+    start = (now_local - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%S")
+    end = (now_local + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%S")
+    logs = data_of(
+        await client.get(
+            f"{API}/admin/audit-logs?targetId=p_admin_approve&startAt={start}&endAt={end}",
+            headers=headers,
+        )
+    )
+    assert any(item["action"] == "post.approve" for item in logs["items"])

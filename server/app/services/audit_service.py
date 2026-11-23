@@ -16,7 +16,7 @@ from app.core.errors import AppError, request_id_ctx
 from app.core.security import new_id
 from app.db.models import AdminUser, AuditLog
 from app.utils.cursor import decode_cursor, encode_cursor
-from app.utils.time import now_utc
+from app.utils.time import BUSINESS_TZ, now_utc
 
 MAX_PAGE_SIZE = 50
 
@@ -70,7 +70,11 @@ def write_audit(
 
 
 def _parse_dt(value: str | None) -> datetime | None:
-    """把查询参数中的 ISO 时间字符串转换成带时区的时间。"""
+    """把分页游标里的 ISO 时间字符串转换成带时区的时间。
+
+    游标由服务端自己生成，里面的时间一定是 UTC；SQLite 读回的时间可能
+    不带时区，因此这里把“不带时区”按 UTC 解释。
+    """
     if not value:
         return None
     try:
@@ -78,6 +82,27 @@ def _parse_dt(value: str | None) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _parse_client_dt(value: str | None) -> datetime | None:
+    """把前端筛选条件里的时间转换成带时区的 UTC 时间。
+
+    为什么不能直接复用 _parse_dt：
+        日期选择器传的是用户看到的本地时间（例如 2026-11-24T10:00:00），
+        不带时区。如果按 UTC 解释，就会被当成北京时间 18:00，
+        筛选结果整体偏移 8 小时。项目统一以 Asia/Shanghai 为业务时区，
+        所以“不带时区”的输入一律按北京时间解释，再换算成 UTC 去查库。
+        如果前端以后带上 +08:00 之类的时区，则尊重它传来的时区。
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=BUSINESS_TZ)
+    return parsed.astimezone(UTC)
 
 
 async def list_audit_logs(
@@ -108,10 +133,10 @@ async def list_audit_logs(
     if target_id:
         conditions.append(AuditLog.target_id == target_id.strip())
 
-    start = _parse_dt(start_at)
+    start = _parse_client_dt(start_at)
     if start_at and start is None:
         raise AppError("TIME_RANGE_INVALID", "开始时间格式不正确")
-    end = _parse_dt(end_at)
+    end = _parse_client_dt(end_at)
     if end_at and end is None:
         raise AppError("TIME_RANGE_INVALID", "结束时间格式不正确")
     if start is not None:

@@ -66,6 +66,7 @@ export const ACTION_LABELS: Record<string, string> = {
   'post.approve': '审核通过',
   'post.reject': '审核拒绝',
   'post.unpublish': '下架内容',
+  'post.delete': '删除内容',
   'user.ban': '封禁用户',
   'user.unban': '解封用户',
 }

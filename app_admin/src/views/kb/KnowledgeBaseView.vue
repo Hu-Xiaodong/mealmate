@@ -485,6 +485,15 @@ onMounted(load)
             </div>
           </div>
 
+          <el-alert
+            v-if="searchResult?.warning"
+            :title="searchResult.warning"
+            type="warning"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 12px"
+          />
+
           <el-empty
             v-if="!searchResult || searchResult.items.length === 0"
             :description="searchResult ? '没有达到阈值的结果，试试降低相似度' : '输入问题后查看召回片段'"
@@ -493,6 +502,9 @@ onMounted(load)
             <div v-for="item in searchResult.items" :key="item.chunkId" class="result">
               <div class="result__head">
                 <el-tag type="success" size="small">{{ formatScore(item.score) }}</el-tag>
+                <el-tag v-if="searchResult?.mode === 'keyword'" type="warning" size="small">
+                  关键词匹配
+                </el-tag>
                 <span class="result__doc">{{ item.documentTitle }}</span>
                 <span class="muted">第 {{ item.ordinal + 1 }} 段</span>
               </div>

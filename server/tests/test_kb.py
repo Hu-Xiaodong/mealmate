@@ -139,6 +139,40 @@ async def test_upload_indexes_document_and_search_ranks(client, fake_embedding):
     assert all(item["documentTitle"] != "土豆指南" for item in result["items"])
 
 
+async def test_search_falls_back_to_keyword_when_embedding_unavailable(
+    client, fake_embedding, monkeypatch
+):
+    """嵌入模型临时不可用时，检索测试降级为关键词检索而不是 500。"""
+    headers = auth_headers(await login_as_admin(client))
+    uploaded = await _upload(client, headers, "tomato.md", TOMATO_DOC, "番茄指南")
+    assert data_of(uploaded)["status"] == "ready"
+
+    potato = await _upload(client, headers, "potato.md", POTATO_DOC, "土豆指南")
+    assert data_of(potato)["status"] == "ready"
+
+    async def _broken(db, texts, *, subject_ref="system:kb"):
+        raise embedding_service.EmbeddingError(
+            "EMBEDDING_REQUEST_FAILED", "嵌入模型连接失败"
+        )
+
+    # 只让检索阶段失败，上传阶段仍然正常写入切片。
+    monkeypatch.setattr(embedding_service, "embed_texts", _broken)
+
+    searched = await client.post(
+        f"{API}/admin/kb/search-test",
+        json={"query": "番茄怎么挑", "topK": 5, "threshold": 0.3},
+        headers=headers,
+    )
+    assert searched.status_code == 200, searched.text
+    result = data_of(searched)
+    assert result["mode"] == "keyword"
+    assert "降级" in (result["warning"] or "")
+    assert result["items"]
+    assert result["items"][0]["documentTitle"] == "番茄指南"
+    assert all(item["documentTitle"] != "土豆指南" for item in result["items"])
+
+
+
 async def test_reindex_uses_new_active_version(client, fake_embedding):
     token = await login_as_admin(client)
     headers = auth_headers(token)

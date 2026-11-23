@@ -277,8 +277,8 @@ class _HomePageState extends State<HomePage> {
                           )
                         else if (_firstLoaded && _posts.isEmpty)
                           EmptyState(
-                            title: '今天还没有饭帖',
-                            description: '拍下你的这一餐，成为今天的第一条。',
+                            title: '还没有饭帖',
+                            description: '拍下你的这一餐，成为第一条分享。',
                             actionText: '去发布',
                             onAction: _openPublish,
                           )
@@ -287,7 +287,7 @@ class _HomePageState extends State<HomePage> {
                             padding: EdgeInsets.symmetric(vertical: 16),
                             child: Center(
                               child: Text(
-                                '今天就看到这里',
+                                '已经到底了',
                                 style: TextStyle(
                                   fontSize: 12,
                                   color: AppColors.faint,
