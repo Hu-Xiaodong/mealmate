@@ -27,7 +27,9 @@ services:
         condition: service_healthy
 
   db:
-    image: postgres:16-alpine
+    # 使用带 pgvector 扩展的 PostgreSQL 镜像：知识库需要向量类型和相似度索引。
+    # 该镜像与官方 postgres 镜像同源，数据目录格式一致，升配不需要迁移数据。
+    image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
       POSTGRES_DB: mealmate

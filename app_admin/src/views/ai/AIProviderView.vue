@@ -24,6 +24,8 @@ function emptyForm(): AIProviderForm {
   return {
     name: '',
     providerType: 'openai_compatible',
+    kind: 'chat',
+    dimensions: null,
     baseUrl: 'https://api.deepseek.com/v1',
     apiKey: '',
     model: 'deepseek-chat',
@@ -58,6 +60,8 @@ function openEdit(item: AIProviderItem) {
   Object.assign(form, {
     name: item.name,
     providerType: 'openai_compatible',
+    kind: item.kind,
+    dimensions: item.dimensions,
     baseUrl: item.baseUrl,
     // 编辑页不回填密钥：后端只保存密文，前端也没有必要接触明文。
     apiKey: '',
@@ -83,6 +87,10 @@ function validate(): boolean {
     ElMessage.warning('首次新增必须填写 API Key')
     return false
   }
+  if (form.kind === 'embedding' && form.dimensions !== 1024) {
+    ElMessage.warning('嵌入模型的向量维度必须为 1024')
+    return false
+  }
   return true
 }
 
@@ -95,6 +103,9 @@ async function save() {
     const payload: Partial<AIProviderForm> = {
       name: form.name.trim(),
       providerType: 'openai_compatible',
+      kind: form.kind,
+      // 聊天模型没有维度概念，统一传 null，后端也会清空。
+      dimensions: form.kind === 'embedding' ? 1024 : null,
       baseUrl: form.baseUrl.trim().replace(/\/+$/, ''),
       model: form.model.trim(),
       enabled: form.enabled,
@@ -203,6 +214,14 @@ onMounted(load)
         </template>
       </el-table-column>
       <el-table-column prop="name" label="名称" min-width="140" />
+      <el-table-column label="用途" width="110" align="center">
+        <template #default="{ row }">
+          <el-tag v-if="row.kind === 'embedding'" type="success" size="small">
+            嵌入模型
+          </el-tag>
+          <el-tag v-else type="info" size="small">聊天模型</el-tag>
+        </template>
+      </el-table-column>
       <el-table-column label="模型与地址" min-width="240">
         <template #default="{ row }">
           <div class="model-name">{{ row.model }}</div>
@@ -253,6 +272,25 @@ onMounted(load)
       <el-form label-width="110px">
         <el-form-item label="名称">
           <el-input v-model="form.name" maxlength="40" placeholder="例如：DeepSeek 主力" />
+        </el-form-item>
+        <el-form-item label="用途">
+          <el-radio-group
+            v-model="form.kind"
+            @change="(value: string | number | boolean | undefined) => (form.dimensions = value === 'embedding' ? 1024 : null)"
+          >
+            <el-radio value="chat">聊天模型</el-radio>
+            <el-radio value="embedding">嵌入模型</el-radio>
+          </el-radio-group>
+          <div class="muted form-hint">
+            聊天模型用于 AI 问答；嵌入模型只用于知识库切片向量化，接口走
+            /embeddings，与聊天接口不通用。
+          </div>
+        </el-form-item>
+        <el-form-item v-if="form.kind === 'embedding'" label="向量维度">
+          <el-input-number v-model="form.dimensions" :min="1024" :max="1024" disabled />
+          <div class="muted form-hint">
+            首版固定 1024 维，与知识库向量列保持一致；换维度需要新建索引版本。
+          </div>
         </el-form-item>
         <el-form-item label="接口地址">
           <el-input

@@ -198,9 +198,16 @@ async def my_favorites(
                     "targetId": favorite.target_id,
                     "title": recipe.title if available else "收藏内容暂不可用",
                     "summary": (
-                        f"{recipe.total_minutes} 分钟 · {recipe.preconditions or '快手家常'}"
-                        if available
-                        else "该菜谱已下架"
+                        (
+                            f"{recipe.total_minutes} 分钟 · "
+                            f"{recipe.preconditions or '快手家常'}"
+                        )
+                        if available and recipe.total_minutes is not None
+                        else (
+                            f"耗时未标注 · {recipe.preconditions or '家常菜'}"
+                            if available
+                            else "该菜谱已下架"
+                        )
                     ),
                     "coverImage": object_url(recipe.cover_url) if available else None,
                     "savedAt": iso(favorite.saved_at),

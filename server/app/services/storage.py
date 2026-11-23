@@ -26,6 +26,14 @@ class StorageBackend(ABC):
         """写入对象。对象键由调用方生成，重复写入覆盖原对象。"""
 
     @abstractmethod
+    def read(self, key: str) -> bytes:
+        """读取对象内容。
+
+        知识库重建索引时需要把原始文件重新读出来切片；
+        对象不存在时抛出 FileNotFoundError，由业务层决定如何提示。
+        """
+
+    @abstractmethod
     def delete(self, key: str) -> None:
         """删除对象。对象不存在时视为成功，便于重试。"""
 
@@ -59,6 +67,9 @@ class LocalStorage(StorageBackend):
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
+
+    def read(self, key: str) -> bytes:
+        return self._path(key).read_bytes()
 
     def delete(self, key: str) -> None:
         self._path(key).unlink(missing_ok=True)

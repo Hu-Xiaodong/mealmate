@@ -458,7 +458,7 @@ async def chat(
             "targetType": "recipe",
             "targetId": recipe.id,
             "title": recipe.title,
-            "summary": recipe.preconditions or f"{recipe.total_minutes} 分钟可完成",
+            "summary": recipe.preconditions or _duration_text(recipe, suffix="可完成"),
             "coverImage": object_url(recipe.cover_url),
             "reason": (
                 "不完全满足你的条件，仅作为快手选择参考"
@@ -594,7 +594,7 @@ def _recommendation_payload(selected: list[tuple[Recipe, str]]) -> list[dict[str
             "targetType": "recipe",
             "targetId": recipe.id,
             "title": recipe.title,
-            "summary": recipe.preconditions or f"{recipe.total_minutes} 分钟可完成",
+            "summary": recipe.preconditions or _duration_text(recipe, suffix="可完成"),
             "coverImage": object_url(recipe.cover_url),
             "reason": reason,
         }
@@ -638,7 +638,7 @@ def _catalog_text(recipes: list[Recipe]) -> str:
         tools = "、".join(TOOL_LABELS.get(code, code) for code in recipe.tool_codes) or "未标注"
         ingredients = "、".join(recipe.main_ingredients[:4]) or "未标注"
         line = (
-            f"- 编号 {recipe.id}｜{recipe.title}｜{recipe.total_minutes} 分钟"
+            f"- 编号 {recipe.id}｜{recipe.title}｜{_duration_text(recipe)}"
             f"｜器具：{tools}｜主要食材：{ingredients}"
         )
         if recipe.preconditions:
@@ -827,7 +827,11 @@ def _satisfies(recipe: Recipe, constraints: AIConstraints) -> bool:
 
     模型推荐和本地规则推荐共用这一份判断，避免两条路径标准不一致。
     """
-    if constraints.max_minutes and recipe.total_minutes > constraints.max_minutes:
+    if constraints.max_minutes and (
+        recipe.total_minutes is None or recipe.total_minutes > constraints.max_minutes
+    ):
+        # 外部菜谱可能没写总时长。无法判断时按“不满足”处理，
+        # 避免把一道耗时未知的菜推荐给明确赶时间的用户。
         return False
     if constraints.tools and not set(recipe.tool_codes).issubset(set(constraints.tools)):
         return False
@@ -858,16 +862,28 @@ def _select_recipes(
         不能把“不符合条件”的菜谱说成“符合”。
     """
     hard = [recipe for recipe in recipes if _satisfies(recipe, constraints)]
-    hard.sort(key=lambda recipe: (recipe.total_minutes, recipe.id))
+    hard.sort(key=_minutes_sort_key)
     if hard:
         return hard[:3], False
 
-    fallback = sorted(recipes, key=lambda recipe: (recipe.total_minutes, recipe.id))[:2]
+    fallback = sorted(recipes, key=_minutes_sort_key)[:2]
     return fallback, True
 
 
+def _minutes_sort_key(recipe: Recipe) -> tuple[int, str]:
+    """按时长排序，没有时长的菜谱排在最后，不参与“快手”比较。"""
+    return (recipe.total_minutes if recipe.total_minutes is not None else 10_000, recipe.id)
+
+
+def _duration_text(recipe: Recipe, *, suffix: str = "") -> str:
+    """统一显示时长，避免空值被拼成“None 分钟”。"""
+    if recipe.total_minutes is None:
+        return "耗时未标注"
+    return f"{recipe.total_minutes} 分钟{suffix}"
+
+
 def _reason(recipe: Recipe) -> str:
-    parts = [f"{recipe.total_minutes} 分钟"]
+    parts = [_duration_text(recipe)]
     tools = [TOOL_LABELS.get(code, code) for code in recipe.tool_codes]
     if tools:
         parts.append("、".join(tools))

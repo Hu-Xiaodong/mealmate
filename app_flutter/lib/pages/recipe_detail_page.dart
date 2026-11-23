@@ -118,9 +118,10 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
   @override
   Widget build(BuildContext context) {
     final recipe = _recipe;
-    final subtitle = recipe == null
-        ? ''
-        : '${recipe.totalMinutes} 分钟 · ${recipe.servings} 人份';
+    final timeLabel = recipe?.totalMinutes == null
+        ? '耗时未标注'
+        : '${recipe!.totalMinutes} 分钟';
+    final subtitle = recipe == null ? '' : '$timeLabel · ${recipe.servings} 人份';
 
     return Scaffold(
       backgroundColor: AppColors.bg,
@@ -196,10 +197,11 @@ class _RecipeDetailPageState extends State<RecipeDetailPage> {
                   spacing: 8,
                   runSpacing: 8,
                   children: [
-                    InfoChip(
-                      label: '${recipe.totalMinutes} 分钟',
-                      highlight: true,
-                    ),
+                    if (recipe.totalMinutes != null)
+                      InfoChip(
+                        label: '${recipe.totalMinutes!} 分钟',
+                        highlight: true,
+                      ),
                     for (final tool in tools) InfoChip(label: tool),
                     InfoChip(label: '${recipe.servings} 人份'),
                   ],

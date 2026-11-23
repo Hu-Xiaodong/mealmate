@@ -47,6 +47,8 @@ def _payload(provider: AIProvider) -> dict[str, Any]:
         "id": provider.id,
         "name": provider.name,
         "providerType": provider.provider_type,
+        "kind": provider.kind,
+        "dimensions": provider.dimensions,
         "baseUrl": provider.base_url,
         "apiKeyMasked": _masked_key(provider),
         "model": provider.model,
@@ -71,6 +73,8 @@ def _snapshot(provider: AIProvider) -> dict[str, Any]:
     return {
         "name": provider.name,
         "providerType": provider.provider_type,
+        "kind": provider.kind,
+        "dimensions": provider.dimensions,
         "baseUrl": provider.base_url,
         "model": provider.model,
         "enabled": provider.enabled,
@@ -112,6 +116,8 @@ async def create_provider(
         id=new_id("aip"),
         name=name,
         provider_type=body.provider_type,
+        kind=body.kind,
+        dimensions=body.dimensions,
         base_url=body.base_url.strip().rstrip("/"),
         api_key_encrypted=encrypt_secret(body.api_key.strip()),
         model=body.model.strip(),
@@ -155,6 +161,10 @@ async def update_provider(
         provider.name = name
     if body.provider_type is not None:
         provider.provider_type = body.provider_type
+    if body.kind is not None:
+        provider.kind = body.kind
+    if body.dimensions is not None:
+        provider.dimensions = body.dimensions
     if body.base_url is not None:
         provider.base_url = body.base_url.strip().rstrip("/")
     if body.model is not None:
@@ -170,6 +180,21 @@ async def update_provider(
     # 空字符串表示“保留原密钥”，只有真正填写了新密钥才重新加密。
     if body.api_key and body.api_key.strip():
         provider.api_key_encrypted = encrypt_secret(body.api_key.strip())
+
+    # 修改后统一校验用途与维度，避免出现“embedding 但维度为空/不是 1024”
+    # 这种配置，否则知识库写入向量时才会失败，排查成本更高。
+    if provider.kind == "embedding":
+        if provider.dimensions is None:
+            provider.dimensions = 1024
+        elif provider.dimensions != 1024:
+            raise AppError(
+                "AI_PROVIDER_DIMENSION_INVALID",
+                "嵌入模型维度必须为 1024，与知识库向量列保持一致",
+                status_code=400,
+            )
+    else:
+        provider.dimensions = None
+
     provider.updated_at = now_utc()
 
     write_audit(

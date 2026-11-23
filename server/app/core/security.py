@@ -53,7 +53,7 @@ def _token_fernet() -> Fernet:
     即使某一处密钥泄露，也不能拿同一份密文去解另一类数据。
     """
     digest = hashlib.sha256(
-        f"{settings.secret_key}:session-token".encode("utf-8")
+        f"{settings.secret_key}:session-token".encode()
     ).digest()
     return Fernet(base64.urlsafe_b64encode(digest))
 
@@ -107,7 +107,7 @@ def _ai_secret_fernet() -> Fernet:
     某一类密文泄露时无法顺手解开另一类数据。
     """
     digest = hashlib.sha256(
-        f"{settings.secret_key}:ai-provider-key".encode("utf-8")
+        f"{settings.secret_key}:ai-provider-key".encode()
     ).digest()
     return Fernet(base64.urlsafe_b64encode(digest))
 

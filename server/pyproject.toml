@@ -18,6 +18,9 @@ dependencies = [
     "argon2-cffi>=23.1",
     "httpx>=0.27",
     "redis>=5.2",
+    # 向量数据库支持：pgvector 提供 PostgreSQL 的 vector 类型与 SQLAlchemy 映射，
+    # 纯 Python 实现，不需要额外编译；数据库端仍需安装 vector 扩展。
+    "pgvector>=0.3",
     # AI 调用层：LangChain 统一封装 OpenAI 兼容协议。
     # langchain-core 提供消息模型，langchain-openai 提供 ChatOpenAI。
     "langchain-core>=1.8,<2.0",

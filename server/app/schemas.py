@@ -232,6 +232,12 @@ class AIProviderCreateRequest(CamelModel):
     name: str = Field(min_length=1, max_length=40)
     # 目前只支持 OpenAI 兼容协议，写成 Literal 后，传其他值会直接返回 422。
     provider_type: Literal["openai_compatible"] = "openai_compatible"
+    # 配置用途：chat 聊天补全、embedding 文本嵌入。
+    # 两者接口结构不同，不能共用一个配置。
+    kind: Literal["chat", "embedding"] = "chat"
+    # 嵌入向量维度。聊天模型忽略此字段；嵌入模型首版固定 1024，
+    # 必须与知识库向量列一致，否则写入数据库会失败。
+    dimensions: int | None = Field(default=None, ge=1, le=8192)
     base_url: str = Field(min_length=1, max_length=255)
     # 只在新增时必填；编辑时留空表示保留原密钥。
     api_key: str = Field(min_length=1, max_length=300)
@@ -241,6 +247,19 @@ class AIProviderCreateRequest(CamelModel):
     priority: int = Field(default=100, ge=0, le=9999)
     timeout_seconds: int = Field(default=20, ge=3, le=120)
     max_output_tokens: int = Field(default=800, ge=100, le=4000)
+
+    @model_validator(mode="after")
+    def _normalize_kind(self):
+        if self.kind == "embedding":
+            # 不填时给默认值，减少运营需要记住的参数。
+            if self.dimensions is None:
+                self.dimensions = 1024
+            if self.dimensions != 1024:
+                raise ValueError("嵌入模型维度必须为 1024，与知识库向量列保持一致")
+        else:
+            # 聊天模型没有向量维度概念，统一清空，避免展示与使用混乱。
+            self.dimensions = None
+        return self
 
 
 class AIProviderUpdateRequest(CamelModel):
@@ -253,6 +272,8 @@ class AIProviderUpdateRequest(CamelModel):
 
     name: str | None = Field(default=None, min_length=1, max_length=40)
     provider_type: Literal["openai_compatible"] | None = None
+    kind: Literal["chat", "embedding"] | None = None
+    dimensions: int | None = Field(default=None, ge=1, le=8192)
     base_url: str | None = Field(default=None, min_length=1, max_length=255)
     api_key: str | None = Field(default=None, max_length=300)
     model: str | None = Field(default=None, min_length=1, max_length=80)
@@ -260,6 +281,40 @@ class AIProviderUpdateRequest(CamelModel):
     priority: int | None = Field(default=None, ge=0, le=9999)
     timeout_seconds: int | None = Field(default=None, ge=3, le=120)
     max_output_tokens: int | None = Field(default=None, ge=100, le=4000)
+
+
+class KbIndexVersionCreateRequest(CamelModel):
+    """新知识库索引版本。
+
+    切片长度与重叠长度决定检索粒度：
+    - 片段太短：上下文不完整，模型拿到的信息支离破碎；
+    - 片段太长：一个片段混合多个主题，检索精度下降；
+    - 重叠太小：一句话被切断后两边都检索不到。
+    400 字与 80 字是首版经过测试的起点，运营可以新建版本对比效果。
+    """
+
+    name: str = Field(min_length=1, max_length=80)
+    chunk_size: int = Field(default=400, ge=200, le=1000)
+    chunk_overlap: int = Field(default=80, ge=0, le=200)
+
+    @model_validator(mode="after")
+    def _check_overlap(self):
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError("重叠长度必须小于切片长度")
+        return self
+
+
+class KbSearchTestRequest(CamelModel):
+    """知识库检索测试。
+
+    threshold 是最低相似度：低于该值的片段不返回。
+    阈值太低会返回大量无关内容，太高又可能什么都搜不到，
+    因此提供给运营现场调整，默认 0 表示先看全量排序。
+    """
+
+    query: str = Field(min_length=1, max_length=500)
+    top_k: int = Field(default=5, ge=1, le=20)
+    threshold: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class AdminLoginRequest(CamelModel):
@@ -342,7 +397,9 @@ class RecipeInput(CamelModel):
 
     title: str = Field(min_length=1, max_length=40)
     cover_url: str = Field(min_length=1, max_length=255)
-    total_minutes: int = Field(ge=1, le=180)
+    # 外部导入的菜谱可能没有写总时长，所以允许为空。
+    # 手工创建时前端仍会要求填写，后端不再强制。
+    total_minutes: int | None = Field(default=None, ge=1, le=180)
     tool_codes: list[str] = Field(default_factory=list, max_length=8)
     category_codes: list[str] = Field(default_factory=list, max_length=8)
     servings: float = Field(default=1, gt=0, le=20)
@@ -350,7 +407,7 @@ class RecipeInput(CamelModel):
     ingredients: list[RecipeIngredientInput] = Field(min_length=1, max_length=30)
     steps: list[str] = Field(min_length=1, max_length=30)
     preconditions: str | None = Field(default=None, max_length=200)
-    content_origin: Literal["platform", "editor"] = "platform"
+    content_origin: Literal["platform", "editor", "howtocook", "pdf"] = "platform"
     validation_status: Literal["tested", "pending", "not_tested"] = "pending"
     status: Literal["draft", "published", "archived"] = "published"
 
@@ -359,7 +416,9 @@ class RecipeInput(CamelModel):
         self.title = self.title.strip()
         self.cover_url = self.cover_url.strip()
         self.steps = [item.strip() for item in self.steps if item.strip()]
-        self.tool_codes = list(dict.fromkeys(code.strip() for code in self.tool_codes if code.strip()))
+        self.tool_codes = list(
+            dict.fromkeys(code.strip() for code in self.tool_codes if code.strip())
+        )
         self.category_codes = list(
             dict.fromkeys(code.strip() for code in self.category_codes if code.strip())
         )
@@ -373,7 +432,9 @@ class RecipeInput(CamelModel):
                 item.name.strip()[:12] for item in self.ingredients[:3]
             ]
         else:
-            self.main_ingredients = [name.strip() for name in self.main_ingredients if name.strip()][:3]
+            self.main_ingredients = [
+                name.strip() for name in self.main_ingredients if name.strip()
+            ][:3]
         return self
 
 

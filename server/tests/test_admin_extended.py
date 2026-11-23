@@ -159,7 +159,11 @@ async def test_analytics_batch_dedupe_and_account(client):
 
     async with app.state.test_session_factory() as db:
         rows = (
-            await db.scalars(select(AnalyticsEvent).where(AnalyticsEvent.event_id.like("evt_test_%")))
+            await db.scalars(
+                select(AnalyticsEvent).where(
+                    AnalyticsEvent.event_id.like("evt_test_%")
+                )
+            )
         ).all()
         by_id = {row.event_id: row for row in rows}
         assert len(by_id) == 3

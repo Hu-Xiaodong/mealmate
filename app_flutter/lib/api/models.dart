@@ -140,7 +140,7 @@ class Recipe {
   final String id;
   final String title;
   final String coverImage;
-  final int totalMinutes;
+  final int? totalMinutes;
   final List<String> tools;
   final List<String> categories;
   final int servings;
@@ -162,7 +162,7 @@ class Recipe {
       id: json['id'] as String? ?? '',
       title: json['title'] as String? ?? '',
       coverImage: json['coverImage'] as String? ?? '',
-      totalMinutes: (json['totalMinutes'] as num?)?.toInt() ?? 0,
+      totalMinutes: (json['totalMinutes'] as num?)?.toInt(),
       tools: tools is List
           ? tools.map((item) => item as String).toList(growable: false)
           : const [],

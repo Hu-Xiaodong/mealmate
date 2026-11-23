@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Avatar,
   ArrowDown,
+  Collection,
   Cpu,
   DataAnalysis,
   Dish,
@@ -30,6 +31,7 @@ const iconMap: Record<string, Component> = {
   '/taste-tags': PriceTag,
   '/ai-providers': Cpu,
   '/ai-call-logs': Tickets,
+  '/knowledge-base': Collection,
   '/users': User,
   '/admins': Avatar,
   '/audit-logs': List,

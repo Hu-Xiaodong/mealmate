@@ -260,6 +260,8 @@ export interface AIProviderItem {
   id: string
   name: string
   providerType: 'openai_compatible' | string
+  kind: 'chat' | 'embedding'
+  dimensions: number | null
   baseUrl: string
   apiKeyMasked: string
   model: string
@@ -277,6 +279,8 @@ export interface AIProviderItem {
 export interface AIProviderForm {
   name: string
   providerType: 'openai_compatible'
+  kind: 'chat' | 'embedding'
+  dimensions: number | null
   baseUrl: string
   apiKey: string
   model: string
@@ -315,4 +319,84 @@ export interface AICallLogParams {
   status?: string
   providerId?: string
   limit?: number
+}
+
+export interface KbDocumentItem {
+  id: string
+  title: string
+  sourceType: string
+  mime: string
+  bytes: number
+  checksum: string
+  status: 'uploaded' | 'parsing' | 'chunking' | 'indexing' | 'ready' | 'failed'
+  errorMessage: string | null
+  indexVersionId: string | null
+  uploadedBy: string | null
+  chunkCount: number
+  createdAt: string
+  updatedAt: string
+}
+
+export interface KbIndexVersionItem {
+  id: string
+  name: string
+  embedProvider: string
+  embedModel: string
+  dimensions: number
+  chunkSize: number
+  chunkOverlap: number
+  status: 'building' | 'active' | 'archived'
+  createdAt: string
+  activatedAt: string | null
+}
+
+export interface KbIndexVersionForm {
+  name: string
+  chunkSize: number
+  chunkOverlap: number
+}
+
+export interface KbChunkItem {
+  id: string
+  ordinal: number
+  content: string
+  tokenCount: number
+  metadata: {
+    heading?: string
+    headingPath?: string
+    sectionIndex?: number
+  } | null
+}
+
+export interface KbChunkPage {
+  items: KbChunkItem[]
+  total: number
+  offset: number
+  limit: number
+  hasMore: boolean
+}
+
+export interface KbSearchParams {
+  query: string
+  topK: number
+  threshold: number
+}
+
+export interface KbSearchItem {
+  chunkId: string
+  documentId: string
+  documentTitle: string
+  ordinal: number
+  content: string
+  score: number
+  metadata: Record<string, unknown> | null
+}
+
+export interface KbSearchResult {
+  query: string
+  topK: number
+  threshold: number
+  indexVersion: KbIndexVersionItem
+  tookMs: number
+  items: KbSearchItem[]
 }

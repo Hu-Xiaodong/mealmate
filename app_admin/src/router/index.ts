@@ -17,6 +17,7 @@ export const NAV_ITEMS = [
   { path: '/taste-tags', label: '口味标签', permission: 'taste_tag.manage' },
   { path: '/ai-providers', label: '模型配置', permission: 'ai.config.write' },
   { path: '/ai-call-logs', label: 'AI 调用日志', permission: 'ai.log.read' },
+  { path: '/knowledge-base', label: '知识库', permission: 'kb.document.manage' },
   { path: '/users', label: '用户管理', permission: 'user.read' },
   { path: '/admins', label: '管理员与角色', permission: 'admin.manage' },
   { path: '/audit-logs', label: '审计日志', permission: 'audit.read' },
@@ -82,6 +83,12 @@ const router = createRouter({
           name: 'ai-call-logs',
           component: () => import('@/views/ai/AICallLogView.vue'),
           meta: { title: 'AI 调用日志', permission: 'ai.log.read' },
+        },
+        {
+          path: 'knowledge-base',
+          name: 'knowledge-base',
+          component: () => import('@/views/kb/KnowledgeBaseView.vue'),
+          meta: { title: '知识库', permission: 'kb.document.manage' },
         },
         {
           path: 'users',

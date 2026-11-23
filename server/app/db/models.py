@@ -273,11 +273,19 @@ class MealPost(Base):
 
 class Recipe(Base):
     __tablename__ = "recipes"
+    # 外部导入的菜谱必须能追溯到唯一来源。
+    # 手工菜谱这两个字段为空，数据库允许多行空值，不影响原有数据。
+    __table_args__ = (
+        UniqueConstraint("source_type", "source_uri", name="uq_recipes_source"),
+    )
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
     title: Mapped[str] = mapped_column(String(40))
     cover_url: Mapped[str] = mapped_column(String(255))
-    total_minutes: Mapped[int] = mapped_column(Integer)
+    # 允许为空：外部菜谱经常不写总时长。
+    # 这里故意不填 0 或默认值，因为“没写”和“零分钟”是两件事，
+    # 后续按时间筛选时，空值应被视为“无法判断”，而不是“很快”。
+    total_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tool_codes: Mapped[list[str]] = mapped_column(JSON)
     category_codes: Mapped[list[str]] = mapped_column(JSON)
     servings: Mapped[float] = mapped_column(Float, default=1)
@@ -289,6 +297,114 @@ class Recipe(Base):
     validation_status: Mapped[str] = mapped_column(String(20), default="tested")
     status: Mapped[str] = mapped_column(String(20), default="published", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    # ---- 外部数据来源（HowToCook、PDF 等）----
+    # 菜谱简介，取原文第一段。手工菜谱可以留空。
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 附加内容、注意事项。保留原文，不做二次创作。
+    tips: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 原文难度，例如“★★”。不换算成主观等级，避免丢失原始信息。
+    difficulty: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # 菜系或类型标签，例如“素菜”“水产”。与 category_codes 分开：
+    # category_codes 决定客户端顶部分类，tags 用于检索和展示。
+    tags: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # 来源类型：manual 手工创建、howtocook 仓库导入、pdf 文档抽取。
+    source_type: Mapped[str] = mapped_column(String(20), default="manual", index=True)
+    # 来源地址。HowToCook 保存仓库内的相对路径；手工菜谱为空。
+    source_uri: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # 规范化正文的 SHA-256 摘要，用于判断源文件是否变化。
+    source_checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 来源许可证，例如 Unlicense。对外展示菜谱时据此标注来源。
+    source_license: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # 本次导入所属批次。批次被删除时菜谱保留，所以不做级联删除。
+    import_batch_id: Mapped[str | None] = mapped_column(
+        ForeignKey("import_batches.id"), nullable=True, index=True
+    )
+    # 来源的附加信息，例如原文分类目录、图片原始地址列表。
+    # 用 JSON 保存而不是不断加列，避免每接一种数据源就改一次表结构。
+    source_meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class ImportBatch(Base):
+    """一次数据导入的批次记录。
+
+    为什么需要批次表，而不是只给菜谱写来源字段：
+    1. 一次导入可能包含几百个文件，需要整体查看成功、失败、跳过数量；
+    2. 导入失败后要能按批次找到并清理本次写入的数据；
+    3. 运营需要知道“这批数据是谁在什么时候导入的、源版本是什么”。
+
+    stats 用 JSON 保存各状态计数，例如
+    {"created": 120, "updated": 3, "skipped": 250, "failed": 1}。
+    导入统计的字段会随数据源变化，用 JSON 比固定列更灵活。
+    """
+
+    __tablename__ = "import_batches"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    # 数据源类型：howtocook / pdf。
+    source_type: Mapped[str] = mapped_column(String(20), index=True)
+    # 数据源地址：仓库地址或文件存储路径。
+    source_uri: Mapped[str] = mapped_column(String(255))
+    # 数据源版本：HowToCook 用提交号，PDF 用对象存储版本号或上传时间。
+    source_ref: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    # 压缩包或整批内容的摘要，用于判断“同一版本是否已经导过”。
+    checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # pending 待执行、running 执行中、succeeded 全部成功、
+    # partial 部分失败、failed 整体失败。
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    stats: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # 发起导入的管理员标识。管理员被删除后批次仍要保留，所以不做外键。
+    created_by: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class IngestionJob(Base):
+    """后台任务表中的一行，交给独立的任务进程执行。
+
+    为什么不用内存队列：
+    进程重启后内存队列会丢失，用户看到的是“任务永远不结束”。
+    把任务写进数据库后，进程崩溃可以重新领取，失败可以重试。
+
+    为什么暂时不用 Celery 这类任务框架：
+    当前只有导入和切片两种任务，量小；先用数据库任务表加
+    SELECT ... FOR UPDATE SKIP LOCKED 就够。等任务量、定时需求、
+    多队列隔离真正出现，再引入任务框架，避免为了一个功能多维护一套服务。
+    """
+
+    __tablename__ = "ingestion_jobs"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    batch_id: Mapped[str] = mapped_column(ForeignKey("import_batches.id"), index=True)
+    # 任务类型：parse_repository 解析仓库、download_images 下载图片、
+    # extract_recipes 从文档抽取菜谱、embed_chunks 生成向量。
+    job_type: Mapped[str] = mapped_column(String(30), index=True)
+    # pending 待领取、running 执行中、succeeded 成功、
+    # failed 失败待重试、dead 超过重试上限。
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    # 任务参数。不同任务需要的字段不同，用 JSON 保存。
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    # 执行结果，例如写入数量、跳过数量、失败文件列表。
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # 最早可执行时间。失败重试时设为“当前时间 + 退避时长”，
+    # 任务进程只领取到期的任务，避免失败任务立刻被反复重试。
+    run_after: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    # 领取任务的进程标识与领取时间，用于发现“进程崩溃后卡住的任务”。
+    locked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    locked_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
 
 
 class RecipeCategory(Base):
@@ -377,6 +493,13 @@ class AIProvider(Base):
     # 后台展示用的名称，例如“DeepSeek 主力”“通义备用”。唯一，避免运营选错。
     name: Mapped[str] = mapped_column(String(40), unique=True, index=True)
     provider_type: Mapped[str] = mapped_column(String(30), default="openai_compatible")
+    # 配置用途：chat 聊天补全、embedding 文本嵌入。
+    # 两类接口的请求路径和返回结构不同，必须分开配置：
+    # 聊天模型负责生成回答，嵌入模型负责把文字转成向量，不能混用。
+    kind: Mapped[str] = mapped_column(String(20), default="chat")
+    # 嵌入向量的维度。聊天模型留空；嵌入模型必须填写，
+    # 并且要与知识库表的向量列维度一致（首版固定 1024）。
+    dimensions: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # 接口根地址，例如 https://api.deepseek.com/v1。
     # 末尾补 /chat/completions 的逻辑集中在服务层，避免每家供应商各写一份。
     base_url: Mapped[str] = mapped_column(String(255))

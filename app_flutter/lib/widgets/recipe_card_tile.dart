@@ -71,10 +71,13 @@ class RecipeCardTile extends StatelessWidget {
                     spacing: 6,
                     runSpacing: 6,
                     children: [
-                      InfoChip(
-                        label: '${recipe.totalMinutes} 分钟',
-                        highlight: true,
-                      ),
+                      // 外部导入菜谱可能没写总时长，此时不展示时间标签，
+                      // 不能显示“0 分钟”误导用户。
+                      if (recipe.totalMinutes != null)
+                        InfoChip(
+                          label: '${recipe.totalMinutes!} 分钟',
+                          highlight: true,
+                        ),
                       for (final tool in tools) InfoChip(label: tool),
                       InfoChip(label: '${recipe.servings} 人份'),
                     ],

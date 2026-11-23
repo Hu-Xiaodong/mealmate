@@ -12,6 +12,7 @@ from app.api.routes.admin import (
     audit,
     auth,
     dashboard,
+    kb,
     posts,
     recipes,
     taste_tags,
@@ -29,3 +30,5 @@ router.include_router(admins.router)
 router.include_router(audit.router)
 router.include_router(ai_providers.router)
 router.include_router(ai_providers.logs_router)
+# 知识库：文档管理、索引版本与检索测试。
+router.include_router(kb.router)

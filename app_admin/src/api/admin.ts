@@ -15,6 +15,12 @@ import type {
   AuditLogItem,
   BatchReviewResult,
   DashboardSummary,
+  KbChunkPage,
+  KbDocumentItem,
+  KbIndexVersionForm,
+  KbIndexVersionItem,
+  KbSearchParams,
+  KbSearchResult,
   LoginResult,
   MeResult,
   PageResult,
@@ -321,5 +327,84 @@ export function listAICallLogs(params: AICallLogParams) {
   return request<{ items: AICallLogItem[] }>({
     url: '/admin/ai-call-logs',
     params,
+  })
+}
+
+export function listKbDocuments(params?: {
+  status?: string
+  keyword?: string
+  limit?: number
+}) {
+  return request<{ items: KbDocumentItem[] }>({
+    url: '/admin/kb/documents',
+    params,
+  })
+}
+
+export function uploadKbDocument(file: File, title?: string) {
+  // multipart/form-data 交给浏览器生成边界；手动设置 Content-Type 反而会丢边界。
+  const form = new FormData()
+  form.append('file', file)
+  if (title && title.trim()) {
+    form.append('title', title.trim())
+  }
+  return request<KbDocumentItem>({
+    url: '/admin/kb/documents',
+    method: 'post',
+    data: form,
+    // 上传后要立即切片与生成向量，耗时明显高于普通查询，单独放宽超时。
+    timeout: 120000,
+  })
+}
+
+export function reindexKbDocument(documentId: string) {
+  return request<KbDocumentItem>({
+    url: `/admin/kb/documents/${documentId}/reindex`,
+    method: 'post',
+    timeout: 120000,
+  })
+}
+
+export function deleteKbDocument(documentId: string) {
+  return request<{ id: string; deleted: boolean }>({
+    url: `/admin/kb/documents/${documentId}`,
+    method: 'delete',
+  })
+}
+
+export function listKbChunks(documentId: string, offset = 0, limit = 50) {
+  return request<KbChunkPage>({
+    url: `/admin/kb/documents/${documentId}/chunks`,
+    params: { offset, limit },
+  })
+}
+
+export function listKbIndexVersions() {
+  return request<{ items: KbIndexVersionItem[] }>({
+    url: '/admin/kb/index-versions',
+  })
+}
+
+export function createKbIndexVersion(data: KbIndexVersionForm) {
+  return request<KbIndexVersionItem>({
+    url: '/admin/kb/index-versions',
+    method: 'post',
+    data,
+  })
+}
+
+export function activateKbIndexVersion(versionId: string) {
+  return request<KbIndexVersionItem>({
+    url: `/admin/kb/index-versions/${versionId}/activate`,
+    method: 'post',
+  })
+}
+
+export function searchKb(data: KbSearchParams) {
+  return request<KbSearchResult>({
+    url: '/admin/kb/search-test',
+    method: 'post',
+    data,
+    timeout: 60000,
   })
 }
