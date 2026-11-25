@@ -19,9 +19,9 @@
 误差可以通过调整 chunk_size 吸收。
 
 调用关系（谁在用这个文件）：
-1. app/services/kb_service.py 的 _index_document：知识库文档“上传 / 重建索引”时，
-   先调用 split_document 把正文切成片段，再把每个片段交给 embedding_service 生成向量，
-   最后写入 kb_chunk 表；
+1. app/services/kb_service.py 的 _split_text：知识库文档“上传 / 重新切片”时，
+   调用 split_document 把正文切成片段，写入 kb_draft_chunks（切片列表）；
+   运营点“建立索引”后，这些片段才由 embedding_service 生成向量并写入 kb_chunks；
 2. server/tests/test_kb.py：单元测试直接调用 split_document，
    验证“按标题分节、保留上下文头、相邻片段有重叠”等行为。
 
@@ -35,7 +35,7 @@ from typing import Any
 
 # 默认目标长度：400 字左右。经验上 300 到 800 字既能保留完整语义，
 # 又不会让一个片段混杂太多主题。
-# 注意：知识库索引流程（kb_service._index_document）会传入“索引版本”里的 chunk_size
+# 注意：知识库切片流程（kb_service._split_text）会传入“索引版本”里的 chunk_size
 # 作为 target_chars，并把 max_chars 设为 chunk_size 的两倍；
 # 这里的默认值主要用于单元测试或没有显式传参的调用。
 DEFAULT_TARGET_CHARS = 400
@@ -69,10 +69,10 @@ class TextChunk:
     避免调用方在多个平行列表或元组之间来回对应。
 
     哪里用到：
-    - app/services/kb_service.py 的 _insert_chunks：把 content 写入 kb_chunk.content、
-      token_count 写入 kb_chunk.token_count、metadata 写入 kb_chunk.chunk_metadata；
-    - app/services/kb_service.py 的 _index_document：把 content 列表交给 embedding_service
-      批量生成向量（向量与切片按下标一一对应）。
+    - app/services/kb_service.py 的 _save_drafts：把 content 写入切片列表
+      （kb_draft_chunks）的 content、token_count、metadata；
+    - app/services/kb_service.py 的 _build_index：把 content 列表交给 embedding_service
+      批量生成向量（向量与切片按下标一一对应），再写入 kb_chunks。
 
     为什么这样设计：
     content 已经带上上下文头，可以直接用于生成向量和展示（片段脱离原文后仍知道属于哪个章节）；
@@ -297,8 +297,8 @@ def split_document(
     """把文档正文切成片段。
 
     作用与调用方：
-        本模块对外的唯一入口。app/services/kb_service.py 的 _index_document 在
-        “文档上传 / 重建索引”时调用它获取切片列表；server/tests/test_kb.py 的单元测试
+        本模块对外的唯一入口。app/services/kb_service.py 的 _split_text 在
+        “文档上传 / 重新切片”时调用它获取切片列表；server/tests/test_kb.py 的单元测试
         也直接调用它，验证切片行为是否符合预期。
 
     Args:

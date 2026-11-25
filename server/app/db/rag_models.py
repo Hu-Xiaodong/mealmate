@@ -1,9 +1,18 @@
 """知识库（检索增强生成，Retrieval-Augmented Generation）数据模型。
 
-三张表的关系：
-1. kb_index_versions：一次“切片 + 嵌入”产物的版本号；
+四张表的关系：
+1. kb_index_versions：一批“嵌入”产物的版本号；
 2. kb_documents：上传的原始文档；
-3. kb_chunks：文档切成的片段，片段上保存向量，用于相似度检索。
+3. kb_draft_chunks：上传后切好、但还没生成向量的“待索引切片”，
+   对应后台“切片列表”里的内容；
+4. kb_chunks：已经生成向量、可以被检索的切片。
+
+为什么把“待索引切片”单独放一张表：
+上传时只做解析和切片，运营可以先人工检查切片质量，再主动点“建立索引”
+才调用嵌入模型。如果直接把未索引的切片塞进 kb_chunks，
+检索查询必须反复判断“向量是否为空”，而且切片列表和检索数据混在一起，
+清理、重建、统计都容易出错。拆成两张表后，职责非常清楚：
+kb_draft_chunks 是“加工中的半成品”，kb_chunks 是“可用的成品”。
 
 为什么向量列只在 PostgreSQL 上是 vector 类型：
 - 生产与开发使用 PostgreSQL + pgvector 扩展，vector(1024) 可以建 HNSW 索引，
@@ -125,4 +134,34 @@ class KbChunk(Base):
     chunk_metadata: Mapped[dict | None] = mapped_column(
         "metadata", JSON, nullable=True
     )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class KbDraftChunk(Base):
+    """待索引切片：已经切好、还没有生成向量的半成品。
+
+    生命周期：
+    1. 上传文档时，按当前启用索引版本的参数切片，结果写进这张表；
+    2. 运营在“切片列表”里检查无误后点“建立索引”；
+    3. 建立成功后，切片连同向量写入 kb_chunks，本表的对应行删除。
+
+    为什么切片参数（chunk_size、chunk_overlap）存在每一行上：
+    kb_documents 是已经上线过的表，直接加列需要额外执行迁移；
+    而且切片参数描述的是“这批切片怎么来的”，跟着切片走语义更直接。
+    同一份切片的每一行参数相同，少量重复换取查询简单，是刻意取舍。
+    """
+
+    __tablename__ = "kb_draft_chunks"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("kb_documents.id"), index=True)
+    # 在文档中的顺序，从 0 开始；建立索引后原样写入 kb_chunks.ordinal。
+    ordinal: Mapped[int] = mapped_column(Integer, default=0)
+    content: Mapped[str] = mapped_column(Text)
+    token_count: Mapped[int] = mapped_column(Integer, default=0)
+    # 切片时使用的目标长度与重叠长度，用于在切片列表中展示。
+    chunk_size: Mapped[int] = mapped_column(Integer, default=400)
+    chunk_overlap: Mapped[int] = mapped_column(Integer, default=80)
+    # 章节标题、标题路径等定位信息；列名与 kb_chunks 保持一致，减少转换代码。
+    chunk_metadata: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

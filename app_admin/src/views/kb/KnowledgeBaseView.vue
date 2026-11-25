@@ -7,23 +7,27 @@ import {
   Plus,
   Refresh,
   Search,
+  SetUp,
   UploadFilled,
   View,
 } from '@element-plus/icons-vue'
 
 import {
   activateKbIndexVersion,
+  buildKbIndex,
   createKbIndexVersion,
   deleteKbDocument,
   listKbChunks,
+  listKbChunkSets,
   listKbDocuments,
   listKbIndexVersions,
-  reindexKbDocument,
+  rechunkKbDocument,
   searchKb,
   uploadKbDocument,
 } from '@/api/admin'
 import type {
   KbChunkItem,
+  KbChunkSetItem,
   KbDocumentItem,
   KbIndexVersionItem,
   KbSearchResult,
@@ -34,6 +38,7 @@ const CHUNK_PAGE = 20
 
 const loading = ref(false)
 const documents = ref<KbDocumentItem[]>([])
+const chunkSets = ref<KbChunkSetItem[]>([])
 const versions = ref<KbIndexVersionItem[]>([])
 const keyword = ref('')
 const statusFilter = ref('')
@@ -44,12 +49,17 @@ const uploadFile = ref<File | null>(null)
 const uploading = ref(false)
 const processingId = ref('')
 
+const indexVisible = ref(false)
+const indexTarget = ref<KbChunkSetItem | null>(null)
+const indexing = ref(false)
+
 const chunkVisible = ref(false)
-const chunkDocument = ref<KbDocumentItem | null>(null)
+const chunkDocument = ref<{ id: string; title: string } | null>(null)
 const chunkItems = ref<KbChunkItem[]>([])
 const chunkTotal = ref(0)
 const chunkOffset = ref(0)
 const chunkLoading = ref(false)
+const chunkSource = ref<'draft' | 'indexed'>('draft')
 
 const versionVisible = ref(false)
 const versionSaving = ref(false)
@@ -70,6 +80,7 @@ const statusMap: Record<
   uploaded: { label: '已上传', type: 'info' },
   parsing: { label: '解析中', type: 'warning' },
   chunking: { label: '切片中', type: 'warning' },
+  chunked: { label: '待建索引', type: 'info' },
   indexing: { label: '生成向量', type: 'warning' },
   ready: { label: '可用', type: 'success' },
   failed: { label: '失败', type: 'danger' },
@@ -106,15 +117,17 @@ function formatScore(score: number): string {
 async function load() {
   loading.value = true
   try {
-    const [documentResult, versionResult] = await Promise.all([
+    const [documentResult, versionResult, chunkSetResult] = await Promise.all([
       listKbDocuments({
         status: statusFilter.value || undefined,
         keyword: keyword.value.trim() || undefined,
       }),
       listKbIndexVersions(),
+      listKbChunkSets(),
     ])
     documents.value = documentResult.items
     versions.value = versionResult.items
+    chunkSets.value = chunkSetResult.items
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '加载知识库失败')
   } finally {
@@ -144,10 +157,12 @@ async function submitUpload() {
   uploading.value = true
   try {
     const document = await uploadKbDocument(uploadFile.value, uploadTitle.value)
-    if (document.status === 'ready') {
-      ElMessage.success(`上传成功，共生成 ${document.chunkCount} 个切片`)
+    if (document.status === 'chunked') {
+      ElMessage.success(
+        `上传成功，已切出 ${document.chunkCount} 个切片，请到切片列表建立索引`,
+      )
     } else {
-      ElMessage.warning(document.errorMessage || '文档已保存，但索引失败')
+      ElMessage.warning(document.errorMessage || '文档已保存，但切片失败')
     }
     uploadVisible.value = false
     await load()
@@ -158,29 +173,55 @@ async function submitUpload() {
   }
 }
 
-async function reindex(document: KbDocumentItem) {
+async function rechunk(document: KbDocumentItem) {
   try {
     await ElMessageBox.confirm(
-      `按当前启用的索引版本重新切片并生成向量，确认重建「${document.title}」？`,
-      '重建索引',
-      { type: 'warning', confirmButtonText: '重建', cancelButtonText: '取消' },
+      `按当前启用的索引版本重新切片，结果会进入切片列表等待建立索引，确认重新切片「${document.title}」？`,
+      '重新切片',
+      { type: 'warning', confirmButtonText: '重新切片', cancelButtonText: '取消' },
     )
   } catch {
     return
   }
   processingId.value = document.id
   try {
-    const updated = await reindexKbDocument(document.id)
-    if (updated.status === 'ready') {
-      ElMessage.success(`重建完成，共 ${updated.chunkCount} 个切片`)
+    const updated = await rechunkKbDocument(document.id)
+    if (updated.status === 'chunked') {
+      ElMessage.success(`重新切片完成，共 ${updated.chunkCount} 个切片，请到切片列表建立索引`)
     } else {
-      ElMessage.warning(updated.errorMessage || '重建失败')
+      ElMessage.warning(updated.errorMessage || '重新切片失败')
     }
     await load()
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '重建失败')
+    ElMessage.error(error instanceof Error ? error.message : '重新切片失败')
   } finally {
     processingId.value = ''
+  }
+}
+
+function openIndexDialog(item: KbChunkSetItem) {
+  indexTarget.value = item
+  indexVisible.value = true
+}
+
+async function submitIndex() {
+  if (!indexTarget.value) {
+    return
+  }
+  indexing.value = true
+  try {
+    const updated = await buildKbIndex(indexTarget.value.documentId)
+    if (updated.status === 'ready') {
+      ElMessage.success(`索引已建立，共 ${updated.chunkCount} 个切片可用于检索`)
+    } else {
+      ElMessage.warning(updated.errorMessage || '建立索引失败')
+    }
+    indexVisible.value = false
+    await load()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '建立索引失败')
+  } finally {
+    indexing.value = false
   }
 }
 
@@ -203,7 +244,7 @@ async function remove(document: KbDocumentItem) {
   }
 }
 
-async function openChunks(document: KbDocumentItem) {
+async function openChunks(document: { id: string; title: string }) {
   chunkDocument.value = document
   chunkItems.value = []
   chunkOffset.value = 0
@@ -223,6 +264,7 @@ async function loadChunks(reset = false) {
       CHUNK_PAGE,
     )
     chunkTotal.value = page.total
+    chunkSource.value = page.source
     chunkItems.value = reset
       ? page.items
       : [...chunkItems.value, ...page.items]
@@ -314,7 +356,7 @@ onMounted(load)
       <div>
         <h1 class="page-title">知识库</h1>
         <p class="page-subtitle">
-          上传 Markdown / 纯文本文档，自动切片并生成向量；检索测试用于验证召回效果。
+          上传只做解析与切片，切片进入「切片列表」；确认后建立索引生成向量，再用检索测试验证效果。
         </p>
       </div>
       <div class="head-actions">
@@ -330,8 +372,8 @@ onMounted(load)
       show-icon
       :closable="false"
       class="hint"
-      title="向量检索依赖嵌入模型"
-      description="请先在「模型配置」中新增用途为 embedding 的供应商；未配置时上传的文档会保存为「失败」，补好配置后点「重建」即可。"
+      title="上传只切片，建立索引才调用嵌入模型"
+      description="请先在「模型配置」中新增用途为 embedding 的供应商；未配置时切片仍会生成，但建立索引会失败，补好配置后可直接重试，不需要重新上传。"
     />
 
     <el-card shadow="never" class="section">
@@ -344,6 +386,7 @@ onMounted(load)
           @keyup.enter="load"
         />
         <el-select v-model="statusFilter" placeholder="全部状态" clearable class="toolbar__status">
+          <el-option label="待建索引" value="chunked" />
           <el-option label="可用" value="ready" />
           <el-option label="处理中" value="indexing" />
           <el-option label="失败" value="failed" />
@@ -386,9 +429,9 @@ onMounted(load)
               link
               type="primary"
               :loading="processingId === row.id"
-              @click="reindex(row)"
+              @click="rechunk(row)"
             >
-              重建
+              重新切片
             </el-button>
             <el-button link type="danger" :icon="Delete" @click="remove(row)">
               删除
@@ -396,6 +439,59 @@ onMounted(load)
           </template>
         </el-table-column>
       </el-table>
+    </el-card>
+
+    <el-card shadow="never" class="section">
+      <template #header>
+        <div class="card-head">
+          <span>切片列表</span>
+          <el-tag type="info" size="small">{{ chunkSets.length }} 份待建立索引</el-tag>
+        </div>
+      </template>
+      <el-table :data="chunkSets" border stripe>
+        <el-table-column label="文档" min-width="220">
+          <template #default="{ row }">
+            <div class="doc-title">{{ row.title }}</div>
+            <div v-if="row.errorMessage" class="error-text">{{ row.errorMessage }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="110" align="center">
+          <template #default="{ row }">
+            <el-tag :type="statusOf(row.status).type" size="small">
+              {{ statusOf(row.status).label }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="chunkCount" label="切片数" width="90" align="center" />
+        <el-table-column label="切片参数" width="150" align="center">
+          <template #default="{ row }">
+            <span class="muted">长度 {{ row.chunkSize }} / 重叠 {{ row.chunkOverlap }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="切片时间" width="170">
+          <template #default="{ row }">
+            <span class="muted">{{ formatDateTime(row.createdAt) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="230">
+          <template #default="{ row }">
+            <el-button
+              link
+              type="primary"
+              :icon="View"
+              @click="openChunks({ id: row.documentId, title: row.title })"
+            >
+              查看切片
+            </el-button>
+            <el-button link type="primary" :icon="SetUp" @click="openIndexDialog(row)">
+              去新建索引
+            </el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <p class="muted footnote">
+        上传只做解析与切片，不会调用嵌入模型；点「去新建索引」确认后，才会生成向量并写入当前启用索引版本。
+      </p>
     </el-card>
 
     <el-row :gutter="16">
@@ -446,7 +542,7 @@ onMounted(load)
             </el-table-column>
           </el-table>
           <p class="muted footnote">
-            当前启用版本：{{ activeVersion ? activeVersion.name : '无' }}。切换版本后，旧文档需要逐个「重建」才会写入新版本。
+            当前启用版本：{{ activeVersion ? activeVersion.name : '无' }}。切换版本后，旧文档需要逐个「重新切片」并「建立索引」才会写入新版本。
           </p>
         </el-card>
       </el-col>
@@ -544,7 +640,39 @@ onMounted(load)
       <template #footer>
         <el-button @click="uploadVisible = false">取消</el-button>
         <el-button type="primary" :loading="uploading" @click="submitUpload">
-          上传并索引
+          上传并切片
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="indexVisible" title="新建索引" width="520px">
+      <el-form label-width="120px">
+        <el-form-item label="文档">
+          <span>{{ indexTarget?.title }}</span>
+        </el-form-item>
+        <el-form-item label="切片">
+          <span>{{ indexTarget?.chunkCount }} 个</span>
+        </el-form-item>
+        <el-form-item label="切片参数">
+          <span class="muted">
+            长度 {{ indexTarget?.chunkSize }} 字 / 重叠 {{ indexTarget?.chunkOverlap }} 字
+          </span>
+        </el-form-item>
+        <el-form-item label="目标索引版本">
+          <span>{{ activeVersion ? activeVersion.name : '无启用版本（将自动创建默认版本）' }}</span>
+        </el-form-item>
+      </el-form>
+      <el-alert
+        type="info"
+        show-icon
+        :closable="false"
+        title="建立索引会调用嵌入模型生成向量"
+        description="切片来自刚才的上传或重新切片；建立成功后文档状态变为「可用」，切片进入检索范围。嵌入模型不可用时状态变为「失败」，修好配置后可再次建立索引。"
+      />
+      <template #footer>
+        <el-button @click="indexVisible = false">取消</el-button>
+        <el-button type="primary" :loading="indexing" @click="submitIndex">
+          建立索引
         </el-button>
       </template>
     </el-dialog>
@@ -556,7 +684,8 @@ onMounted(load)
     >
       <div v-loading="chunkLoading">
         <p class="muted">
-          共 {{ chunkTotal }} 个切片。每个切片开头的【文档｜章节】是检索时补的上下文头。
+          共 {{ chunkTotal }} 个切片，当前展示{{ chunkSource === 'draft' ? '待建立索引' : '已建立索引' }}的切片。
+          每个切片开头的【文档｜章节】是检索时补的上下文头。
         </p>
         <div v-for="chunk in chunkItems" :key="chunk.id" class="chunk">
           <div class="chunk__head">

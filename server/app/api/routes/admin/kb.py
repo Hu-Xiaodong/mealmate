@@ -1,9 +1,14 @@
 """知识库后台接口。
 
-接口分为三组：
-1. 文档：上传、列表、详情、重建索引、删除、查看切片；
-2. 索引版本：列表、新建、启用；
-3. 检索测试：用真实问题验证召回效果。
+接口分为四组：
+1. 文档：上传（只切片）、列表、详情、重新切片、建立索引、删除、查看切片；
+2. 切片列表：查看已切好但还没建立索引的文档；
+3. 索引版本：列表、新建、启用；
+4. 检索测试：用真实问题验证召回效果。
+
+为什么上传和建立索引要分成两个接口：
+切片只做文本处理，嵌入要调用外部模型、按量计费。拆开后运营可以先检查
+切片质量，再决定是否花钱生成向量；嵌入失败也只重试建立索引，不用重新上传。
 
 权限拆成两个：
 - kb.document.manage：能改数据（上传、删除、重建）；
@@ -43,10 +48,10 @@ async def upload_document(
     principal: AdminPrincipal = Depends(require_permission("kb.document.manage")),
     db: AsyncSession = Depends(get_db),
 ):
-    """上传 Markdown 或纯文本文档，上传后立即切片并生成向量。
+    """上传 Markdown 或纯文本文档，只做解析与切片，不调用嵌入模型。
 
-    索引失败仍返回 200，但在 message 与文档状态中说明原因：
-    文件已经保存，运营修复模型配置后可以直接重建，不需要重新上传。
+    切片失败仍返回 200，但在 message 与文档状态中说明原因：
+    文件已经保存，运营可以重新切片或删除，不需要重新上传。
     """
     data = await file.read()
     payload, error = await kb_service.upload_document(
@@ -59,8 +64,8 @@ async def upload_document(
         ip=client_ip(request),
     )
     if error:
-        return ok(payload, f"文档已保存，但索引失败：{error}")
-    return ok(payload, "文档已上传并完成索引")
+        return ok(payload, f"文档已保存，但切片失败：{error}")
+    return ok(payload, "文档已上传并完成切片，请到切片列表建立索引")
 
 
 @router.get("/documents/{document_id}")
@@ -72,20 +77,48 @@ async def get_document(
     return ok(await kb_service.get_document(db, document_id))
 
 
-@router.post("/documents/{document_id}/reindex")
-async def reindex_document(
+@router.post("/documents/{document_id}/rechunk")
+async def rechunk_document(
     document_id: str,
     request: Request,
     principal: AdminPrincipal = Depends(require_permission("kb.document.manage")),
     db: AsyncSession = Depends(get_db),
 ):
-    """按当前启用版本重新切片、重新嵌入。"""
-    payload, error = await kb_service.reindex_document(
+    """按当前启用索引版本的参数重新切片，结果放回切片列表。
+
+    只切片、不嵌入：旧索引在新索引建立前保持可用。
+    """
+    payload, error = await kb_service.rechunk_document(
         db, principal.admin, document_id, client_ip(request)
     )
     if error:
-        return ok(payload, f"重建失败：{error}")
-    return ok(payload, "已按当前索引版本重建完成")
+        return ok(payload, f"重新切片失败：{error}")
+    return ok(payload, "已重新切片，请到切片列表建立索引")
+
+
+@router.post("/documents/{document_id}/index")
+async def build_document_index(
+    document_id: str,
+    request: Request,
+    principal: AdminPrincipal = Depends(require_permission("kb.document.manage")),
+    db: AsyncSession = Depends(get_db),
+):
+    """把切片列表里的切片建立成可检索的索引（调用嵌入模型生成向量）。"""
+    payload, error = await kb_service.build_index(
+        db, principal.admin, document_id, client_ip(request)
+    )
+    if error:
+        return ok(payload, f"建立索引失败：{error}")
+    return ok(payload, "索引已建立，文档可用于检索")
+
+
+@router.get("/chunk-sets")
+async def list_chunk_sets(
+    principal: AdminPrincipal = Depends(require_permission("kb.document.manage")),
+    db: AsyncSession = Depends(get_db),
+):
+    """切片列表：已切好但还没建立索引的文档及其切片参数。"""
+    return ok(await kb_service.list_chunk_sets(db))
 
 
 @router.delete("/documents/{document_id}")

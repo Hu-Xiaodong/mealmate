@@ -29,7 +29,7 @@ class StorageBackend(ABC):
     def read(self, key: str) -> bytes:
         """读取对象内容。
 
-        知识库重建索引时需要把原始文件重新读出来切片；
+        知识库重新切片时需要把原始文件重新读出来；
         对象不存在时抛出 FileNotFoundError，由业务层决定如何提示。
         """
 

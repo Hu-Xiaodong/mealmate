@@ -214,11 +214,13 @@ docker compose up -d --build
 | POST | `/users/{id}/unban` | 解封 | `user.ban` |
 | GET | `/audit-logs` | 审计日志，只读 | `audit.read` |
 | GET | `/kb/documents` | 知识库文档列表 | `kb.document.manage` |
-| POST | `/kb/documents` | 上传 `.md` / `.txt`，同步切片与嵌入 | `kb.document.manage` |
+| POST | `/kb/documents` | 上传 `.md` / `.txt`，只做解析与切片，进入切片列表 | `kb.document.manage` |
 | GET | `/kb/documents/{id}` | 文档详情与状态 | `kb.document.manage` |
-| POST | `/kb/documents/{id}/reindex` | 用当前启用版本重建切片与向量 | `kb.document.manage` |
-| DELETE | `/kb/documents/{id}` | 删除文档、切片与存储文件 | `kb.document.manage` |
-| GET | `/kb/documents/{id}/chunks` | 切片分页 | `kb.document.manage` |
+| POST | `/kb/documents/{id}/rechunk` | 按当前启用版本重新切片，结果进入切片列表 | `kb.document.manage` |
+| POST | `/kb/documents/{id}/index` | 把切片列表中的切片建立成索引（生成向量） | `kb.document.manage` |
+| DELETE | `/kb/documents/{id}` | 删除文档、已索引/待索引切片与存储文件 | `kb.document.manage` |
+| GET | `/kb/documents/{id}/chunks` | 切片分页；优先返回待索引切片 | `kb.document.manage` |
+| GET | `/kb/chunk-sets` | 切片列表：待建立索引的文档与切片参数 | `kb.document.manage` |
 | GET | `/kb/index-versions` | 索引版本列表 | `kb.document.manage` |
 | POST | `/kb/index-versions` | 新建索引版本（含切片长度与重叠） | `kb.document.manage` |
 | POST | `/kb/index-versions/{id}/activate` | 启用版本，旧版本自动归档 | `kb.document.manage` |

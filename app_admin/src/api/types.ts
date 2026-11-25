@@ -328,7 +328,14 @@ export interface KbDocumentItem {
   mime: string
   bytes: number
   checksum: string
-  status: 'uploaded' | 'parsing' | 'chunking' | 'indexing' | 'ready' | 'failed'
+  status:
+    | 'uploaded'
+    | 'parsing'
+    | 'chunking'
+    | 'chunked'
+    | 'indexing'
+    | 'ready'
+    | 'failed'
   errorMessage: string | null
   indexVersionId: string | null
   uploadedBy: string | null
@@ -374,6 +381,21 @@ export interface KbChunkPage {
   offset: number
   limit: number
   hasMore: boolean
+  /** draft：待建立索引的切片；indexed：已经建立索引的切片。 */
+  source: 'draft' | 'indexed'
+}
+
+/** 切片列表中的一行：一篇文档切好但还没建立索引的切片。 */
+export interface KbChunkSetItem {
+  documentId: string
+  title: string
+  status: string
+  errorMessage: string | null
+  chunkCount: number
+  chunkSize: number
+  chunkOverlap: number
+  createdAt: string
+  updatedAt: string
 }
 
 export interface KbSearchParams {

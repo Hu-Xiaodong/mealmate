@@ -1,8 +1,11 @@
 """知识库：切片、上传、嵌入、检索与索引版本测试。
 
+2026-11-24 起上传只做切片，切片进入“切片列表”，
+再由“建立索引”接口调用嵌入模型。用例按这两步分开验证。
+
 嵌入模型在用例中替换成确定性的假实现：
 不访问网络、不消耗额度，同时能精确验证排序与阈值。
-真实调用云端接口的路径由「失败时文档进入 failed」用例覆盖。
+真实调用云端接口的路径由「建立索引失败、修好配置后重试」用例覆盖。
 """
 
 import pytest
@@ -68,6 +71,13 @@ async def _upload(client, headers, filename: str, content: str, title: str | Non
     )
 
 
+async def _build_index(client, headers, document_id: str):
+    """在切片列表中点“建立索引”：把切片交给嵌入模型并写入 kb_chunks。"""
+    return await client.post(
+        f"{API}/admin/kb/documents/{document_id}/index", headers=headers
+    )
+
+
 def test_text_chunker_splits_by_heading_and_keeps_context():
     paragraph = "番茄要选颜色均匀、手感偏重的，青色果蒂说明新鲜。" * 12
     text = f"# 选购\n\n{paragraph}\n\n# 存放\n\n常温阴凉处存放，避免阳光直射。"
@@ -94,19 +104,59 @@ def test_text_chunker_keeps_overlap_between_neighbours():
     assert chunks[0].content[-80:] in chunks[1].content
 
 
-async def test_upload_indexes_document_and_search_ranks(client, fake_embedding):
+async def test_upload_chunks_then_build_index_and_search(client, fake_embedding):
     token = await login_as_admin(client)
     headers = auth_headers(token)
 
+    # 第一步：上传只做解析与切片，不调用嵌入模型。
     uploaded = await _upload(client, headers, "tomato.md", TOMATO_DOC, "番茄指南")
     assert uploaded.status_code == 200, uploaded.text
     document = data_of(uploaded)
-    assert document["status"] == "ready"
+    assert document["status"] == "chunked"
     assert document["chunkCount"] >= 1
+    assert document["indexVersionId"] is None
     assert document["title"] == "番茄指南"
 
+    # 切片进入切片列表，并且能看到待索引切片。
+    sets = await client.get(f"{API}/admin/kb/chunk-sets", headers=headers)
+    assert sets.status_code == 200, sets.text
+    assert any(item["documentId"] == document["id"] for item in data_of(sets)["items"])
+
+    chunks = await client.get(
+        f"{API}/admin/kb/documents/{document['id']}/chunks", headers=headers
+    )
+    assert chunks.status_code == 200
+    chunk_data = data_of(chunks)
+    assert chunk_data["source"] == "draft"
+    assert chunk_data["total"] >= 1
+    assert chunk_data["items"][0]["metadata"]["heading"] == "番茄选购指南"
+
+    # 还没建立索引时检索不到这篇文档。
+    before = await client.post(
+        f"{API}/admin/kb/search-test",
+        json={"query": "番茄怎么挑", "topK": 5, "threshold": 0.3},
+        headers=headers,
+    )
+    assert before.status_code == 200, before.text
+    assert data_of(before)["items"] == []
+
+    # 第二步：建立索引，状态变为可用并写入索引版本。
+    indexed = await _build_index(client, headers, document["id"])
+    assert indexed.status_code == 200, indexed.text
+    indexed_document = data_of(indexed)
+    assert indexed_document["status"] == "ready"
+    assert indexed_document["indexVersionId"]
+    assert indexed_document["chunkCount"] >= 1
+
+    sets_after = await client.get(f"{API}/admin/kb/chunk-sets", headers=headers)
+    assert all(
+        item["documentId"] != document["id"] for item in data_of(sets_after)["items"]
+    )
+
     potato = await _upload(client, headers, "potato.md", POTATO_DOC, "土豆指南")
-    assert data_of(potato)["status"] == "ready"
+    assert data_of(potato)["status"] == "chunked"
+    potato_indexed = data_of(await _build_index(client, headers, data_of(potato)["id"]))
+    assert potato_indexed["status"] == "ready"
 
     # 相同内容再次上传会被拒绝，避免同一知识被检索两次。
     duplicate = await _upload(client, headers, "tomato-copy.md", TOMATO_DOC)
@@ -116,14 +166,6 @@ async def test_upload_indexes_document_and_search_ranks(client, fake_embedding):
     listed = await client.get(f"{API}/admin/kb/documents", headers=headers)
     assert listed.status_code == 200
     assert len(data_of(listed)["items"]) == 2
-
-    chunks = await client.get(
-        f"{API}/admin/kb/documents/{document['id']}/chunks", headers=headers
-    )
-    assert chunks.status_code == 200
-    chunk_data = data_of(chunks)
-    assert chunk_data["total"] >= 1
-    assert chunk_data["items"][0]["metadata"]["heading"] == "番茄选购指南"
 
     searched = await client.post(
         f"{API}/admin/kb/search-test",
@@ -139,23 +181,36 @@ async def test_upload_indexes_document_and_search_ranks(client, fake_embedding):
     assert all(item["documentTitle"] != "土豆指南" for item in result["items"])
 
 
+async def test_build_index_without_draft_chunks_returns_409(client, fake_embedding):
+    """已经建立过索引、切片列表为空时，再次建立索引应明确拒绝。"""
+    headers = auth_headers(await login_as_admin(client))
+    document = data_of(await _upload(client, headers, "tomato.md", TOMATO_DOC, "番茄指南"))
+    assert data_of(await _build_index(client, headers, document["id"]))["status"] == "ready"
+
+    again = await _build_index(client, headers, document["id"])
+    assert again.status_code == 409
+    assert again.json()["code"] == "KB_DRAFT_CHUNKS_MISSING"
+
+
 async def test_search_falls_back_to_keyword_when_embedding_unavailable(
     client, fake_embedding, monkeypatch
 ):
     """嵌入模型临时不可用时，检索测试降级为关键词检索而不是 500。"""
     headers = auth_headers(await login_as_admin(client))
     uploaded = await _upload(client, headers, "tomato.md", TOMATO_DOC, "番茄指南")
-    assert data_of(uploaded)["status"] == "ready"
+    tomato_id = data_of(uploaded)["id"]
+    assert data_of(await _build_index(client, headers, tomato_id))["status"] == "ready"
 
     potato = await _upload(client, headers, "potato.md", POTATO_DOC, "土豆指南")
-    assert data_of(potato)["status"] == "ready"
+    potato_id = data_of(potato)["id"]
+    assert data_of(await _build_index(client, headers, potato_id))["status"] == "ready"
 
     async def _broken(db, texts, *, subject_ref="system:kb"):
         raise embedding_service.EmbeddingError(
             "EMBEDDING_REQUEST_FAILED", "嵌入模型连接失败"
         )
 
-    # 只让检索阶段失败，上传阶段仍然正常写入切片。
+    # 只让检索阶段失败，建立索引阶段仍然正常写入切片。
     monkeypatch.setattr(embedding_service, "embed_texts", _broken)
 
     searched = await client.post(
@@ -173,13 +228,15 @@ async def test_search_falls_back_to_keyword_when_embedding_unavailable(
 
 
 
-async def test_reindex_uses_new_active_version(client, fake_embedding):
+async def test_rechunk_then_build_uses_new_active_version(client, fake_embedding):
     token = await login_as_admin(client)
     headers = auth_headers(token)
 
     uploaded = await _upload(client, headers, "tomato.md", TOMATO_DOC, "番茄指南")
     document = data_of(uploaded)
-    old_version_id = document["indexVersionId"]
+    indexed = data_of(await _build_index(client, headers, document["id"]))
+    assert indexed["status"] == "ready"
+    old_version_id = indexed["indexVersionId"]
     assert old_version_id
 
     created = await client.post(
@@ -197,9 +254,18 @@ async def test_reindex_uses_new_active_version(client, fake_embedding):
     assert activated.status_code == 200, activated.text
     assert data_of(activated)["status"] == "active"
 
-    rebuilt = await client.post(
-        f"{API}/admin/kb/documents/{document['id']}/reindex", headers=headers
+    # 重新切片：只产生新的待索引切片，旧索引仍然可用。
+    rechunked = await client.post(
+        f"{API}/admin/kb/documents/{document['id']}/rechunk", headers=headers
     )
+    assert rechunked.status_code == 200, rechunked.text
+    rechunked_document = data_of(rechunked)
+    assert rechunked_document["status"] == "chunked"
+    assert rechunked_document["chunkCount"] >= 1
+    # 旧索引没有被删除，文档仍指向旧版本，检索不会突然变空。
+    assert rechunked_document["indexVersionId"] == old_version_id
+
+    rebuilt = await _build_index(client, headers, document["id"])
     assert rebuilt.status_code == 200, rebuilt.text
     rebuilt_document = data_of(rebuilt)
     assert rebuilt_document["status"] == "ready"
@@ -211,16 +277,48 @@ async def test_reindex_uses_new_active_version(client, fake_embedding):
     assert statuses[old_version_id] == "archived"
 
 
-async def test_upload_without_embedding_provider_marks_failed(client):
-    """没有配置嵌入模型时，文件仍会保存，但文档状态是 failed 且带原因。"""
+async def test_upload_without_embedding_provider_chunks_then_build_fails(client):
+    """没有配置嵌入模型时，切片仍会生成；建立索引才失败，且切片保留可重试。"""
     token = await login_as_admin(client)
     headers = auth_headers(token)
 
     uploaded = await _upload(client, headers, "guide.md", TOMATO_DOC, "番茄指南")
     assert uploaded.status_code == 200, uploaded.text
     document = data_of(uploaded)
-    assert document["status"] == "failed"
-    assert "嵌入模型" in (document["errorMessage"] or "")
+    assert document["status"] == "chunked"
+    assert document["chunkCount"] >= 1
+    assert document["indexVersionId"] is None
+
+    failed = data_of(await _build_index(client, headers, document["id"]))
+    assert failed["status"] == "failed"
+    assert "嵌入模型" in (failed["errorMessage"] or "")
+
+    # 失败后切片不丢，切片列表里仍然可以看到并重试。
+    sets = await client.get(f"{API}/admin/kb/chunk-sets", headers=headers)
+    assert any(item["documentId"] == document["id"] for item in data_of(sets)["items"])
+
+
+async def test_failed_build_can_retry_after_embedding_available(
+    client, monkeypatch
+):
+    """建立索引失败后，补好嵌入模型配置可以直接重试，不需要重新上传。"""
+    headers = auth_headers(await login_as_admin(client))
+    document = data_of(await _upload(client, headers, "guide.md", TOMATO_DOC, "番茄指南"))
+    failed = data_of(await _build_index(client, headers, document["id"]))
+    assert failed["status"] == "failed"
+
+    async def _fake(db, texts, *, subject_ref="system:kb"):
+        return embedding_service.EmbeddingResult(
+            vectors=[_fake_vector(text) for text in texts],
+            provider_name="测试嵌入模型",
+            model="fake-embedding-1024",
+            dimensions=1024,
+        )
+
+    monkeypatch.setattr(embedding_service, "embed_texts", _fake)
+    retried = data_of(await _build_index(client, headers, document["id"]))
+    assert retried["status"] == "ready"
+    assert retried["indexVersionId"]
 
 
 async def test_kb_requires_permission_and_valid_file_type(client, fake_embedding):

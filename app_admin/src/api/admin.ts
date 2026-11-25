@@ -16,6 +16,7 @@ import type {
   BatchReviewResult,
   DashboardSummary,
   KbChunkPage,
+  KbChunkSetItem,
   KbDocumentItem,
   KbIndexVersionForm,
   KbIndexVersionItem,
@@ -360,16 +361,33 @@ export function uploadKbDocument(file: File, title?: string) {
     url: '/admin/kb/documents',
     method: 'post',
     data: form,
-    // 上传后要立即切片与生成向量，耗时明显高于普通查询，单独放宽超时。
+    // 上传后要立即解析与切片，耗时明显高于普通查询，单独放宽超时。
     timeout: 120000,
   })
 }
 
-export function reindexKbDocument(documentId: string) {
+/** 按当前启用索引版本重新切片，结果进入切片列表，不生成向量。 */
+export function rechunkKbDocument(documentId: string) {
   return request<KbDocumentItem>({
-    url: `/admin/kb/documents/${documentId}/reindex`,
+    url: `/admin/kb/documents/${documentId}/rechunk`,
     method: 'post',
     timeout: 120000,
+  })
+}
+
+/** 把切片列表里的切片建立成可检索的索引（调用嵌入模型）。 */
+export function buildKbIndex(documentId: string) {
+  return request<KbDocumentItem>({
+    url: `/admin/kb/documents/${documentId}/index`,
+    method: 'post',
+    timeout: 120000,
+  })
+}
+
+/** 切片列表：已切好但还没建立索引的文档。 */
+export function listKbChunkSets() {
+  return request<{ items: KbChunkSetItem[] }>({
+    url: '/admin/kb/chunk-sets',
   })
 }
 

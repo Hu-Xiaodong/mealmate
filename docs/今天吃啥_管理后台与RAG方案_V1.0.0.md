@@ -164,7 +164,7 @@
 | `recipe.manage` | 新建、编辑、发布菜谱 |
 | `ai.log.read` | 查看 AI 调用日志 |
 | `ai.config.write` | 修改 AI 配额与供应商配置 |
-| `kb.document.manage` | 上传、删除知识库文档，重建索引 |
+| `kb.document.manage` | 上传、删除知识库文档，重新切片、建立索引 |
 | `kb.search.test` | 使用召回测试 |
 | `audit.read` | 查看审计日志 |
 | `admin.manage` | 管理管理员账号与角色 |
@@ -306,14 +306,25 @@ kb_documents
   mime            String(80)   文件类型
   bytes           Integer      文件大小
   checksum        String(64)   内容摘要，用于去重
-  status          String(20)   uploaded / parsing / chunking / indexing / ready / failed
+  status          String(20)   uploaded / parsing / chunking / chunked / indexing / ready / failed
   error_message   String(500)  失败原因，可空
   index_version_id String(40)  最近一次索引版本，可空
   uploaded_by     String(40)   上传人
   created_at      DateTime     创建时间
   updated_at      DateTime     更新时间
 
-kb_chunks
+kb_draft_chunks（待索引切片，对应后台“切片列表”）
+  id              String(40)   主键
+  document_id     String(40)   外键 kb_documents.id，索引
+  ordinal         Integer      在文档中的顺序号
+  content         Text         切片原文（暂无向量）
+  token_count     Integer      令牌数量估算
+  chunk_size      Integer      切片时使用的目标长度
+  chunk_overlap   Integer      切片时使用的重叠长度
+  metadata        JSON         章节标题、标题路径等定位信息
+  created_at      DateTime     创建时间
+
+kb_chunks（已索引切片）
   id              String(40)   主键
   document_id     String(40)   外键 kb_documents.id，索引
   index_version_id String(40)  外键 kb_index_versions.id，索引
@@ -328,7 +339,7 @@ kb_chunks
 
 关于向量维度：维度由所选嵌入模型决定，必须在建表前确定，建表后不能随意修改。首版建议固定一个模型和一个维度，换模型时新建索引版本并整体重建。
 
-**SQLite 兼容策略**：`pgvector` 的向量类型只有 PostgreSQL 支持。从 RAG 阶段开始，本地开发也改用 `docker compose` 里的 PostgreSQL，不再使用 SQLite。RAG 相关模型单独放在 `app/db/rag_models.py`，仅在数据库方言为 PostgreSQL 时导入和建表；SQLite 环境下知识库接口统一返回 `RAG_UNAVAILABLE`。
+**SQLite 兼容策略**：`pgvector` 的向量类型只有 PostgreSQL 支持。本地开发与生产使用 `docker compose` 里的 PostgreSQL；单元测试使用 SQLite，`kb_chunks.embedding` 列在该方言下退化为 `Text`，保存 JSON 数组字符串，检索时在 Python 里计算余弦相似度。RAG 相关模型统一放在 `app/db/rag_models.py`，向量列通过 `with_variant` 按数据库方言切换类型。
 
 **落地状态（2026-11-23）**：本地开发机是独立安装的 PostgreSQL 18（安装目录 `D:\Soft\PostgreSQL18`，服务名 `postgresql-x64-18`），已安装 pgvector 0.8.6。因为本机没有微软 C++ 编译工具，使用社区提供的、与 PostgreSQL 18 严格对应的 Windows 预编译包 `vector.v0.8.6-pg18.zip`（来源：https://github.com/andreiramani/pgvector_pgsql_windows ）：把 `vector.dll` 放入 `lib`，把 `vector.control` 与各版本升级脚本放入 `share/extension`。扩展已在 `meal_dev` 库启用，`server/migrations/20261123_kb_pgvector.sql` 执行成功，`kb_index_versions`、`kb_documents`、`kb_chunks` 三张表、`vector(1024)` 列与 HNSW 索引均已创建，并用 1024 维向量完成了插入与余弦距离查询验证（相同向量相似度为 1）。`docker-compose.yml` 仍使用 `pgvector/pgvector:pg16` 作为部署基线。
 
@@ -474,11 +485,13 @@ ingestion_jobs
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
 | GET | `/admin/kb/documents` | `kb.document.manage` | 文档列表与状态 |
-| POST | `/admin/kb/documents` | `kb.document.manage` | 上传文档，表单上传 |
+| POST | `/admin/kb/documents` | `kb.document.manage` | 上传文档，只解析与切片，进入切片列表 |
 | GET | `/admin/kb/documents/{id}` | `kb.document.manage` | 文档详情与解析错误 |
-| DELETE | `/admin/kb/documents/{id}` | `kb.document.manage` | 删除文档及其切片 |
-| POST | `/admin/kb/documents/{id}/reindex` | `kb.document.manage` | 重新解析并生成切片 |
-| GET | `/admin/kb/documents/{id}/chunks` | `kb.document.manage` | 查看切片，分页 |
+| DELETE | `/admin/kb/documents/{id}` | `kb.document.manage` | 删除文档、已索引/待索引切片与文件 |
+| POST | `/admin/kb/documents/{id}/rechunk` | `kb.document.manage` | 按当前启用版本重新切片，进入切片列表 |
+| POST | `/admin/kb/documents/{id}/index` | `kb.document.manage` | 把切片列表中的切片建立成索引 |
+| GET | `/admin/kb/documents/{id}/chunks` | `kb.document.manage` | 查看切片，分页；优先返回待索引切片 |
+| GET | `/admin/kb/chunk-sets` | `kb.document.manage` | 切片列表：待建立索引的文档与切片参数 |
 | POST | `/admin/kb/documents/{id}/extract-recipes` | `recipe.manage` | 从 PDF 抽取菜谱草稿，进入人工审核 |
 | GET | `/admin/kb/index-versions` | `kb.document.manage` | 索引版本列表与状态 |
 | POST | `/admin/kb/index-versions` | `kb.document.manage` | 新建索引版本 |
@@ -581,8 +594,9 @@ app_admin/
 | 用户列表 | 昵称与手机号后四位搜索、封禁/解封、查看发布 |
 | AI 日志 | 时间范围、成功/失败筛选、耗时排序 |
 | AI 配置 | 配额输入、供应商状态、测试按钮 |
-| 知识库列表 | 上传、状态轮询、失败原因、重建索引 |
-| 文档详情 | 切片列表、切片内容预览、重新解析 |
+| 知识库列表 | 上传、状态轮询、失败原因、重新切片 |
+| 切片列表 | 待建索引文档、切片数量与参数、去新建索引、切片预览 |
+| 文档详情 | 切片预览、重新切片、建立索引 |
 | 召回测试 | 输入问题、展示命中片段与相似度、可跳转文档 |
 | 审计日志 | 只读表格、操作前后值对比 |
 
@@ -595,24 +609,31 @@ app_admin/
 ### 8.1 写入链路
 
 ```text
-上传文档
+上传文档（第一步：只切片）
   → 校验类型与大小
   → 存入对象存储，记录 kb_documents
   → 解析出纯文本（PDF / Word / Markdown）
   → 清洗（去页眉页脚、合并断行、去除空段）
   → 切片（按字符数 + 重叠）
+  → 写入 kb_draft_chunks（切片列表），状态 chunked
+  → 运营检查切片，点“去新建索引”
+
+建立索引（第二步：生成向量）
+  → 读取 kb_draft_chunks
   → 调用嵌入服务，得到每段的向量
   → 写入 kb_chunks，绑定当前索引版本
-  → 建立向量索引
-  → 版本状态改为 active
+  → 删除待索引切片，状态 ready
+  → 旧切片整批替换，检索不中断
 ```
 
 状态机：
 
 ```text
-uploaded → parsing → chunking → indexing → ready
-                                  └──────▶ failed
+uploaded → parsing → chunking → chunked → indexing → ready
+       └──────────────────────────────────────────▶ failed
 ```
+
+切片阶段失败只需重新切片；索引阶段失败保留待索引切片，修好嵌入模型配置后可直接重试。
 
 每一步失败都写入 `error_message`，前端可看到具体原因并重试。
 

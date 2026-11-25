@@ -1,14 +1,22 @@
-"""知识库业务服务：文档上传、切片、嵌入、检索测试。
+"""知识库业务服务：文档上传、切片、建立索引、检索测试。
 
-整体流程：
+整体流程（2026-11-24 起把“切片”和“建立向量”拆成两步）：
 1. 运营上传 Markdown 或纯文本，服务端计算 SHA-256 去重并保存原文件；
-2. 按索引版本的参数切片（标题分节 + 段落累积 + 相邻重叠）；
-3. 调用嵌入模型把每个片段转成 1024 维向量；
-4. 向量写入 kb_chunks，文档状态变为 ready；
+2. 按当前启用索引版本的参数切片（标题分节 + 段落累积 + 相邻重叠），
+   切片写入 kb_draft_chunks，文档状态变为 chunked（待建立索引）；
+3. 运营在后台“切片列表”里检查切片，点“去新建索引”，确认后建立索引；
+4. 建立索引时调用嵌入模型，把每个切片转成 1024 维向量，
+   切片连同向量写入 kb_chunks，文档状态变为 ready；
 5. 检索测试把问题转成向量，按余弦相似度返回最接近的片段。
 
-为什么把处理过程设计成同步状态机（parsing → chunking → indexing → ready）：
-当前文档量小，同步处理能让运营上传后立刻看到结果，也少一套消息队列和
+为什么要把两步拆开：
+切片是纯文本处理，快且不花钱；嵌入要调用外部模型，慢、按量计费，
+而且如果切得不好，嵌入的额度就白花了。拆开之后运营可以先用低成本的方式
+检查切片质量，确认没问题再花钱生成向量；失败时也只重试嵌入，不需要重新上传。
+
+为什么把处理过程设计成同步状态机（parsing → chunking → chunked →
+indexing → ready）：
+当前文档量小，同步处理能让运营操作后立刻看到结果，也少一套消息队列和
 后台进程。状态机让每一步都落库，以后改成异步任务时，
 消费者只需要读取“非 ready”的文档继续处理，业务代码不用重写。
 
@@ -38,6 +46,7 @@ from app.db.rag_models import (
     KB_EMBEDDING_DIMENSIONS,
     KbChunk,
     KbDocument,
+    KbDraftChunk,
     KbIndexVersion,
 )
 from app.schemas import KbIndexVersionCreateRequest, KbSearchTestRequest
@@ -156,10 +165,33 @@ def _document_payload(doc: KbDocument, chunk_count: int = 0) -> dict[str, Any]:
 
 
 async def _chunk_count(db: AsyncSession, document_id: str) -> int:
+    """已建立索引的切片数量（kb_chunks）。"""
     total = await db.scalar(
         select(func.count()).select_from(KbChunk).where(KbChunk.document_id == document_id)
     )
     return int(total or 0)
+
+
+async def _draft_count(db: AsyncSession, document_id: str) -> int:
+    """待建立索引的切片数量（kb_draft_chunks）。"""
+    total = await db.scalar(
+        select(func.count())
+        .select_from(KbDraftChunk)
+        .where(KbDraftChunk.document_id == document_id)
+    )
+    return int(total or 0)
+
+
+async def _effective_chunk_count(db: AsyncSession, document_id: str) -> int:
+    """展示用的切片数：有半成品时优先显示半成品数量。
+
+    重新切片后旧索引还在、能继续被检索，但运营最关心的是“这次切出来多少”；
+    因此只要存在待索引切片，就展示它，建立索引后再回到已索引数量。
+    """
+    drafts = await _draft_count(db, document_id)
+    if drafts:
+        return drafts
+    return await _chunk_count(db, document_id)
 
 
 async def _active_version(db: AsyncSession) -> KbIndexVersion | None:
@@ -320,16 +352,84 @@ async def list_documents(
         )
     ).all()
     counts: dict[str, int] = {}
+    draft_counts: dict[str, int] = {}
     if rows:
-        count_rows = (
+        document_ids = [doc.id for doc in rows]
+        indexed_rows = (
             await db.execute(
                 select(KbChunk.document_id, func.count(KbChunk.id))
-                .where(KbChunk.document_id.in_([doc.id for doc in rows]))
+                .where(KbChunk.document_id.in_(document_ids))
                 .group_by(KbChunk.document_id)
             )
         ).all()
-        counts = {document_id: int(count) for document_id, count in count_rows}
-    return {"items": [_document_payload(doc, counts.get(doc.id, 0)) for doc in rows]}
+        counts = {document_id: int(count) for document_id, count in indexed_rows}
+        draft_rows = (
+            await db.execute(
+                select(KbDraftChunk.document_id, func.count(KbDraftChunk.id))
+                .where(KbDraftChunk.document_id.in_(document_ids))
+                .group_by(KbDraftChunk.document_id)
+            )
+        ).all()
+        draft_counts = {document_id: int(count) for document_id, count in draft_rows}
+    return {
+        "items": [
+            _document_payload(
+                doc, draft_counts.get(doc.id) or counts.get(doc.id, 0)
+            )
+            for doc in rows
+        ]
+    }
+
+
+def _split_text(
+    text_content: str,
+    title: str,
+    version: KbIndexVersion,
+) -> list[Any]:
+    """按索引版本的参数把正文切成切片。
+
+    抽成独立函数的原因：上传和“重新切片”必须使用完全相同的切片规则，
+    否则同一个文件在不同入口会切出不同结果，排查问题时无法复现。
+    """
+    chunks = split_document(
+        text_content,
+        title=title,
+        target_chars=version.chunk_size,
+        max_chars=version.chunk_size * 2,
+        overlap_chars=version.chunk_overlap,
+    )
+    if not chunks:
+        raise AppError("KB_DOCUMENT_EMPTY", "文档没有可用正文，无法生成切片")
+    return chunks
+
+
+async def _save_drafts(
+    db: AsyncSession,
+    *,
+    document_id: str,
+    version: KbIndexVersion,
+    chunks: list[Any],
+) -> None:
+    """把一个文档切好的切片写入 kb_draft_chunks（切片列表）。
+
+    这里不生成向量，也不删除旧索引：新切片只是“候选”，
+    运营点“建立索引”之后才会替换线上正在使用的那一套切片。
+    """
+    created_at = now_utc()
+    for ordinal, chunk in enumerate(chunks):
+        db.add(
+            KbDraftChunk(
+                id=new_id("kbdft"),
+                document_id=document_id,
+                ordinal=ordinal,
+                content=chunk.content,
+                token_count=chunk.token_count,
+                chunk_size=version.chunk_size,
+                chunk_overlap=version.chunk_overlap,
+                chunk_metadata=chunk.metadata,
+                created_at=created_at,
+            )
+        )
 
 
 async def _insert_chunks(
@@ -340,7 +440,7 @@ async def _insert_chunks(
     chunks: list[Any],
     vectors: list[list[float]],
 ) -> None:
-    """写入切片与向量。
+    """把待索引切片和向量写入 kb_chunks。
 
     PostgreSQL 走原生 SQL + CAST，SQLite（单元测试）把向量存成 JSON 文本。
     两种实现的差异只在这一个函数里，上层完全不感知数据库类型。
@@ -369,7 +469,7 @@ async def _insert_chunks(
                     "content": chunk.content,
                     "token_count": chunk.token_count,
                     "embedding": _vector_literal(vector),
-                    "metadata": json.dumps(chunk.metadata, ensure_ascii=False),
+                    "metadata": json.dumps(chunk.chunk_metadata, ensure_ascii=False),
                     "created_at": created_at,
                 },
             )
@@ -385,74 +485,43 @@ async def _insert_chunks(
                 content=chunk.content,
                 token_count=chunk.token_count,
                 embedding=json.dumps(vector),
-                chunk_metadata=chunk.metadata,
+                chunk_metadata=chunk.chunk_metadata,
                 created_at=created_at,
             )
         )
 
 
-async def _index_document(
+async def _chunk_document(
     db: AsyncSession,
     doc: KbDocument,
     text_content: str,
+    version: KbIndexVersion,
     admin: AdminUser,
     ip: str | None,
     *,
     action: str,
 ) -> None:
-    """执行“切片 → 嵌入 → 写入”的完整流程。
+    """执行“切片 → 写入切片列表”，不调用嵌入模型。
 
-    每一步都先更新状态再执行，出错时运营能看到卡在哪一步；
-    旧切片在新切片写入前删除，避免重建后出现两倍的重复结果。
+    步骤：
+    1. 状态改成 chunking，让后台能看到正在切片；
+    2. 按参数切片；
+    3. 清掉这个文档上一次留下的待索引切片（重复切片不能叠加）；
+    4. 写入新的待索引切片，状态改成 chunked。
     """
-    version = (
-        await db.get(KbIndexVersion, doc.index_version_id)
-        if doc.index_version_id
-        else None
-    )
-    if version is None:
-        version = await ensure_active_version(db)
-        doc.index_version_id = version.id
-
     doc.status = "chunking"
     doc.error_message = None
     doc.updated_at = now_utc()
     await db.flush()
 
-    chunks = split_document(
-        text_content,
-        title=doc.title,
-        target_chars=version.chunk_size,
-        max_chars=version.chunk_size * 2,
-        overlap_chars=version.chunk_overlap,
-    )
-    if not chunks:
-        raise AppError("KB_DOCUMENT_EMPTY", "文档没有可用正文，无法生成切片")
+    chunks = _split_text(text_content, doc.title, version)
 
-    doc.status = "indexing"
-    doc.updated_at = now_utc()
-    await db.flush()
-
-    result = await embedding_service.embed_texts(
-        db,
-        [chunk.content for chunk in chunks],
-        subject_ref=f"kb:{doc.id}",
+    await db.execute(delete(KbDraftChunk).where(KbDraftChunk.document_id == doc.id))
+    await _save_drafts(
+        db, document_id=doc.id, version=version, chunks=chunks
     )
 
-    # 重建时先清掉该文档在旧版本里的切片，保证同一文档只保留一套可用切片。
-    await db.execute(delete(KbChunk).where(KbChunk.document_id == doc.id))
-    await _insert_chunks(
-        db,
-        document_id=doc.id,
-        version_id=version.id,
-        chunks=chunks,
-        vectors=result.vectors,
-    )
-
-    version.embed_provider = result.provider_name
-    version.embed_model = result.model
-    version.dimensions = result.dimensions
-    doc.status = "ready"
+    doc.status = "chunked"
     doc.error_message = None
     doc.updated_at = now_utc()
     write_audit(
@@ -464,6 +533,114 @@ async def _index_document(
         after={
             "title": doc.title,
             "chunkCount": len(chunks),
+            "chunkSize": version.chunk_size,
+            "chunkOverlap": version.chunk_overlap,
+        },
+        ip=ip,
+    )
+    await db.commit()
+
+
+async def _run_chunk(
+    db: AsyncSession,
+    doc: KbDocument,
+    text_content: str,
+    version: KbIndexVersion,
+    admin: AdminUser,
+    ip: str | None,
+    *,
+    action: str,
+) -> str | None:
+    """执行切片并把失败原因记录到文档上。
+
+    失败时先回滚（可能已有未提交的切片），再单独提交失败状态，
+    这样运营在列表里能看到“失败 + 原因”，而不是永远停在“切片中”。
+    """
+    # 回滚会让 ORM 对象过期，之后再读 doc.id 可能触发同步 IO 并报错，
+    # 因此先把编号取出来保存。
+    document_id = doc.id
+    try:
+        await _chunk_document(db, doc, text_content, version, admin, ip, action=action)
+        return None
+    except Exception as exc:  # noqa: BLE001 - 需要把任何失败都记录到文档状态
+        message = _error_text(exc)
+        await db.rollback()
+        failed = await db.get(KbDocument, document_id)
+        if failed is not None:
+            failed.status = "failed"
+            failed.error_message = message[:500]
+            failed.updated_at = now_utc()
+            await db.commit()
+        return message
+
+
+async def _build_index(
+    db: AsyncSession,
+    doc: KbDocument,
+    admin: AdminUser,
+    ip: str | None,
+) -> None:
+    """把待索引切片转换成向量并写入 kb_chunks。
+
+    流程：
+    1. 取出切片列表中的切片（已按 ordinal 排序）；
+    2. 状态改成 indexing，调用嵌入模型；
+    3. 删除旧切片，写入新切片与向量（旧切片在新数据准备好后才替换）；
+    4. 删除待索引切片，状态改成 ready。
+    """
+    version = await ensure_active_version(db)
+    drafts = (
+        await db.scalars(
+            select(KbDraftChunk)
+            .where(KbDraftChunk.document_id == doc.id)
+            .order_by(KbDraftChunk.ordinal)
+        )
+    ).all()
+    if not drafts:
+        raise AppError(
+            "KB_DRAFT_CHUNKS_MISSING",
+            "没有待建立索引的切片，请先上传文档或重新切片",
+            status_code=409,
+        )
+
+    doc.status = "indexing"
+    doc.error_message = None
+    doc.updated_at = now_utc()
+    await db.flush()
+
+    result = await embedding_service.embed_texts(
+        db,
+        [draft.content for draft in drafts],
+        subject_ref=f"kb:{doc.id}",
+    )
+
+    # 同一文档只保留一套可用切片：旧版本切片整批替换，避免重复召回。
+    await db.execute(delete(KbChunk).where(KbChunk.document_id == doc.id))
+    await _insert_chunks(
+        db,
+        document_id=doc.id,
+        version_id=version.id,
+        chunks=list(drafts),
+        vectors=result.vectors,
+    )
+    await db.execute(delete(KbDraftChunk).where(KbDraftChunk.document_id == doc.id))
+
+    version.embed_provider = result.provider_name
+    version.embed_model = result.model
+    version.dimensions = result.dimensions
+    doc.index_version_id = version.id
+    doc.status = "ready"
+    doc.error_message = None
+    doc.updated_at = now_utc()
+    write_audit(
+        db,
+        actor=admin,
+        action="kb.document.index",
+        target_type="kb_document",
+        target_id=doc.id,
+        after={
+            "title": doc.title,
+            "chunkCount": len(drafts),
             "indexVersionId": version.id,
             "embedModel": result.model,
         },
@@ -472,25 +649,20 @@ async def _index_document(
     await db.commit()
 
 
-async def _run_index(
+async def _run_build(
     db: AsyncSession,
     doc: KbDocument,
-    text_content: str,
     admin: AdminUser,
     ip: str | None,
-    *,
-    action: str,
 ) -> str | None:
-    """执行索引并把失败记录写回文档。
+    """执行建立索引，并把失败原因写回文档。
 
-    失败时先回滚业务事务（可能有未提交的切片），再单独提交失败状态，
-    这样运营在列表里能看到“失败 + 原因”，而不是永远停在“处理中”。
+    失败时待索引切片会保留（事务回滚），运营修好嵌入模型配置后
+    可以直接再次点“建立索引”，不用重新上传或重新切片。
     """
-    # 回滚会让 ORM 对象过期，之后再读 doc.id 可能触发同步 IO 并报错，
-    # 因此先把编号取出来保存。
     document_id = doc.id
     try:
-        await _index_document(db, doc, text_content, admin, ip, action=action)
+        await _build_index(db, doc, admin, ip)
         return None
     except Exception as exc:  # noqa: BLE001 - 需要把任何失败都记录到文档状态
         message = _error_text(exc)
@@ -514,10 +686,11 @@ async def upload_document(
     data: bytes,
     ip: str | None,
 ) -> tuple[dict[str, Any], str | None]:
-    """上传并索引一份文档。
+    """上传文档：保存原文件并切片，不调用嵌入模型。
 
-    Returns:
-        (文档展示数据, 失败原因)。失败原因为 None 表示索引成功。
+    返回：
+        (文档展示数据, 失败原因)。失败原因为空表示切片成功；
+        切片成功后文档状态是 chunked，需要再到切片列表建立索引。
     """
     safe_name = _safe_filename(filename)
     suffix = Path(safe_name).suffix.lower()
@@ -558,19 +731,22 @@ async def upload_document(
         bytes=len(data),
         checksum=checksum,
         status="parsing",
-        index_version_id=version.id,
+        # 还没建立索引，因此先不指向任何版本；点“建立索引”成功后再写入。
+        index_version_id=None,
         uploaded_by=admin.id,
         created_at=now_utc(),
         updated_at=now_utc(),
     )
     db.add(doc)
-    # 先提交文档记录：即使后面切片或嵌入失败，文件与文档也不会凭空消失，
-    # 运营可以修复配置后直接重建索引。
+    # 先提交文档记录：即使后面切片失败，文件与文档也不会凭空消失，
+    # 运营可以看到失败原因并重新切片或删除。
     await db.commit()
 
-    error = await _run_index(db, doc, text_content, admin, ip, action="kb.document.upload")
+    error = await _run_chunk(
+        db, doc, text_content, version, admin, ip, action="kb.document.upload"
+    )
     refreshed = await db.get(KbDocument, document_id)
-    payload = _document_payload(refreshed, await _chunk_count(db, document_id))
+    payload = _document_payload(refreshed, await _effective_chunk_count(db, document_id))
     return payload, error
 
 
@@ -578,18 +754,20 @@ async def get_document(db: AsyncSession, document_id: str) -> dict[str, Any]:
     doc = await db.get(KbDocument, document_id)
     if doc is None:
         raise AppError("KB_DOCUMENT_NOT_FOUND", "文档不存在", status_code=404)
-    return _document_payload(doc, await _chunk_count(db, document_id))
+    return _document_payload(doc, await _effective_chunk_count(db, document_id))
 
 
-async def reindex_document(
+async def rechunk_document(
     db: AsyncSession,
     admin: AdminUser,
     document_id: str,
     ip: str | None,
 ) -> tuple[dict[str, Any], str | None]:
-    """用当前启用的索引版本重新切片、重新嵌入。
+    """用当前启用索引版本的参数重新切片，结果放回切片列表。
 
-    使用场景：调整了切片参数、更换了嵌入模型、或上次索引失败后修复配置。
+    使用场景：调整了切片参数、换了索引版本，或者想重新检查切片质量。
+    注意这里不再直接生成向量：旧索引在新索引建立前仍然可用，
+    避免“点一下重建，线上检索立刻变空”。
     """
     doc = await db.get(KbDocument, document_id)
     if doc is None:
@@ -606,16 +784,95 @@ async def reindex_document(
     text_content = _decode_text(data)
 
     version = await ensure_active_version(db)
-    doc.index_version_id = version.id
     doc.status = "parsing"
     doc.error_message = None
     doc.updated_at = now_utc()
     await db.commit()
 
-    error = await _run_index(db, doc, text_content, admin, ip, action="kb.document.reindex")
+    error = await _run_chunk(
+        db, doc, text_content, version, admin, ip, action="kb.document.rechunk"
+    )
     refreshed = await db.get(KbDocument, document_id)
-    payload = _document_payload(refreshed, await _chunk_count(db, document_id))
+    payload = _document_payload(refreshed, await _effective_chunk_count(db, document_id))
     return payload, error
+
+
+async def build_index(
+    db: AsyncSession,
+    admin: AdminUser,
+    document_id: str,
+    ip: str | None,
+) -> tuple[dict[str, Any], str | None]:
+    """把切片列表里的切片建立成可检索的索引。
+
+    返回：
+        (文档展示数据, 失败原因)。失败原因为空表示建立成功。
+    """
+    doc = await db.get(KbDocument, document_id)
+    if doc is None:
+        raise AppError("KB_DOCUMENT_NOT_FOUND", "文档不存在", status_code=404)
+    if doc.status in {"parsing", "chunking", "indexing"}:
+        raise AppError("KB_DOCUMENT_BUSY", "文档正在处理中，请稍后再试", status_code=409)
+    if await _draft_count(db, document_id) == 0:
+        raise AppError(
+            "KB_DRAFT_CHUNKS_MISSING",
+            "没有待建立索引的切片，请先上传文档或重新切片",
+            status_code=409,
+        )
+
+    error = await _run_build(db, doc, admin, ip)
+    refreshed = await db.get(KbDocument, document_id)
+    payload = _document_payload(refreshed, await _effective_chunk_count(db, document_id))
+    return payload, error
+
+
+async def list_chunk_sets(db: AsyncSession) -> dict[str, Any]:
+    """切片列表：所有“切好但还没建立索引”的文档分组。
+
+    用分组查询一次拿到每篇文档的切片数、切片参数和最早切片时间，
+    避免先查文档再逐个查切片（N + 1 查询）。
+    """
+    rows = (
+        await db.execute(
+            select(
+                KbDraftChunk.document_id,
+                func.count(KbDraftChunk.id),
+                func.max(KbDraftChunk.chunk_size),
+                func.max(KbDraftChunk.chunk_overlap),
+                func.min(KbDraftChunk.created_at),
+            )
+            .group_by(KbDraftChunk.document_id)
+            .order_by(func.min(KbDraftChunk.created_at).desc())
+        )
+    ).all()
+    if not rows:
+        return {"items": []}
+
+    document_ids = [row[0] for row in rows]
+    documents = (
+        await db.scalars(select(KbDocument).where(KbDocument.id.in_(document_ids)))
+    ).all()
+    document_map = {doc.id: doc for doc in documents}
+
+    items: list[dict[str, Any]] = []
+    for document_id, count, chunk_size, chunk_overlap, created_at in rows:
+        doc = document_map.get(document_id)
+        if doc is None:
+            continue
+        items.append(
+            {
+                "documentId": doc.id,
+                "title": doc.title,
+                "status": doc.status,
+                "errorMessage": doc.error_message,
+                "chunkCount": int(count),
+                "chunkSize": int(chunk_size or 0),
+                "chunkOverlap": int(chunk_overlap or 0),
+                "createdAt": iso(created_at),
+                "updatedAt": iso(doc.updated_at),
+            }
+        )
+    return {"items": items}
 
 
 async def delete_document(
@@ -635,6 +892,7 @@ async def delete_document(
 
     before = {"title": doc.title, "status": doc.status}
     await db.execute(delete(KbChunk).where(KbChunk.document_id == doc.id))
+    await db.execute(delete(KbDraftChunk).where(KbDraftChunk.document_id == doc.id))
     get_storage().delete(doc.storage_key)
     write_audit(
         db,
@@ -657,23 +915,45 @@ async def list_chunks(
     offset: int = 0,
     limit: int = 50,
 ) -> dict[str, Any]:
-    """分页查看切片，用于人工检查切片质量。"""
+    """分页查看切片，用于人工检查切片质量。
+
+    优先返回待索引切片：运营刚上传或重新切片后最想看的是这一批；
+    没有待索引切片时再返回已经建立索引的切片。
+    source 字段告诉前端当前看的是哪一批，避免运营误以为已生效。
+    """
     doc = await db.get(KbDocument, document_id)
     if doc is None:
         raise AppError("KB_DOCUMENT_NOT_FOUND", "文档不存在", status_code=404)
 
     limit = min(max(limit, 1), MAX_CHUNK_PAGE)
     offset = max(offset, 0)
-    total = await _chunk_count(db, document_id)
-    rows = (
-        await db.scalars(
-            select(KbChunk)
-            .where(KbChunk.document_id == document_id)
-            .order_by(KbChunk.ordinal)
-            .offset(offset)
-            .limit(limit)
-        )
-    ).all()
+    total = await _draft_count(db, document_id)
+    source = "draft"
+    if total == 0:
+        total = await _chunk_count(db, document_id)
+        source = "indexed"
+
+    if source == "draft":
+        rows = (
+            await db.scalars(
+                select(KbDraftChunk)
+                .where(KbDraftChunk.document_id == document_id)
+                .order_by(KbDraftChunk.ordinal)
+                .offset(offset)
+                .limit(limit)
+            )
+        ).all()
+    else:
+        rows = (
+            await db.scalars(
+                select(KbChunk)
+                .where(KbChunk.document_id == document_id)
+                .order_by(KbChunk.ordinal)
+                .offset(offset)
+                .limit(limit)
+            )
+        ).all()
+
     items = [
         {
             "id": chunk.id,
@@ -690,6 +970,7 @@ async def list_chunks(
         "offset": offset,
         "limit": limit,
         "hasMore": offset + len(items) < total,
+        "source": source,
     }
 
 
