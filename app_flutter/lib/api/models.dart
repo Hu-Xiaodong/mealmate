@@ -600,19 +600,24 @@ class AIRecommendation {
 
 class AIQuota {
   const AIQuota({
+    required this.enabled,
     required this.limit,
     required this.used,
     required this.remaining,
   });
 
+  /// 是否启用每日次数限制。后端关闭限制时为 false，此时 [remaining] 为空，
+  /// 界面不显示“今日剩余 N 次”，但 [used] 仍会累计，便于统计真实用量。
+  final bool enabled;
   final int limit;
   final int used;
-  final int remaining;
+  final int? remaining;
 
   factory AIQuota.fromJson(Map<String, dynamic> json) => AIQuota(
+    enabled: json['enabled'] as bool? ?? true,
     limit: json['limit'] as int? ?? 0,
     used: json['used'] as int? ?? 0,
-    remaining: json['remaining'] as int? ?? 0,
+    remaining: json['remaining'] as int?,
   );
 }
 
@@ -646,7 +651,7 @@ class AIChatResult {
           : const [],
       quota: quota is Map<String, dynamic>
           ? AIQuota.fromJson(quota)
-          : const AIQuota(limit: 0, used: 0, remaining: 0),
+          : const AIQuota(enabled: false, limit: 0, used: 0, remaining: null),
     );
   }
 }

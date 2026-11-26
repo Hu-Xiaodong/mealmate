@@ -22,8 +22,8 @@ router = APIRouter(prefix="/admin/users", tags=["admin-users"])
 async def list_users(
     keyword: str | None = Query(default=None, max_length=40),
     status_filter: str | None = Query(default=None, alias="status"),
-    cursor: str | None = None,
-    limit: int = Query(default=20, ge=1, le=50),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=50, alias="pageSize"),
     principal: AdminPrincipal = Depends(require_permission("user.read")),
     db: AsyncSession = Depends(get_db),
 ):
@@ -33,8 +33,8 @@ async def list_users(
             db,
             keyword=keyword,
             status=status_filter,
-            cursor=cursor,
-            limit=limit,
+            page=page,
+            page_size=page_size,
         )
     )
 
@@ -53,8 +53,8 @@ async def user_detail(
 async def user_posts(
     user_id: str,
     status_filter: str | None = Query(default=None, alias="status"),
-    cursor: str | None = None,
-    limit: int = Query(default=10, ge=1, le=50),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=1, le=50, alias="pageSize"),
     principal: AdminPrincipal = Depends(require_permission("user.read")),
     db: AsyncSession = Depends(get_db),
 ):
@@ -69,8 +69,8 @@ async def user_posts(
         await list_admin_posts(
             db,
             status=status_filter,
-            cursor=cursor,
-            limit=limit,
+            page=page,
+            page_size=page_size,
             author_id=user_id,
         )
     )

@@ -17,8 +17,8 @@ async def audit_logs(
     target_id: str | None = Query(default=None, alias="targetId", max_length=40),
     start_at: str | None = Query(default=None, alias="startAt"),
     end_at: str | None = Query(default=None, alias="endAt"),
-    cursor: str | None = None,
-    limit: int = Query(default=20, ge=1, le=50),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=50, alias="pageSize"),
     principal: AdminPrincipal = Depends(require_permission("audit.read")),
     db: AsyncSession = Depends(get_db),
 ):
@@ -35,7 +35,7 @@ async def audit_logs(
             target_id=target_id,
             start_at=start_at,
             end_at=end_at,
-            cursor=cursor,
-            limit=limit,
+            page=page,
+            page_size=page_size,
         )
     )

@@ -14,19 +14,19 @@
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.serializers import iso
 from app.core.errors import AppError
 from app.core.security import decrypt_secret, encrypt_secret, mask_secret, new_id
-from app.db.models import AdminUser, AICallLog, AIProvider
+from app.db.models import AdminUser, AICallLog, AICallTrace, AIProvider
 from app.schemas import AIProviderCreateRequest, AIProviderUpdateRequest
 from app.services.ai_service import probe_provider
 from app.services.audit_service import write_audit
 from app.utils.time import now_utc
 
-MAX_LOG_LIMIT = 200
+MAX_LOG_PAGE_SIZE = 100
 
 
 def _masked_key(provider: AIProvider) -> str:
@@ -104,6 +104,37 @@ async def _ensure_name_available(
         raise AppError("AI_PROVIDER_NAME_EXISTS", "该模型名称已存在", status_code=409)
 
 
+async def _disable_other_enabled(
+    db: AsyncSession, kind: str, keep_id: str | None = None
+) -> list[str]:
+    """停用同一用途下其他已启用的模型，保证“一个用途只有一个开关是开的”。
+
+    为什么要有这个函数：
+        聊天和嵌入两类接口不能混用，同一用途同时启用多个模型会让
+        “这次到底用哪个模型”变得不确定。产品要求开关切换即生效，
+        因此启用一个模型时，必须自动关掉同类型的其他模型。
+
+    为什么先停用再启用/插入：
+        数据库上有一个“每个用途只能有一行启用”的部分唯一索引，
+        如果先把新模型设为启用、再关旧模型，中间状态会违反唯一约束。
+
+    返回被自动停用的模型名称，调用方可据此提示运营。
+    """
+    conditions = [AIProvider.kind == kind, AIProvider.enabled.is_(True)]
+    if keep_id is not None:
+        conditions.append(AIProvider.id != keep_id)
+    rows = (await db.scalars(select(AIProvider).where(*conditions))).all()
+    names: list[str] = []
+    for row in rows:
+        row.enabled = False
+        row.updated_at = now_utc()
+        names.append(row.name)
+    if rows:
+        # 必须先落库，再启用新模型；否则唯一索引会在中间状态报冲突。
+        await db.flush()
+    return names
+
+
 async def create_provider(
     db: AsyncSession,
     admin: AdminUser,
@@ -112,6 +143,9 @@ async def create_provider(
 ) -> dict[str, Any]:
     name = body.name.strip()
     await _ensure_name_available(db, name)
+    if body.enabled:
+        # 新模型默认启用时，同用途旧的启用模型自动停用。
+        await _disable_other_enabled(db, body.kind)
     provider = AIProvider(
         id=new_id("aip"),
         name=name,
@@ -155,6 +189,13 @@ async def update_provider(
 
     # 必须在修改字段之前保存快照，否则 before 和 after 会变成同一份数据。
     before = _snapshot(provider)
+    # 修改后最终是否启用、属于哪个用途，要在改字段前算出来：
+    # 如果这次会把模型切到另一个用途并保持启用，必须先停用目标用途的旧模型，
+    # 否则改 kind 的那条 SQL 会撞上“每个用途只能启用一个”的唯一索引。
+    target_kind = body.kind if body.kind is not None else provider.kind
+    target_enabled = body.enabled if body.enabled is not None else provider.enabled
+    if target_enabled:
+        await _disable_other_enabled(db, target_kind, keep_id=provider.id)
     if body.name is not None:
         name = body.name.strip()
         await _ensure_name_available(db, name, exclude_id=provider.id)
@@ -253,52 +294,110 @@ async def test_provider(
     return result
 
 
+def _log_payload(log: AICallLog) -> dict[str, Any]:
+    """调用日志的列表字段。
+
+    列表与详情共用同一份字段定义，避免详情页少返回某个字段，
+    前端又要单独做一次兼容处理。
+    """
+    return {
+        "id": log.id,
+        "requestId": log.request_id,
+        "subjectRef": log.subject_ref,
+        "contextType": log.context_type,
+        "providerId": log.provider_id,
+        "providerName": log.provider_name,
+        "model": log.model,
+        "status": log.status,
+        "latencyMs": log.latency_ms,
+        "promptTokens": log.prompt_tokens,
+        "completionTokens": log.completion_tokens,
+        "totalTokens": log.total_tokens,
+        "errorCode": log.error_code,
+        "errorMessage": log.error_message,
+        "createdAt": iso(log.created_at),
+    }
+
+
+def _trace_payload(trace: AICallTrace) -> dict[str, Any]:
+    """调用过程明细的单步字段，按前端时间线需要的结构返回。"""
+    return {
+        "id": trace.id,
+        "seq": trace.seq,
+        "step": trace.step,
+        "title": trace.title,
+        "status": trace.status,
+        "detail": trace.detail,
+        "durationMs": trace.duration_ms,
+        "createdAt": iso(trace.created_at),
+    }
+
+
+async def get_call_log_detail(db: AsyncSession, log_id: str) -> dict[str, Any]:
+    """返回一条调用日志的完整执行过程。
+
+    为什么把汇总和明细放在同一个接口：
+        详情页打开时必须同时展示“结果”和“过程”，分两个接口会让页面出现
+        “上半部分已经显示、时间线还在加载”的割裂状态；
+        明细按调用编号查询，单次调用最多几十条，一次返回不会有性能问题。
+
+    为什么明细要按 seq 排序而不是按创建时间：
+        步骤是由代码按执行顺序写入的，同一毫秒内可能写入多条，
+        创建时间可能相同；seq 是显式的顺序号，展示顺序永远稳定。
+    """
+    log = await db.get(AICallLog, log_id)
+    if log is None:
+        raise AppError(
+            "AI_CALL_LOG_NOT_FOUND", "调用日志不存在或已被清理", status_code=404
+        )
+    traces = (
+        await db.scalars(
+            select(AICallTrace)
+            .where(AICallTrace.call_log_id == log_id)
+            .order_by(AICallTrace.seq, AICallTrace.created_at, AICallTrace.id)
+        )
+    ).all()
+    return {**_log_payload(log), "traces": [_trace_payload(row) for row in traces]}
+
+
 async def list_call_logs(
     db: AsyncSession,
     *,
     status: str | None,
     provider_id: str | None,
-    limit: int,
+    page: int,
+    page_size: int,
 ) -> dict[str, Any]:
-    """查询最近的模型调用日志。
+    """分页查询模型调用日志。
 
-    先做最简单的“最近若干条 + 状态/供应商筛选”：
-    排查线上问题时最常用的是“最近失败的是哪个模型、错误码是什么”，
-    复杂的时间范围与关键字检索等真正有需求时再加。
+    排查线上问题时最常用的是“最近失败的是哪个模型、错误码是什么”；
+    日志会持续增长，因此按创建时间倒序分页，并返回总数供页面显示。
     """
-    limit = min(max(limit, 1), MAX_LOG_LIMIT)
+    page_size = min(max(page_size, 1), MAX_LOG_PAGE_SIZE)
+    page = max(page, 1)
     conditions = []
     if status:
         conditions.append(AICallLog.status == status.strip())
     if provider_id:
         conditions.append(AICallLog.provider_id == provider_id.strip())
 
+    total = int(
+        await db.scalar(select(func.count()).select_from(AICallLog).where(*conditions))
+        or 0
+    )
     rows = (
         await db.scalars(
             select(AICallLog)
             .where(*conditions)
             .order_by(AICallLog.created_at.desc(), AICallLog.id.desc())
-            .limit(limit)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
         )
     ).all()
-    items = [
-        {
-            "id": log.id,
-            "requestId": log.request_id,
-            "subjectRef": log.subject_ref,
-            "contextType": log.context_type,
-            "providerId": log.provider_id,
-            "providerName": log.provider_name,
-            "model": log.model,
-            "status": log.status,
-            "latencyMs": log.latency_ms,
-            "promptTokens": log.prompt_tokens,
-            "completionTokens": log.completion_tokens,
-            "totalTokens": log.total_tokens,
-            "errorCode": log.error_code,
-            "errorMessage": log.error_message,
-            "createdAt": iso(log.created_at),
-        }
-        for log in rows
-    ]
-    return {"items": items}
+    items = [_log_payload(log) for log in rows]
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+    }

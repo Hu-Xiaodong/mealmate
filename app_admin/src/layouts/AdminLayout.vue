@@ -40,6 +40,16 @@ const iconMap: Record<string, Component> = {
 const menuItems = computed(() =>
   NAV_ITEMS.filter((item) => store.hasPermission(item.permission)),
 )
+/**
+ * 详情页的地址是 /ai-call-logs/xxx，菜单项只登记了 /ai-call-logs。
+ * 这里按前缀匹配，进入详情页时左侧“AI 调用日志”仍然保持高亮。
+ */
+const activeMenu = computed(() => {
+  const matched = NAV_ITEMS.find(
+    (item) => route.path === item.path || route.path.startsWith(`${item.path}/`),
+  )
+  return matched?.path || route.path
+})
 const pageTitle = computed(() => String(route.meta.title || '管理后台'))
 const avatarText = computed(
   () => (store.profile?.displayName || store.profile?.username || '管').slice(0, 1),
@@ -79,7 +89,7 @@ async function handleCommand(command: string) {
       </div>
 
       <el-menu
-        :default-active="route.path"
+        :default-active="activeMenu"
         router
         class="menu"
         background-color="transparent"

@@ -8,6 +8,7 @@ from app.schemas import AIProviderCreateRequest, AIProviderUpdateRequest
 from app.services.admin_ai_provider_service import (
     create_provider,
     delete_provider,
+    get_call_log_detail,
     list_call_logs,
     list_providers,
     test_provider,
@@ -84,13 +85,33 @@ async def test(
 async def logs(
     status: str | None = Query(default=None, max_length=20),
     provider_id: str | None = Query(default=None, alias="providerId", max_length=40),
-    limit: int = Query(default=50, ge=1, le=200),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100, alias="pageSize"),
     principal: AdminPrincipal = Depends(require_permission("ai.log.read")),
     db: AsyncSession = Depends(get_db),
 ):
-    """最近调用日志，用于排查“哪个模型失败、错误码是什么”。"""
+    """模型调用日志，页码分页，用于排查“哪个模型失败、错误码是什么”。"""
     return ok(
         await list_call_logs(
-            db, status=status, provider_id=provider_id, limit=limit
+            db,
+            status=status,
+            provider_id=provider_id,
+            page=page,
+            page_size=page_size,
         )
     )
+
+
+@logs_router.get("/{log_id}")
+async def log_detail(
+    log_id: str,
+    principal: AdminPrincipal = Depends(require_permission("ai.log.read")),
+    db: AsyncSession = Depends(get_db),
+):
+    """返回一次模型调用的完整执行过程：提示词、原始输出、解析与校验结果。
+
+    为什么单独做一个详情接口：
+        列表只需要汇总字段，如果列表接口顺带返回明细，页面数据量会成倍增加；
+        详情按编号精确查询，打开一条加载一条，列表和详情互不影响。
+    """
+    return ok(await get_call_log_detail(db, log_id))

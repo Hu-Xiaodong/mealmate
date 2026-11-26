@@ -153,8 +153,14 @@ async function test(item: AIProviderItem) {
 async function toggle(item: AIProviderItem, enabled: boolean) {
   try {
     await updateAIProvider(item.id, { enabled })
-    item.enabled = enabled
-    ElMessage.success(enabled ? '已启用，将参与自动分配' : '已停用，不再参与自动分配')
+    // 启用一个模型时后端会自动停用同类型其他模型，必须重新加载列表，
+    // 否则页面上会出现两个开关同时显示为“开”，与实际配置不一致。
+    await load()
+    ElMessage.success(
+      enabled
+        ? '已启用，将作为该用途的当前模型；同类型其他模型已自动停用'
+        : '已停用，该用途暂无启用模型时 AI 会使用本地规则推荐',
+    )
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '保存失败')
   }
@@ -188,7 +194,7 @@ onMounted(load)
       <div>
         <h1 class="page-title">模型配置</h1>
         <p class="page-subtitle">
-          按优先级从小到大尝试，失败自动切换下一个；全部失败时回退到本地规则推荐。
+          同一用途同时只能启用一个模型，调用时使用启用中的那个；未启用或调用失败时回退到本地规则推荐。
         </p>
       </div>
       <div class="head-actions">
@@ -203,7 +209,7 @@ onMounted(load)
       show-icon
       :closable="false"
       title="尚未配置模型"
-      description="未配置或全部调用失败时，AI 问答会自动使用本地规则推荐：只从已发布菜谱中筛选，不编造内容。"
+      description="未启用或调用失败时，AI 问答会自动使用本地规则推荐：只从已发布菜谱中筛选，不编造内容。"
       class="hint"
     />
 
@@ -240,7 +246,7 @@ onMounted(load)
           <div class="muted">{{ formatDateTime(row.lastTestAt) }}</div>
         </template>
       </el-table-column>
-      <el-table-column label="启用" width="90">
+      <el-table-column label="启用（同类型唯一）" width="140">
         <template #default="{ row }">
           <el-switch
             :model-value="row.enabled"
@@ -319,7 +325,9 @@ onMounted(load)
         </el-form-item>
         <el-form-item label="优先级">
           <el-input-number v-model="form.priority" :min="0" :max="9999" />
-          <div class="muted form-hint">数字越小越先尝试，失败后自动切到下一个模型。</div>
+          <div class="muted form-hint">
+            数字越小越靠前，主要用于列表排序；同一用途只有一个启用模型，不会再按优先级自动切换。
+          </div>
         </el-form-item>
         <el-form-item label="超时（秒）">
           <el-input-number v-model="form.timeoutSeconds" :min="3" :max="120" />
@@ -330,6 +338,9 @@ onMounted(load)
         </el-form-item>
         <el-form-item label="立即启用">
           <el-switch v-model="form.enabled" />
+          <div class="muted form-hint">
+            启用后，同用途其他模型会自动停用；同一用途始终最多只有一个启用模型。
+          </div>
         </el-form-item>
       </el-form>
       <template #footer>

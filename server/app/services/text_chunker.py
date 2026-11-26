@@ -13,6 +13,11 @@
 4. 每个片段开头补一行上下文头（文档标题 + 章节路径），
    因为片段脱离原文后，单看正文可能不知道在讲哪一部分。
 
+图片怎么处理：
+- 切片 content 保留 `![说明](地址)` 图片标记，管理后台预览时才能把图片渲染出来；
+- 统计 token 数、生成向量前用 strip_media_markup 去掉图片标记，
+  因为图片地址对语义检索没有帮助，还会浪费嵌入模型的输入长度。
+
 这些都是“字符数”而不是“模型 token 数”的近似值：
 中文一个汉字通常约等于一个 token，英文一个单词约等于一到两个 token。
 用字符数控制切片简单、稳定、无需依赖具体模型的分词器，
@@ -55,6 +60,13 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 # 匹配连续的英文字母或数字，把一段英文/数字当作一个计数单位。
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
+# 匹配 Markdown 图片，例如 "![白灼虾](./白灼虾.webp)"。
+# 只用于“去图片”场景（统计 token、生成向量），不会改写切片正文，
+# 所以这里只要求匹配成功即可，不关心图片说明和地址分别是什么。
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)\s]+(?:\s+[\"'][^\"']*[\"'])?\)")
+# 匹配 HTML 图片标签，例如 <img src="x.png" />。
+# 有些 Markdown 文档会混用 HTML 写法，生成向量前也要一并去掉。
+_HTML_IMAGE_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 # 句子切分正则：匹配到句末标点（。！？!?；;）或换行为止的一段文字。
 # 前半段 [^...]* 表示“不含句末标点的任意内容”，后半段 [。！？!?；;\n]? 是可选的一个标点，
 # 因此最后一段即使没有标点也能被匹配到。用于超长段落的安全切分。
@@ -106,6 +118,26 @@ def estimate_tokens(text: str) -> int:
     # 再统计英文单词/数字串数量：每个词大约 1~2 个 token，这里按 1 个估算。
     words = len(_WORD_RE.findall(_CJK_RE.sub(" ", text)))
     return cjk + words
+
+
+def strip_media_markup(text: str) -> str:
+    """去掉文本中的图片标记，只保留可读文字。
+
+    作用：图片地址（例如 `./白灼虾.webp`、`/media/kb/xxx/白灼虾.webp`）对语义检索
+    没有帮助，还会占用嵌入模型的输入长度；生成向量和统计 token 前统一清理。
+    哪里用到：
+    1. 本文件 split_document 计算 token_count 时调用；
+    2. app/services/kb_service.py 的 _build_index 在调用嵌入服务前调用。
+
+    为什么不在切片时直接删除图片：
+    管理后台需要把切片原样展示给运营确认，保留图片标记才能渲染出图片；
+    只有“送去向量化”的那份文本需要去掉图片。
+    """
+    cleaned = _MARKDOWN_IMAGE_RE.sub("", text)
+    cleaned = _HTML_IMAGE_RE.sub("", cleaned)
+    # 删除图片后可能留下连续空行，压缩成最多一个空行，避免无意义的空白进入向量。
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _split_sections(text: str) -> list[dict[str, Any]]:
@@ -345,12 +377,13 @@ def split_document(
             content = f"{header}{piece}".strip()
             if not content:
                 continue
-            # 组装返回值：content 用于向量化和展示，token_count 用于统计，
+            # 组装返回值：content 用于展示，token_count 用于统计，
             # metadata 记录来源章节，最终写入 kb_chunk 表的 chunk_metadata 字段。
+            # token_count 按去掉图片标记后的文字计算，和真正送给嵌入模型的内容保持一致。
             chunks.append(
                 TextChunk(
                     content=content,
-                    token_count=estimate_tokens(content),
+                    token_count=estimate_tokens(strip_media_markup(content)),
                     metadata={
                         "heading": section["heading"],
                         "headingPath": section["heading_path"],

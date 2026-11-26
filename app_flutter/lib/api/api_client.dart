@@ -80,11 +80,7 @@ class ApiClient {
     try {
       decoded = jsonDecode(utf8.decode(response.bodyBytes));
     } on FormatException {
-      throw ApiException(
-        'BAD_RESPONSE',
-        '服务返回了无法解析的内容',
-        response.statusCode,
-      );
+      throw ApiException('BAD_RESPONSE', '服务返回了无法解析的内容', response.statusCode);
     }
     if (decoded is! Map<String, dynamic>) {
       throw ApiException('BAD_RESPONSE', '服务返回了无法解析的内容', response.statusCode);
@@ -233,14 +229,7 @@ class ApiClient {
     int radius = 3000,
   }) async {
     final data = await _request(
-      '/api/v1/feed${_query({
-        'filter': filter,
-        'cursor': cursor,
-        'limit': limit,
-        'lat': lat,
-        'lng': lng,
-        'radius': radius,
-      })}',
+      '/api/v1/feed${_query({'filter': filter, 'cursor': cursor, 'limit': limit, 'lat': lat, 'lng': lng, 'radius': radius})}',
     );
     return FeedPage.fromJson(data);
   }
@@ -256,11 +245,7 @@ class ApiClient {
     int limit = 20,
   }) async {
     final data = await _request(
-      '/api/v1/recipes${_query({
-        'category': category,
-        'cursor': cursor,
-        'limit': limit,
-      })}',
+      '/api/v1/recipes${_query({'category': category, 'cursor': cursor, 'limit': limit})}',
     );
     return RecipePage.fromJson(data);
   }
@@ -292,11 +277,7 @@ class ApiClient {
     final data = await _request(
       '/api/v1/favorites',
       method: 'PUT',
-      body: {
-        'targetType': targetType,
-        'targetId': targetId,
-        'saved': saved,
-      },
+      body: {'targetType': targetType, 'targetId': targetId, 'saved': saved},
     );
     return FavoriteResult.fromJson(data);
   }
@@ -342,12 +323,7 @@ class ApiClient {
     int limit = 10,
   }) async {
     final data = await _request(
-      '/api/v1/maps/places${_query({
-        'keyword': keyword,
-        'lat': lat,
-        'lng': lng,
-        'limit': limit,
-      })}',
+      '/api/v1/maps/places${_query({'keyword': keyword, 'lat': lat, 'lng': lng, 'limit': limit})}',
     );
     final items = data['items'];
     return items is List
@@ -405,13 +381,7 @@ class ApiClient {
     int width = 640,
     int height = 320,
   }) {
-    return '$baseUrl/api/v1/maps/static${_query({
-      'lat': lat,
-      'lng': lng,
-      'zoom': zoom,
-      'width': width,
-      'height': height,
-    })}';
+    return '$baseUrl/api/v1/maps/static${_query({'lat': lat, 'lng': lng, 'zoom': zoom, 'width': width, 'height': height})}';
   }
 
   Future<DraftSaveResult> createDraft(Map<String, dynamic> payload) async {
@@ -486,6 +456,7 @@ class ApiClient {
     String contextType = 'home',
     String? contextId,
     required String message,
+    List<Map<String, String>> history = const [],
   }) async {
     final data = await _request(
       '/api/v1/ai/chat',
@@ -494,9 +465,119 @@ class ApiClient {
         'contextType': contextType,
         'contextId': contextId,
         'message': message,
+        if (history.isNotEmpty) 'history': history,
       },
     );
     return AIChatResult.fromJson(data);
+  }
+
+  /// 流式问答：服务端按 SSE 逐段推送文字，收到一段就回调一次 [onDelta]。
+  ///
+  /// 为什么不用普通 `post`：
+  /// 普通请求会等服务端把完整响应写完才返回，用户在这段时间里只能看到“思考中”；
+  /// SSE 让服务端一边生成一边写，客户端一边读一边展示，首字出现时间明显更短。
+  /// 这里仍然使用同一个 `http.Client`，只是换成 `send` 拿到可逐行读取的响应流。
+  Future<AIChatResult> aiChatStream({
+    String contextType = 'home',
+    String? contextId,
+    required String message,
+    List<Map<String, String>> history = const [],
+    required void Function(String delta) onDelta,
+  }) async {
+    final request = http.Request(
+      'POST',
+      Uri.parse('$baseUrl/api/v1/ai/chat/stream'),
+    );
+    request.headers.addAll(_headers());
+    request.body = jsonEncode({
+      'contextType': contextType,
+      'contextId': contextId,
+      'message': message,
+      if (history.isNotEmpty) 'history': history,
+    });
+
+    http.StreamedResponse streamed;
+    try {
+      // 只限制“多久之内必须开始响应”。本地 14B 模型首次加载可能较慢，
+      // 因此比普通接口的 15 秒放宽到 60 秒；开始返回后由下面的循环持续读取。
+      streamed = await _http.send(request).timeout(const Duration(seconds: 60));
+    } on TimeoutException {
+      throw const ApiException('TIMEOUT', 'AI 响应超时，请稍后重试', 0);
+    } on http.ClientException {
+      throw const ApiException('NETWORK_ERROR', '网络连接失败，请检查网络', 0);
+    }
+
+    if (streamed.statusCode >= 400) {
+      final text = await streamed.stream.bytesToString();
+      try {
+        final decoded = jsonDecode(text);
+        if (decoded is Map<String, dynamic>) {
+          throw ApiException(
+            decoded['code'] ?? streamed.statusCode,
+            decoded['message'] as String? ?? 'AI 请求失败',
+            streamed.statusCode,
+            decoded['data'],
+          );
+        }
+      } on FormatException {
+        // 不是标准错误信封时，走下面的通用提示。
+      }
+      throw ApiException(
+        'AI_STREAM_FAILED',
+        'AI 请求失败（${streamed.statusCode}）',
+        streamed.statusCode,
+      );
+    }
+
+    AIChatResult? result;
+    // 服务端每个事件占一行：`data: {"type":"delta","text":"..."}`。
+    // 只处理 data 行，空行和注释行（以冒号开头）直接跳过。
+    try {
+      await for (final line
+          in streamed.stream
+              .transform(utf8.decoder)
+              .transform(const LineSplitter())) {
+        if (!line.startsWith('data:')) continue;
+        final payloadText = line.substring(5).trim();
+        if (payloadText.isEmpty) continue;
+        Object? decoded;
+        try {
+          decoded = jsonDecode(payloadText);
+        } on FormatException {
+          // 代理或网络异常可能插入非 JSON 行，跳过即可，不影响后续事件。
+          continue;
+        }
+        if (decoded is! Map<String, dynamic>) continue;
+        final payload = decoded;
+        final type = payload['type'];
+        if (type == 'delta') {
+          final text = payload['text'];
+          if (text is String && text.isNotEmpty) {
+            onDelta(text);
+          }
+        } else if (type == 'done') {
+          final data = payload['data'];
+          if (data is Map<String, dynamic>) {
+            result = AIChatResult.fromJson(data);
+          }
+        } else if (type == 'error') {
+          throw ApiException(
+            payload['code'] ?? 'AI_STREAM_ERROR',
+            payload['message'] as String? ?? 'AI 回答失败',
+            0,
+          );
+        }
+      }
+    } on http.ClientException {
+      throw const ApiException('NETWORK_ERROR', '网络连接中断，请重试', 0);
+    } on TimeoutException {
+      throw const ApiException('TIMEOUT', 'AI 响应超时，请重试', 0);
+    }
+
+    if (result == null) {
+      throw const ApiException('AI_STREAM_INCOMPLETE', 'AI 回答不完整，请重试', 0);
+    }
+    return result;
   }
 
   Future<MediaAsset> uploadImage(String filePath) async {
@@ -546,9 +627,8 @@ class FavoriteResult {
   final bool saved;
   final String? savedAt;
 
-  factory FavoriteResult.fromJson(Map<String, dynamic> json) =>
-      FavoriteResult(
-        saved: json['saved'] as bool? ?? false,
-        savedAt: json['savedAt'] as String?,
-      );
+  factory FavoriteResult.fromJson(Map<String, dynamic> json) => FavoriteResult(
+    saved: json['saved'] as bool? ?? false,
+    savedAt: json['savedAt'] as String?,
+  );
 }

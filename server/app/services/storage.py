@@ -6,6 +6,7 @@
 把 `MEDIA_BACKEND` 改掉，业务代码与数据库都不需要改动。
 """
 
+import shutil
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Final
@@ -18,7 +19,7 @@ LOCAL_URL_PREFIX: Final = "/media/"
 class StorageBackend(ABC):
     """对象存储后端接口。
 
-    新增云厂商时只需要实现这四个方法，媒体服务与序列化层不感知具体实现。
+    新增云厂商时只需要实现这些方法，媒体服务与序列化层不感知具体实现。
     """
 
     @abstractmethod
@@ -44,6 +45,14 @@ class StorageBackend(ABC):
     @abstractmethod
     def url(self, key: str) -> str:
         """生成可访问地址。本地返回相对路径，云端返回完整地址。"""
+
+    @abstractmethod
+    def delete_prefix(self, prefix: str) -> None:
+        """删除某个对象键前缀下的全部对象。
+
+        知识库文档可以把多张图片放在同一个目录下，删除文档时需要按目录
+        整体清理；前缀下没有对象时视为成功，便于重复调用和失败重试。
+        """
 
 
 class LocalStorage(StorageBackend):
@@ -79,6 +88,12 @@ class LocalStorage(StorageBackend):
 
     def url(self, key: str) -> str:
         return f"{LOCAL_URL_PREFIX}{key.lstrip('/')}"
+
+    def delete_prefix(self, prefix: str) -> None:
+        path = self._path(prefix)
+        # 只允许删除目录，避免误传单个对象键时把文件当成目录处理。
+        if path.is_dir():
+            shutil.rmtree(path)
 
 
 def _build_storage() -> StorageBackend:

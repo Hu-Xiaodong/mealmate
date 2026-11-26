@@ -4,7 +4,6 @@
 封禁只改状态并撤销会话，不删除任何数据，保证可追溯、可恢复。
 """
 
-from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func, select, update
@@ -15,23 +14,12 @@ from app.core.errors import AppError
 from app.core.security import decrypt_phone, mask_phone
 from app.db.models import Favorite, Like, MealPost, Session, User
 from app.services.audit_service import write_audit
-from app.utils.cursor import decode_cursor, encode_cursor
-from app.utils.time import as_utc, now_utc
+from app.utils.time import now_utc
 
 MAX_PAGE_SIZE = 50
 # 关键词搜索时最多扫描的用户数。当前项目数据量小，这样实现最简单；
 # 生产环境应在写入时保存手机号后四位或检索摘要，避免全表解密。
 MAX_SEARCH_SCAN = 2000
-
-
-def _parse_dt(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def _user_payload(user: User, post_count: int = 0) -> dict[str, Any]:
@@ -69,15 +57,20 @@ async def list_admin_users(
     *,
     keyword: str | None,
     status: str | None,
-    cursor: str | None,
-    limit: int,
+    page: int,
+    page_size: int,
 ) -> dict[str, Any]:
     """用户列表，支持昵称或手机号后四位搜索。
 
     注意：手机号在数据库中是加密存储的，无法直接用 SQL 做后缀匹配，
     所以当前实现在有限范围内取出后解密过滤。生产环境应增加专用检索列。
+
+    有关键词时，过滤发生在内存里，因此先把候选全部筛出来得到总数，
+    再按页码切片；没有关键词时直接用数据库的 count 与 offset，
+    避免为了分页把整张用户表读进内存。
     """
-    limit = min(max(limit, 1), MAX_PAGE_SIZE)
+    page_size = min(max(page_size, 1), MAX_PAGE_SIZE)
+    page = max(page, 1)
     keyword_text = (keyword or "").strip()
     status_text = (status or "").strip()
     if status_text and status_text not in {"active", "disabled", "system"}:
@@ -87,18 +80,16 @@ async def list_admin_users(
     if status_text:
         conditions.append(User.status == status_text)
 
-    # 有关键词时先取一批候选再在内存中匹配，避免把解密逻辑写进 SQL。
-    scan_limit = MAX_SEARCH_SCAN if keyword_text else limit + 1
-    rows = (
-        await db.scalars(
-            select(User)
-            .where(*conditions)
-            .order_by(User.created_at.desc(), User.id.desc())
-            .limit(scan_limit)
-        )
-    ).all()
-
     if keyword_text:
+        # 关键词搜索：在有限扫描范围内解密手机号并匹配。
+        rows = (
+            await db.scalars(
+                select(User)
+                .where(*conditions)
+                .order_by(User.created_at.desc(), User.id.desc())
+                .limit(MAX_SEARCH_SCAN)
+            )
+        ).all()
         lowered = keyword_text.lower()
         digits_only = keyword_text.isdigit()
         matched = []
@@ -109,31 +100,31 @@ async def list_admin_users(
             )
             if nickname_hit or phone_hit:
                 matched.append(user)
-        rows = matched
+        total = len(matched)
+        offset = (page - 1) * page_size
+        current = matched[offset : offset + page_size]
+    else:
+        total = int(
+            await db.scalar(select(func.count()).select_from(User).where(*conditions)) or 0
+        )
+        current = (
+            await db.scalars(
+                select(User)
+                .where(*conditions)
+                .order_by(User.created_at.desc(), User.id.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+        ).all()
 
-    cursor_data = decode_cursor(cursor)
-    if cursor:
-        created = _parse_dt(cursor_data.get("createdAt") if cursor_data else None)
-        cursor_id = cursor_data.get("id") if cursor_data else None
-        if created is None or not cursor_id:
-            raise AppError("CURSOR_INVALID", "分页游标无效，请刷新后重试")
-        rows = [
-            user
-            for user in rows
-            if as_utc(user.created_at) < created
-            or (as_utc(user.created_at) == created and user.id < cursor_id)
-        ]
-
-    has_more = len(rows) > limit
-    page = rows[:limit]
-    counts = await _post_counts(db, [user.id for user in page])
-    items = [_user_payload(user, counts.get(user.id, 0)) for user in page]
-
-    next_cursor = None
-    if has_more and page:
-        last = page[-1]
-        next_cursor = encode_cursor({"createdAt": last.created_at.isoformat(), "id": last.id})
-    return {"items": items, "nextCursor": next_cursor, "hasMore": has_more}
+    counts = await _post_counts(db, [user.id for user in current])
+    items = [_user_payload(user, counts.get(user.id, 0)) for user in current]
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+    }
 
 
 async def get_admin_user(db: AsyncSession, user_id: str) -> dict[str, Any]:

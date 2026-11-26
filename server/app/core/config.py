@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     # 这里只保留所有环境共用的配额，避免“配置分散在环境变量和数据库两处”。
     guest_ai_daily_limit: int = 5
     user_ai_daily_limit: int = 20
+    # 是否启用每日问答次数限制。
+    # 设为 false 时仍然记录使用次数（便于统计和以后恢复），但不再拒绝请求；
+    # 用于演示、联调或模型额度充足时临时放开，不需要改代码。
+    ai_daily_limit_enabled: bool = True
 
     rank_cache_seconds: int = 10
 

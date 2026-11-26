@@ -36,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import decrypt_secret
 from app.db.models import AIProvider
 from app.db.rag_models import KB_EMBEDDING_DIMENSIONS
-from app.services.ai_service import record_call
+from app.services.ai_service import CallTrace, record_call
 
 # 每次请求最多送多少段文本。
 # 为什么不是一次把整篇文档都送过去：请求体过大容易超时、失败后重试成本高；
@@ -89,7 +89,8 @@ def _endpoint(base_url: str) -> str:
 async def _embedding_provider(db: AsyncSession) -> AIProvider:
     """找出当前可用的嵌入供应商。
 
-    规则与聊天模型一致：只选启用的，按优先级升序取第一个。
+    规则与聊天模型一致：同一用途同时只启用一个模型；
+    这里仍按优先级取第一条，兼容历史数据里可能出现多个启用项的情况。
     为什么要求单独的 kind=embedding 配置：
     聊天模型和嵌入模型的接口路径、返回结构完全不同，
     把两者混在一张配置里，调用时无法判断该走哪个协议。
@@ -124,6 +125,7 @@ async def _request_embeddings(
         不用为了跑单元测试去申请密钥或花钱调用云端接口。
     """
     payload = {"model": provider.model, "input": texts}
+    endpoint = _endpoint(provider.base_url)
     headers = {
         "Authorization": f"Bearer {decrypt_secret(provider.api_key_encrypted)}",
         "Content-Type": "application/json",
@@ -131,21 +133,36 @@ async def _request_embeddings(
     try:
         async with httpx.AsyncClient(timeout=provider.timeout_seconds) as client:
             response = await client.post(
-                _endpoint(provider.base_url), json=payload, headers=headers
+                endpoint, json=payload, headers=headers
             )
             response.raise_for_status()
             body = response.json()
     except httpx.TimeoutException as exc:
-        raise EmbeddingError("EMBEDDING_TIMEOUT", "嵌入模型请求超时") from exc
+        raise EmbeddingError(
+            "EMBEDDING_TIMEOUT",
+            f"嵌入模型「{provider.name}」（{provider.model}）请求 {endpoint} 超时",
+        ) from exc
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
+        # 404 和 401/403/429 的原因完全不同：前者通常是供应商根本没有嵌入接口，
+        # 后者才是密钥、模型名或额度问题。错误信息里直接带上供应商名称、模型名
+        # 和实际请求地址，运营一眼就能确认系统调用的是哪一个配置，
+        # 不会出现“我配置的模型没被调用”的误解。
+        if status == 404:
+            hint = "该地址没有嵌入（embeddings）接口，请确认这个供应商支持文本嵌入"
+        else:
+            hint = "请检查密钥、模型名与额度"
+        detail = exc.response.text.strip()[:160]
         raise EmbeddingError(
             f"EMBEDDING_HTTP_{status}",
-            f"嵌入模型返回错误（HTTP {status}），请检查密钥、模型名与额度",
+            f"嵌入模型「{provider.name}」（{provider.model}）请求 {endpoint} "
+            f"返回 HTTP {status}：{hint}。供应商返回：{detail or '无内容'}",
         ) from exc
     except (httpx.HTTPError, ValueError) as exc:
         raise EmbeddingError(
-            "EMBEDDING_REQUEST_FAILED", "嵌入模型请求失败，请检查网络与接口地址"
+            "EMBEDDING_REQUEST_FAILED",
+            f"嵌入模型「{provider.name}」（{provider.model}）请求 {endpoint} 失败，"
+            "请检查网络与接口地址",
         ) from exc
 
     data = body.get("data") if isinstance(body, dict) else None
@@ -183,6 +200,23 @@ def _check_dimensions(vectors: list[list[float]]) -> None:
                 f"嵌入模型输出 {len(vector)} 维向量，"
                 f"与知识库要求的 {KB_EMBEDDING_DIMENSIONS} 维不一致",
             )
+
+
+async def probe_embedding(provider: AIProvider) -> tuple[int, int]:
+    """对嵌入供应商做一次最小真实调用，返回（向量维度, 消耗 token 数）。
+
+    作用：
+        「模型配置」里的“测试连接”原来统一按聊天接口测试，
+        但嵌入配置的请求路径和返回结构完全不同，用聊天接口测出来的结果
+        不能说明嵌入是否可用。这里复用真正的嵌入请求函数，
+        并用和建立索引相同的维度校验，保证“测试通过”就等于“能建索引”。
+    哪里用到：
+        ai_service.probe_provider 在 provider.kind == "embedding" 时调用；
+        测试环境可以替换 _request_embeddings，避免真的产生网络费用。
+    """
+    vectors, tokens = await _request_embeddings(provider, ["连接测试"])
+    _check_dimensions(vectors)
+    return len(vectors[0]), tokens
 
 
 async def embed_texts(
@@ -225,6 +259,34 @@ async def embed_texts(
         vectors: list[list[float]] = []
         tokens = 0
 
+        retry_trace = CallTrace()
+        preview = batch[0].strip().replace("\n", " ")[:120] if batch else ""
+        retry_trace.add(
+            "function_call",
+            "调用嵌入函数",
+            detail=(
+                "调用链：app.services.embedding_service.embed_texts\n"
+                "        → app.services.embedding_service._request_embeddings\n"
+                "        → httpx.AsyncClient.post\n"
+                f"入参：texts={len(texts)} 段，本批={len(batch)} 段，"
+                f"subject_ref={subject_ref!r}"
+            ),
+        )
+        retry_trace.add(
+            "embedding_request",
+            "请求嵌入接口",
+            detail=(
+                f"批次：第 {start // BATCH_SIZE + 1} 批，"
+                f"共 {max((len(texts) + BATCH_SIZE - 1) // BATCH_SIZE, 1)} 批\n"
+                f"本批文本：{len(batch)} 段\n"
+                f"供应商：{provider.name}（{provider.id}）\n"
+                f"模型：{provider.model}\n"
+                f"请求方法：POST\n"
+                f"请求地址：{_endpoint(provider.base_url)}\n"
+                "请求体字段：model、input（本批文本数组）\n"
+                f"首段文本预览：{preview or '（空）'}"
+            ),
+        )
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
                 vectors, tokens = await _request_embeddings(provider, batch)
@@ -232,15 +294,33 @@ async def embed_texts(
                 break
             except EmbeddingError as exc:
                 last_error = exc
+                latency = int((time.perf_counter() - started) * 1000)
+                retry_trace.add(
+                    "embedding_retry" if attempt < MAX_ATTEMPTS else "embedding_error",
+                    f"第 {attempt} 次尝试失败",
+                    status="failed",
+                    detail=(
+                        f"错误码：{exc.code}\n"
+                        f"错误信息：{exc.message}\n"
+                        f"截至当前耗时：{latency} ms\n"
+                        + (
+                            f"将在等待后重试（最多 {MAX_ATTEMPTS} 次）"
+                            if attempt < MAX_ATTEMPTS
+                            else f"已达到最大尝试次数 {MAX_ATTEMPTS}，本批次失败"
+                        )
+                    ),
+                    duration_ms=latency,
+                )
                 record_call(
                     db,
                     subject_ref=subject_ref,
                     context_type="kb_embedding",
                     provider=provider,
                     status="failed",
-                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    latency_ms=latency,
                     error_code=exc.code,
                     error_message=exc.message,
+                    trace=retry_trace,
                 )
                 if attempt < MAX_ATTEMPTS:
                     await asyncio.sleep(RETRY_BASE_SECONDS * 2 ** (attempt - 1))
@@ -250,15 +330,29 @@ async def embed_texts(
             raise last_error
 
         _check_dimensions(vectors)
+        latency = int((time.perf_counter() - started) * 1000)
+        retry_trace.add(
+            "embedding_response",
+            "嵌入接口返回成功",
+            status="success",
+            detail=(
+                f"返回向量：{len(vectors)} 条\n"
+                f"每批文本：{len(batch)} 段\n"
+                f"消耗 token：{tokens}\n"
+                f"耗时：{latency} ms"
+            ),
+            duration_ms=latency,
+        )
         record_call(
             db,
             subject_ref=subject_ref,
             context_type="kb_embedding",
             provider=provider,
             status="success",
-            latency_ms=int((time.perf_counter() - started) * 1000),
+            latency_ms=latency,
             total_tokens=tokens,
             prompt_tokens=tokens,
+            trace=retry_trace,
         )
         all_vectors.extend(vectors)
 

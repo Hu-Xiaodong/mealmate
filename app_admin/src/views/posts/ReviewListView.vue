@@ -26,8 +26,12 @@ const canDelete = computed(() => store.hasPermission('post.delete'))
 const statusFilter = ref('pending_review')
 const items = ref<AdminPost[]>([])
 const loading = ref(false)
-const hasMore = ref(false)
-const nextCursor = ref<string | null>(null)
+// 页码分页：page 从 1 开始，pageSize 可切换，total 由接口返回。
+// 管理后台需要“共多少条、当前第几页、直接跳页”，所以统一用页码分页，
+// 不再使用“加载更多”的游标模式。
+const page = ref(1)
+const pageSize = ref(20)
+const total = ref(0)
 
 const drawerVisible = ref(false)
 const activePostId = ref('')
@@ -74,32 +78,45 @@ function sourceLabel(source: string) {
   return SOURCE_LABELS[source] || source
 }
 
-async function load(reset = false) {
+async function load() {
   if (loading.value) {
     return
   }
   loading.value = true
+  // 当前页最后一条被处理后，这一页可能变空；记下标记，等 loading 结束后退回上一页。
+  let needPrevious = false
   try {
     const data = await listPosts({
       status: statusFilter.value || undefined,
-      cursor: reset ? undefined : nextCursor.value || undefined,
-      limit: 20,
+      page: page.value,
+      pageSize: pageSize.value,
     })
-    items.value = reset ? data.items : [...items.value, ...data.items]
-    nextCursor.value = data.nextCursor
-    hasMore.value = data.hasMore
+    items.value = data.items
+    total.value = data.total
     selectedRows.value = []
     tableRef.value?.clearSelection()
+    if (!data.items.length && page.value > 1) {
+      needPrevious = true
+    }
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '加载饭帖失败')
   } finally {
     loading.value = false
   }
+  if (needPrevious) {
+    page.value -= 1
+    await load()
+  }
 }
 
 function reload() {
-  nextCursor.value = null
-  return load(true)
+  page.value = 1
+  return load()
+}
+
+function changePageSize() {
+  page.value = 1
+  void load()
 }
 
 function openDetail(row: AdminPost, column?: { type?: string }) {
@@ -243,7 +260,7 @@ async function submitReason() {
   }
 }
 
-onMounted(() => load(true))
+onMounted(() => load())
 </script>
 
 <template>
@@ -390,8 +407,17 @@ onMounted(() => load(true))
         </template>
       </el-table>
 
-      <div v-if="hasMore" class="load-more">
-        <el-button :loading="loading" @click="load(false)">加载更多</el-button>
+      <div class="pager">
+        <el-pagination
+          v-model:current-page="page"
+          v-model:page-size="pageSize"
+          :total="total"
+          :page-sizes="[10, 20, 50]"
+          layout="total, sizes, prev, pager, next, jumper"
+          background
+          @current-change="load"
+          @size-change="changePageSize"
+        />
       </div>
     </section>
 

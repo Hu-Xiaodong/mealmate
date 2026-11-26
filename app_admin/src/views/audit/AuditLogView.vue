@@ -19,8 +19,10 @@ const filters = reactive({
 
 const items = ref<AuditLogItem[]>([])
 const loading = ref(false)
-const hasMore = ref(false)
-const nextCursor = ref<string | null>(null)
+// 页码分页：审计日志会持续追加，运营需要按页核对和回看，而不是只能往下加载。
+const page = ref(1)
+const pageSize = ref(20)
+const total = ref(0)
 
 function actionLabel(action: string) {
   return ACTION_LABELS[action] || action
@@ -46,7 +48,7 @@ function prettyJson(value: Record<string, unknown> | null) {
   return JSON.stringify(value, null, 2)
 }
 
-async function load(reset = false) {
+async function load() {
   if (loading.value) {
     return
   }
@@ -57,12 +59,11 @@ async function load(reset = false) {
       action: filters.action || undefined,
       startAt: filters.range?.[0] || undefined,
       endAt: filters.range?.[1] || undefined,
-      cursor: reset ? undefined : nextCursor.value || undefined,
-      limit: 20,
+      page: page.value,
+      pageSize: pageSize.value,
     })
-    items.value = reset ? data.items : [...items.value, ...data.items]
-    nextCursor.value = data.nextCursor
-    hasMore.value = data.hasMore
+    items.value = data.items
+    total.value = data.total
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '加载审计日志失败')
   } finally {
@@ -71,8 +72,13 @@ async function load(reset = false) {
 }
 
 function search() {
-  nextCursor.value = null
-  load(true)
+  page.value = 1
+  load()
+}
+
+function changePageSize() {
+  page.value = 1
+  void load()
 }
 
 function reset() {
@@ -82,7 +88,7 @@ function reset() {
   search()
 }
 
-onMounted(() => load(true))
+onMounted(() => load())
 </script>
 
 <template>
@@ -94,7 +100,7 @@ onMounted(() => load(true))
           只追加、不修改、不删除。每条记录包含操作人、动作、对象、原因、来源地址和请求标识。
         </p>
       </div>
-      <el-button :icon="Refresh" :loading="loading" @click="load(true)">
+      <el-button :icon="Refresh" :loading="loading" @click="load">
         刷新
       </el-button>
     </header>
@@ -211,8 +217,17 @@ onMounted(() => load(true))
         </template>
       </el-table>
 
-      <div v-if="hasMore" class="load-more">
-        <el-button :loading="loading" @click="load(false)">加载更多</el-button>
+      <div class="pager">
+        <el-pagination
+          v-model:current-page="page"
+          v-model:page-size="pageSize"
+          :total="total"
+          :page-sizes="[10, 20, 50]"
+          layout="total, sizes, prev, pager, next, jumper"
+          background
+          @current-change="load"
+          @size-change="changePageSize"
+        />
       </div>
     </section>
   </div>

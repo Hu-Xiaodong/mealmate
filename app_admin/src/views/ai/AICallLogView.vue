@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Refresh, Search } from '@element-plus/icons-vue'
 
@@ -7,9 +8,14 @@ import { listAICallLogs } from '@/api/admin'
 import type { AICallLogItem } from '@/api/types'
 import { formatDateTime } from '@/utils/format'
 
+const router = useRouter()
 const loading = ref(false)
 const items = ref<AICallLogItem[]>([])
 const filters = reactive({ status: '' })
+// 页码分页：调用日志会持续增长，不能只展示最近固定条数。
+const page = ref(1)
+const pageSize = ref(20)
+const total = ref(0)
 
 const CONTEXT_LABELS: Record<string, string> = {
   home: '首页',
@@ -21,12 +27,13 @@ const CONTEXT_LABELS: Record<string, string> = {
 async function load() {
   loading.value = true
   try {
-    items.value = (
-      await listAICallLogs({
-        status: filters.status || undefined,
-        limit: 50,
-      })
-    ).items
+    const data = await listAICallLogs({
+      status: filters.status || undefined,
+      page: page.value,
+      pageSize: pageSize.value,
+    })
+    items.value = data.items
+    total.value = data.total
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '加载调用日志失败')
   } finally {
@@ -34,8 +41,24 @@ async function load() {
   }
 }
 
+/** 状态筛选变化后回到第 1 页。 */
+function search() {
+  page.value = 1
+  void load()
+}
+
+function changePageSize() {
+  page.value = 1
+  void load()
+}
+
 function contextLabel(value: string) {
   return CONTEXT_LABELS[value] || value
+}
+
+/** 打开某一次调用的执行过程明细。 */
+function openDetail(row: AICallLogItem) {
+  router.push(`/ai-call-logs/${row.id}`)
 }
 
 onMounted(load)
@@ -55,7 +78,7 @@ onMounted(load)
           <el-option label="成功" value="success" />
           <el-option label="失败" value="failed" />
         </el-select>
-        <el-button :icon="Search" @click="load">筛选</el-button>
+        <el-button :icon="Search" @click="search">筛选</el-button>
         <el-button :icon="Refresh" @click="load">刷新</el-button>
       </div>
     </header>
@@ -99,9 +122,27 @@ onMounted(load)
           <span class="muted">{{ row.requestId || '-' }}</span>
         </template>
       </el-table-column>
+      <el-table-column label="操作" width="100" fixed="right">
+        <template #default="{ row }">
+          <el-button link type="primary" @click="openDetail(row)">
+            查看详情
+          </el-button>
+        </template>
+      </el-table-column>
     </el-table>
 
-    <div class="footnote muted">最多展示最近 50 条。</div>
+    <div class="pager">
+      <el-pagination
+        v-model:current-page="page"
+        v-model:page-size="pageSize"
+        :total="total"
+        :page-sizes="[10, 20, 50, 100]"
+        layout="total, sizes, prev, pager, next, jumper"
+        background
+        @current-change="load"
+        @size-change="changePageSize"
+      />
+    </div>
   </div>
 </template>
 

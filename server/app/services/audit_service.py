@@ -8,14 +8,13 @@
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.serializers import iso
 from app.core.errors import AppError, request_id_ctx
 from app.core.security import new_id
 from app.db.models import AdminUser, AuditLog
-from app.utils.cursor import decode_cursor, encode_cursor
 from app.utils.time import BUSINESS_TZ, now_utc
 
 MAX_PAGE_SIZE = 50
@@ -69,25 +68,10 @@ def write_audit(
     return log
 
 
-def _parse_dt(value: str | None) -> datetime | None:
-    """把分页游标里的 ISO 时间字符串转换成带时区的时间。
-
-    游标由服务端自己生成，里面的时间一定是 UTC；SQLite 读回的时间可能
-    不带时区，因此这里把“不带时区”按 UTC 解释。
-    """
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-
-
 def _parse_client_dt(value: str | None) -> datetime | None:
     """把前端筛选条件里的时间转换成带时区的 UTC 时间。
 
-    为什么不能直接复用 _parse_dt：
+    为什么不能把它当成 UTC：
         日期选择器传的是用户看到的本地时间（例如 2026-11-24T10:00:00），
         不带时区。如果按 UTC 解释，就会被当成北京时间 18:00，
         筛选结果整体偏移 8 小时。项目统一以 Asia/Shanghai 为业务时区，
@@ -114,15 +98,19 @@ async def list_audit_logs(
     target_id: str | None,
     start_at: str | None,
     end_at: str | None,
-    cursor: str | None,
-    limit: int,
+    page: int,
+    page_size: int,
 ) -> dict[str, Any]:
     """按条件分页查询审计日志，只读。
 
-    分页使用游标而不是页码。审计日志会持续追加，
-    页码分页在数据插入后容易重复或漏行；游标固定在上一次的最后一条之后。
+    为什么改成页码分页：
+        审计日志虽然会持续追加，但后台使用者需要“第几页、共多少条”来
+        核对一次操作前后的完整记录；游标分页只能往后翻，无法回看或跳页。
+        审计表是只追加、极少修改的，按偏移量取某一页足够稳定；
+        如果以后日志量大到深页变慢，再改成按时间范围缩小查询。
     """
-    limit = min(max(limit, 1), MAX_PAGE_SIZE)
+    page_size = min(max(page_size, 1), MAX_PAGE_SIZE)
+    page = max(page, 1)
     conditions = []
     if actor_name:
         conditions.append(AuditLog.actor_name.contains(actor_name.strip()))
@@ -144,29 +132,19 @@ async def list_audit_logs(
     if end is not None:
         conditions.append(AuditLog.created_at <= end)
 
-    cursor_data = decode_cursor(cursor)
-    if cursor:
-        created = _parse_dt(cursor_data.get("createdAt") if cursor_data else None)
-        cursor_id = cursor_data.get("id") if cursor_data else None
-        if created is None or not cursor_id:
-            raise AppError("CURSOR_INVALID", "分页游标无效，请刷新后重试")
-        conditions.append(
-            or_(
-                AuditLog.created_at < created,
-                and_(AuditLog.created_at == created, AuditLog.id < cursor_id),
-            )
-        )
-
+    total = int(
+        await db.scalar(select(func.count()).select_from(AuditLog).where(*conditions))
+        or 0
+    )
     rows = (
         await db.scalars(
             select(AuditLog)
             .where(*conditions)
             .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-            .limit(limit + 1)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
         )
     ).all()
-    has_more = len(rows) > limit
-    page = rows[:limit]
 
     items = [
         {
@@ -183,11 +161,12 @@ async def list_audit_logs(
             "requestId": log.request_id,
             "createdAt": iso(log.created_at),
         }
-        for log in page
+        for log in rows
     ]
 
-    next_cursor = None
-    if has_more and page:
-        last = page[-1]
-        next_cursor = encode_cursor({"createdAt": last.created_at.isoformat(), "id": last.id})
-    return {"items": items, "nextCursor": next_cursor, "hasMore": has_more}
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+    }

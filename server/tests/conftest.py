@@ -6,6 +6,8 @@ from pathlib import Path
 
 os.environ["APP_ENV"] = "test"
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_placeholder.db"
+# 测试固定启用配额，避免本地 .env 为了演示把限制暂停后影响配额用例。
+os.environ["AI_DAILY_LIMIT_ENABLED"] = "true"
 os.environ["SECRET_KEY"] = "test-secret-key"
 os.environ["ALLOW_DEV_AUTH_CODE"] = "true"
 os.environ["DEV_AUTH_CODE"] = "123456"
@@ -27,7 +29,7 @@ from sqlalchemy.pool import NullPool
 
 from app.db.base import Base
 from app.db.seed import seed_admin_data, seed_demo_data
-from app.db.session import get_db
+from app.db.session import get_db, get_session_factory
 from app.main import app
 
 API = "/api/v1"
@@ -53,6 +55,9 @@ async def client():
             yield session
 
     app.dependency_overrides[get_db] = _override_get_db
+    # 批量导入的后台任务会自己创建会话，必须让它使用同一个临时数据库，
+    # 否则任务会写到开发库的真实文件里。
+    app.dependency_overrides[get_session_factory] = lambda: session_factory
     # 用例需要直接造数据时可以通过 app.state 取到同一个会话工厂。
     app.state.test_session_factory = session_factory
     transport = httpx.ASGITransport(app=app)

@@ -6,6 +6,7 @@ import type {
   AdminRoleItem,
   AdminUserDetail,
   AdminUserItem,
+  AICallLogDetail,
   AICallLogItem,
   AICallLogParams,
   AIProviderForm,
@@ -15,9 +16,11 @@ import type {
   AuditLogItem,
   BatchReviewResult,
   DashboardSummary,
+  KbBatchDeleteResult,
+  KbBatchOperationResult,
   KbChunkPage,
-  KbChunkSetItem,
   KbDocumentItem,
+  KbImportBatchItem,
   KbIndexVersionForm,
   KbIndexVersionItem,
   KbSearchParams,
@@ -26,6 +29,7 @@ import type {
   MeResult,
   PageResult,
   PostListParams,
+  RecipeBatchResult,
   RecipeForm,
   RecipeListParams,
   RoleListResult,
@@ -188,6 +192,33 @@ export function archiveRecipe(recipeId: string) {
   })
 }
 
+/** 批量上架菜谱：已上架的会在结果里标记为跳过。 */
+export function batchPublishRecipes(recipeIds: string[]) {
+  return request<RecipeBatchResult>({
+    url: '/admin/recipes/batch-publish',
+    method: 'post',
+    data: { recipeIds },
+  })
+}
+
+/** 批量下架菜谱：软下架，历史饭帖关联保留。 */
+export function batchArchiveRecipes(recipeIds: string[]) {
+  return request<RecipeBatchResult>({
+    url: '/admin/recipes/batch-archive',
+    method: 'post',
+    data: { recipeIds },
+  })
+}
+
+/** 批量删除菜谱：被饭帖引用的菜谱会被后端跳过并说明原因。 */
+export function batchDeleteRecipes(recipeIds: string[]) {
+  return request<RecipeBatchResult>({
+    url: '/admin/recipes/batch-delete',
+    method: 'post',
+    data: { recipeIds },
+  })
+}
+
 export function listTasteTags() {
   return request<{ items: TasteTagItem[] }>({ url: '/admin/taste-tags' })
 }
@@ -333,27 +364,44 @@ export function testAIProvider(providerId: string) {
 }
 
 export function listAICallLogs(params: AICallLogParams) {
-  return request<{ items: AICallLogItem[] }>({
+  return request<PageResult<AICallLogItem>>({
     url: '/admin/ai-call-logs',
     params,
+  })
+}
+
+/** 查询一次模型调用的完整执行过程，用于“调用详情”页。 */
+export function getAICallLog(logId: string) {
+  return request<AICallLogDetail>({
+    url: `/admin/ai-call-logs/${logId}`,
   })
 }
 
 export function listKbDocuments(params?: {
   status?: string
   keyword?: string
-  limit?: number
+  page?: number
+  pageSize?: number
 }) {
-  return request<{ items: KbDocumentItem[] }>({
+  return request<{
+    items: KbDocumentItem[]
+    total: number
+    page: number
+    pageSize: number
+  }>({
     url: '/admin/kb/documents',
     params,
   })
 }
 
-export function uploadKbDocument(file: File, title?: string) {
+export function uploadKbDocument(file: File, images: File[] = [], title?: string) {
   // multipart/form-data 交给浏览器生成边界；手动设置 Content-Type 反而会丢边界。
   const form = new FormData()
   form.append('file', file)
+  // 图片可选，用同一个字段名重复追加；后端按文件名匹配 Markdown 里的图片引用。
+  for (const image of images) {
+    form.append('images', image)
+  }
   if (title && title.trim()) {
     form.append('title', title.trim())
   }
@@ -363,6 +411,56 @@ export function uploadKbDocument(file: File, title?: string) {
     data: form,
     // 上传后要立即解析与切片，耗时明显高于普通查询，单独放宽超时。
     timeout: 120000,
+  })
+}
+
+/**
+ * 创建批量导入批次。
+ *
+ * 为什么单独传 archive：浏览器一次只能展开一个压缩包，后端也只支持一个；
+ * 普通文件与文件夹则通过重复的 files 字段提交。
+ * paths 与 files 顺序一一对应，用于保留文件夹里的相对路径，
+ * 后端据此把同目录图片和文档配到一起。
+ */
+export function createKbImportBatch(payload: {
+  files: File[]
+  paths?: string[]
+  archive?: File | null
+  label?: string
+}) {
+  const form = new FormData()
+  for (const file of payload.files) {
+    form.append('files', file)
+  }
+  if (payload.paths?.length) {
+    form.append('paths', JSON.stringify(payload.paths))
+  }
+  if (payload.archive) {
+    form.append('archive', payload.archive)
+  }
+  if (payload.label?.trim()) {
+    form.append('label', payload.label.trim())
+  }
+  return request<KbImportBatchItem>({
+    url: '/admin/kb/import-batches',
+    method: 'post',
+    data: form,
+    // 上传几十 MB 的压缩包本身就需要时间，进度由后端后台任务单独推进。
+    timeout: 300000,
+  })
+}
+
+export function getKbImportBatch(batchId: string) {
+  return request<KbImportBatchItem>({
+    url: `/admin/kb/import-batches/${batchId}`,
+  })
+}
+
+/** 只重新处理失败的文件，成功后不需要重新上传整批。 */
+export function retryKbImportBatch(batchId: string) {
+  return request<KbImportBatchItem>({
+    url: `/admin/kb/import-batches/${batchId}/retry`,
+    method: 'post',
   })
 }
 
@@ -384,17 +482,64 @@ export function buildKbIndex(documentId: string) {
   })
 }
 
-/** 切片列表：已切好但还没建立索引的文档。 */
-export function listKbChunkSets() {
-  return request<{ items: KbChunkSetItem[] }>({
-    url: '/admin/kb/chunk-sets',
-  })
-}
-
 export function deleteKbDocument(documentId: string) {
   return request<{ id: string; deleted: boolean }>({
     url: `/admin/kb/documents/${documentId}`,
     method: 'delete',
+  })
+}
+
+/** 批量重新切片：逐篇执行，返回每篇结果。 */
+export function batchRechunkKbDocuments(documentIds: string[]) {
+  return request<KbBatchOperationResult>({
+    url: '/admin/kb/documents/batch-rechunk',
+    method: 'post',
+    data: { documentIds },
+    // 每篇都要读取原文件重新切分，批量操作比普通请求慢，放宽到 5 分钟。
+    timeout: 300000,
+  })
+}
+
+/** 批量生成菜谱草稿：已发布的菜谱会被跳过。 */
+export function batchGenerateKbRecipeDrafts(documentIds: string[]) {
+  return request<KbBatchOperationResult>({
+    url: '/admin/kb/documents/batch-recipe-draft',
+    method: 'post',
+    data: { documentIds },
+    timeout: 300000,
+  })
+}
+
+/** 批量建立索引：每篇都要调用嵌入模型，是三个批量操作里最慢的。 */
+export function batchBuildKbIndex(documentIds: string[]) {
+  return request<KbBatchOperationResult>({
+    url: '/admin/kb/documents/batch-index',
+    method: 'post',
+    data: { documentIds },
+    timeout: 300000,
+  })
+}
+
+/** 把知识库文档按固定模板解析成菜谱草稿，已存在的草稿会被更新。 */
+export function generateKbRecipeDraft(documentId: string) {
+  return request<{
+    recipeId: string
+    title: string
+    created: boolean
+    skipped: boolean
+    message: string
+  }>({
+    url: `/admin/kb/documents/${documentId}/recipe-draft`,
+    method: 'post',
+  })
+}
+
+/** 批量删除知识库文档：一次提交多个编号，后端逐条处理并返回结果。 */
+export function batchDeleteKbDocuments(documentIds: string[]) {
+  return request<KbBatchDeleteResult>({
+    url: '/admin/kb/documents/batch-delete',
+    method: 'post',
+    data: { documentIds },
   })
 }
 

@@ -5,11 +5,13 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+.pytest-basetemp/
 
 # 本地数据与上传
 server/mealmate_dev.db
 server/mealmate_dev.db-*
 server/media/uploads/
+server/media/kb/
 .env
 *.log
 
@@ -41,6 +43,10 @@ app_flutter/ios/Pods/
 app_flutter/ios/.symlinks/
 app_flutter/android/.gradle/
 app_flutter/android/local.properties
+
+# 下载工具的未完成文件（迅雷等），体积大且无需入库
+*.xltd
+*.xltd.cfg
 
 # 编辑器
 .idea/

@@ -215,11 +215,31 @@ class AIConstraints(CamelModel):
     avoid: list[str] = Field(default_factory=list, max_length=10)
 
 
+class AIChatMessage(CamelModel):
+    """一轮历史对话。
+
+    为什么由客户端携带历史，而不是只在服务端保存会话：
+    1. App 的对话是短会话，关掉面板就结束，不需要长期保存；
+    2. 服务端保存会话要新增表、清理过期数据，还要处理游客身份，
+       成本远高于让客户端把最近几轮一起带上；
+    3. 客户端携带历史时，服务端每次请求都是无状态的，扩容和重试都更简单。
+    历史只保留最近几轮，既够模型理解“那它呢”这类指代，也不会把提示词撑爆。
+    """
+
+    # 只允许用户和助手两种角色。system 提示词由服务端固定，
+    # 不能让客户端伪造，否则等于把安全规则交给前端。
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=1000)
+
+
 class AIChatRequest(CamelModel):
     context_type: Literal["home", "post", "recipe_list"] = "home"
     context_id: str | None = Field(default=None, max_length=40)
     message: str = Field(min_length=1, max_length=500)
     constraints: AIConstraints = Field(default_factory=AIConstraints)
+    # 最近 8 条消息（约 4 轮）。再多对模型理解当前问题帮助有限，
+    # 反而会增加 token 费用和延迟，所以由 schema 直接限制上限。
+    history: list[AIChatMessage] = Field(default_factory=list, max_length=8)
 
 
 class AIProviderCreateRequest(CamelModel):
@@ -315,6 +335,29 @@ class KbSearchTestRequest(CamelModel):
     query: str = Field(min_length=1, max_length=500)
     top_k: int = Field(default=5, ge=1, le=20)
     threshold: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class KbBatchDeleteRequest(CamelModel):
+    """批量删除知识库文档请求。
+
+    为什么单独建一个模型，而不是复用饭帖的 BatchDeleteRequest：
+    饭帖删除必须填原因、一次最多 20 条；知识库删除不需要原因，
+    并且管理后台文档列表一次最多展示 200 篇，勾选全部时不该被偏小的上限拦住。
+    两个业务的校验规则不同，塞进同一个模型只会让字段变成
+    “这个接口必须填、那个接口不用填”，反而更难维护。
+    """
+
+    document_ids: list[str] = Field(min_length=1, max_length=200)
+
+
+class KbBatchOperationRequest(CamelModel):
+    """批量重新切片 / 生成菜谱 / 建立索引的请求。
+
+    这三个操作每篇都要读文件或调用外部模型，比删除慢得多，
+    因此上限只有 20 篇；超过时前端应提示运营分批勾选。
+    """
+
+    document_ids: list[str] = Field(min_length=1, max_length=20)
 
 
 class AdminLoginRequest(CamelModel):
@@ -429,7 +472,7 @@ class RecipeInput(CamelModel):
     ingredients: list[RecipeIngredientInput] = Field(min_length=1, max_length=30)
     steps: list[str] = Field(min_length=1, max_length=30)
     preconditions: str | None = Field(default=None, max_length=200)
-    content_origin: Literal["platform", "editor", "howtocook", "pdf"] = "platform"
+    content_origin: Literal["platform", "editor", "howtocook", "pdf", "kb"] = "platform"
     validation_status: Literal["tested", "pending", "not_tested"] = "pending"
     status: Literal["draft", "published", "archived"] = "published"
 
@@ -457,6 +500,27 @@ class RecipeInput(CamelModel):
             self.main_ingredients = [
                 name.strip() for name in self.main_ingredients if name.strip()
             ][:3]
+        return self
+
+
+class RecipeBatchRequest(CamelModel):
+    """批量上架 / 下架 / 删除菜谱的请求。
+
+    为什么上限是 50 条：
+        菜谱列表一页最多返回 50 条，批量操作的主要场景就是“把当前这一页处理掉”；
+        这三个操作虽然只改数据库、单条很快，但每条都要写审计日志并提交事务，
+        条数过多会长时间占用数据库连接，也会让审计表迅速膨胀。
+    为什么要去重：
+        前端表格翻页加载时可能重复勾选同一条菜谱；不去重就会重复写审计日志，
+        还会让统计里的“成功数量”大于实际菜谱数量。
+    """
+
+    recipe_ids: list[str] = Field(min_length=1, max_length=50)
+
+    @model_validator(mode="after")
+    def _dedupe(self):
+        # 保留第一次出现的顺序，结果列表和运营勾选的顺序保持一致。
+        self.recipe_ids = list(dict.fromkeys(self.recipe_ids))
         return self
 
 

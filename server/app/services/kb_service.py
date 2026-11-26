@@ -28,13 +28,16 @@ PostgreSQL 扩展语法，SQLAlchemy 的 ORM 查询表达式无法完整表达�
 """
 
 import hashlib
+import io
 import json
 import math
 import re
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import unquote
 
+from PIL import Image, UnidentifiedImageError
 from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,24 +53,43 @@ from app.db.rag_models import (
     KbIndexVersion,
 )
 from app.schemas import KbIndexVersionCreateRequest, KbSearchTestRequest
-from app.services import embedding_service
+from app.services import embedding_service, kb_recipe_service
 from app.services.audit_service import write_audit
 from app.services.storage import get_storage
-from app.services.text_chunker import split_document
+from app.services.text_chunker import split_document, strip_media_markup
 from app.utils.time import now_utc
 
 # 单个文档最大 5 MB。知识文档是文字内容，5 MB 已经足够容纳很长的手册；
 # 限制大小可以避免一次上传长时间占用服务进程和嵌入接口额度。
 MAX_DOCUMENT_BYTES = 5 * 1024 * 1024
 ALLOWED_SUFFIXES = {".md", ".txt"}
-MAX_DOCUMENT_LIMIT = 200
+# 单张知识库图片最大 5 MB，和 App 图片上传的限制保持一致。
+MAX_KB_IMAGE_BYTES = 5 * 1024 * 1024
+# 一次上传最多携带 30 张图片：再多会让表单请求体过大，也会拖慢切片接口。
+MAX_KB_IMAGES = 30
+# 只接受这四类图片后缀。SVG 不在此列：SVG 可以内嵌脚本，直接展示有安全风险。
+ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+# Pillow 识别出的真实格式，用来防止“把文本文件改成 .png 后上传”。
+ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP"}
+# 文档列表分页参数。每页默认 20 条，最多 100 条：
+# 太少会让运营频繁翻页，太多会拖慢页面渲染，也超出人眼一次能核对的数量。
+DEFAULT_PAGE_SIZE = 20
+MAX_PAGE_SIZE = 100
 MAX_CHUNK_PAGE = 100
 
+# 匹配 Markdown 图片里的“地址”部分，并保留前后缀，便于只替换地址。
+# 第 1 组是 `![说明](`，第 2 组是图片地址，第 3 组是可选标题与右括号。
+_MARKDOWN_IMAGE_URL_RE = re.compile(
+    r"(!\[[^\]]*\]\()([^)\s]+)((?:\s+[\"'][^\"']*[\"'])?\))"
+)
 
-def _safe_filename(raw: str) -> str:
+
+def safe_filename(raw: str) -> str:
     """清洗上传文件名，只保留字母、数字、汉字和少量安全符号。
 
     文件名会被拼进存储路径，必须防止 `../` 这类目录穿越字符。
+    为什么改成公开函数：批量导入要给压缩包里的每个文件生成存储键，
+    必须复用同一条清洗规则，否则两个入口的落盘名称会不一致。
     """
     name = Path(raw or "document.md").name
     cleaned = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", name).strip("._")
@@ -91,6 +113,126 @@ def _decode_text(data: bytes) -> str:
     if not text_content.strip():
         raise AppError("KB_FILE_EMPTY", "文件内容为空", status_code=400)
     return text_content
+
+
+def _image_basename(value: str) -> str:
+    """从图片地址或文件名中取出“文件名”部分，作为匹配用的键。
+
+    作用：Markdown 里可能写 `./白灼虾.webp`、`../../images/白灼虾.webp`、
+    `%E7%99%BD%E7%81%BC%E8%99%BE.webp`，而管理员上传图片时拿到的只有文件名。
+    统一解码、去掉目录和后缀以外的差异，才能把“文档里的引用”和“上传的文件”对上。
+    哪里用到：upload_document 保存图片时、_rewrite_markdown_images 改写地址时。
+    """
+    path = value.split("?", 1)[0].split("#", 1)[0]
+    path = unquote(path).replace("\\", "/").strip("<>")
+    # casefold 让英文文件名不区分大小写，避免 Windows 上能打开、Linux 上却匹配不到。
+    return PurePosixPath(path).name.casefold()
+
+
+def referenced_image_names(text_content: str) -> list[str]:
+    """从 Markdown 正文中提取“本地图片引用的文件名”，按出现顺序去重。
+
+    作用：
+        批量导入时，一批文件里可能有很多图片。如果每篇文档都保存整批图片，
+        存储会成倍膨胀；因此先看正文到底引用了哪些文件名，只保存被引用的图片。
+    哪里用到：
+        kb_import_service 创建批次时，为每个文档挑选需要一起保存的图片；
+        upload_document 仍然按文件名匹配，二者使用同一个 _image_basename 规则，
+        保证“提取出来的名字”和“保存后的匹配键”完全一致。
+    为什么跳过外链：
+        http、https、data、// 开头的地址是第三方资源，不需要也不会保存到本地存储。
+    """
+    names: list[str] = []
+    for match in _MARKDOWN_IMAGE_URL_RE.finditer(text_content):
+        url = match.group(2)
+        if url.startswith(("http://", "https://", "data:", "//")):
+            continue
+        name = _image_basename(url)
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def validate_image(filename: str, data: bytes) -> None:
+    """校验随文档上传的图片，防止非图片文件或超大文件进入知识库。
+
+    为什么不能只看后缀：把可执行文件改名成 .png 也能骗过后缀检查；
+    这里用 Pillow 真正打开一次，确认真实格式属于 JPG / PNG / WebP。
+    哪里用到：
+        1. upload_document 在保存图片之前逐张调用；
+        2. 批量导入在创建批次时就预校验，坏图片直接拒绝整批，
+           避免运营等后台任务跑完才发现某张图片根本打不开。
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix not in ALLOWED_IMAGE_SUFFIXES:
+        raise AppError(
+            "KB_IMAGE_TYPE_UNSUPPORTED",
+            f"图片 {filename} 仅支持 JPG、PNG、WebP",
+            status_code=400,
+        )
+    if not data:
+        raise AppError("KB_IMAGE_EMPTY", f"图片 {filename} 内容为空", status_code=400)
+    if len(data) > MAX_KB_IMAGE_BYTES:
+        raise AppError(
+            "KB_IMAGE_TOO_LARGE",
+            f"图片 {filename} 不能超过 5 MB",
+            status_code=413,
+        )
+    try:
+        image = Image.open(io.BytesIO(data))
+        image.verify()
+        # verify() 会消耗文件对象，检查真实格式前需要重新打开一次。
+        image = Image.open(io.BytesIO(data))
+    except (UnidentifiedImageError, OSError) as exc:
+        raise AppError(
+            "KB_IMAGE_INVALID", f"图片 {filename} 不是可识别的图片", status_code=400
+        ) from exc
+    if image.format not in ALLOWED_IMAGE_FORMATS:
+        raise AppError(
+            "KB_IMAGE_TYPE_UNSUPPORTED",
+            f"图片 {filename} 仅支持 JPG、PNG、WebP",
+            status_code=400,
+        )
+
+
+def _rewrite_markdown_images(
+    text_content: str, image_keys: dict[str, str]
+) -> tuple[str, int, int]:
+    """把 Markdown 里的本地图片地址改写成本服务的可访问地址。
+
+    参数说明：
+        image_keys：键是文件名（_image_basename 的结果），值是对象存储键，
+        例如 `{"白灼虾.webp": "kb/kbd_xxx/images/白灼虾.webp"}`。
+
+    返回值：
+        (改写后的正文, 成功关联的图片数, 没匹配到上传文件的引用数)。
+
+    哪些地址会改写：
+        相对路径、绝对路径都改写；`http://`、`https://`、`data:` 这类外部地址
+        保持原样，避免把第三方图片误当成上传文件。
+
+    为什么这样设计：
+        上传接口只拿到图片文件本身，拿不到它在原目录里的相对路径；
+        因此用“文件名”匹配是兼容性最好的做法，也能覆盖 `./`、`../` 等写法。
+        没匹配到的引用保留原文，同时在返回值里计数，让运营知道还有图片没传全。
+    """
+    matched = 0
+    missing = 0
+    storage = get_storage()
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal matched, missing
+        url = match.group(2)
+        if url.startswith(("http://", "https://", "data:", "//")):
+            return match.group(0)
+        key = image_keys.get(_image_basename(url))
+        if key is None:
+            missing += 1
+            return match.group(0)
+        matched += 1
+        return f"{match.group(1)}{storage.url(key)}{match.group(3)}"
+
+    return _MARKDOWN_IMAGE_URL_RE.sub(replace, text_content), matched, missing
 
 
 def _vector_literal(vector: list[float]) -> str:
@@ -120,11 +262,12 @@ def _cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
-def _error_text(exc: Exception) -> str:
+def error_text(exc: Exception) -> str:
     """把异常转换成可展示的错误说明。
 
     业务异常本身就有中文说明；未知异常带上类型名，
     方便排查时不至于只剩一句“失败”。
+    批量导入复用它，保证单篇上传和批次任务展示同一套错误文案。
     """
     if isinstance(exc, (AppError, embedding_service.EmbeddingError)):
         return exc.message
@@ -146,7 +289,24 @@ def _version_payload(version: KbIndexVersion) -> dict[str, Any]:
     }
 
 
-def _document_payload(doc: KbDocument, chunk_count: int = 0) -> dict[str, Any]:
+def _document_payload(
+    doc: KbDocument,
+    chunk_count: int = 0,
+    *,
+    draft_chunk_count: int = 0,
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
+    chunked_at: Any = None,
+) -> dict[str, Any]:
+    """把文档记录转换成前端展示结构。
+
+    为什么要额外返回 draftChunkCount、chunkSize、chunkOverlap、chunkedAt：
+        管理后台原来用两个列表展示同一批文档：一个全部文档，一个“待建立索引”。
+        两个列表看的是同一张表，运营却要在两处之间来回对照，很容易看漏。
+        合并成一个列表后，文档列表接口必须自己回答“这篇还有没有切片等着建索引、
+        用的什么切片参数、什么时候切的”，否则前端只能再请求一次“切片列表”，
+        等于把两个请求的问题带回界面。
+    """
     return {
         "id": doc.id,
         "title": doc.title,
@@ -159,6 +319,12 @@ def _document_payload(doc: KbDocument, chunk_count: int = 0) -> dict[str, Any]:
         "indexVersionId": doc.index_version_id,
         "uploadedBy": doc.uploaded_by,
         "chunkCount": chunk_count,
+        # 待建立索引的切片数量。大于 0 时前端才显示“去新建索引”。
+        "draftChunkCount": draft_chunk_count,
+        # 切片参数只在存在待索引切片时有意义；已建索引的文档为 null。
+        "chunkSize": chunk_size,
+        "chunkOverlap": chunk_overlap,
+        "chunkedAt": iso(chunked_at),
         "createdAt": iso(doc.created_at),
         "updatedAt": iso(doc.updated_at),
     }
@@ -182,16 +348,52 @@ async def _draft_count(db: AsyncSession, document_id: str) -> int:
     return int(total or 0)
 
 
-async def _effective_chunk_count(db: AsyncSession, document_id: str) -> int:
-    """展示用的切片数：有半成品时优先显示半成品数量。
+async def _draft_info(db: AsyncSession, document_id: str) -> dict[str, Any] | None:
+    """取一篇文档的待索引切片概况：数量、切片参数、切片时间。
 
-    重新切片后旧索引还在、能继续被检索，但运营最关心的是“这次切出来多少”；
-    因此只要存在待索引切片，就展示它，建立索引后再回到已索引数量。
+    没有待索引切片时返回 None。上传、重新切片、查询详情都要返回这些信息，
+    前端才能在同一行决定是否显示“去新建索引”，因此集中成一个函数，
+    避免每个入口各写一遍分组查询。
     """
-    drafts = await _draft_count(db, document_id)
-    if drafts:
-        return drafts
-    return await _chunk_count(db, document_id)
+    row = (
+        await db.execute(
+            select(
+                func.count(KbDraftChunk.id),
+                func.max(KbDraftChunk.chunk_size),
+                func.max(KbDraftChunk.chunk_overlap),
+                func.min(KbDraftChunk.created_at),
+            ).where(KbDraftChunk.document_id == document_id)
+        )
+    ).one()
+    count, chunk_size, chunk_overlap, created_at = row
+    if not count:
+        return None
+    return {
+        "count": int(count),
+        "chunkSize": int(chunk_size or 0),
+        "chunkOverlap": int(chunk_overlap or 0),
+        "chunkedAt": created_at,
+    }
+
+
+async def _document_view(db: AsyncSession, doc: KbDocument) -> dict[str, Any]:
+    """单篇文档的展示数据，带待索引切片信息。
+
+    为什么统一走这里：上传、重新切片、详情、建立索引都返回文档数据，
+    如果只有列表带 draftChunkCount，其他接口就会返回“切片数 2、待索引 0”
+    这种自相矛盾的结果，前端只能额外再查一次列表。
+    """
+    draft = await _draft_info(db, doc.id)
+    if draft:
+        return _document_payload(
+            doc,
+            draft["count"],
+            draft_chunk_count=draft["count"],
+            chunk_size=draft["chunkSize"],
+            chunk_overlap=draft["chunkOverlap"],
+            chunked_at=draft["chunkedAt"],
+        )
+    return _document_payload(doc, await _chunk_count(db, doc.id))
 
 
 async def _active_version(db: AsyncSession) -> KbIndexVersion | None:
@@ -329,30 +531,47 @@ async def list_documents(
     *,
     status: str | None = None,
     keyword: str | None = None,
-    limit: int = 100,
+    page: int = 1,
+    page_size: int = DEFAULT_PAGE_SIZE,
 ) -> dict[str, Any]:
-    """文档列表，附带每个文档的切片数量。
+    """文档列表，按页码分页，附带每个文档的切片数量与待索引状态。
 
     切片数量用一次分组查询批量取，避免每个文档都查一次数据库
     （也就是常见的“N + 1 查询”问题）。
+
+    为什么待索引切片的数量和参数也从这里返回：
+        管理后台已经合并成一个文档列表，不再单独请求“切片列表”。
+        一次分组查询顺带取出数量、切片长度、重叠长度和切片时间，
+        仍然是固定次数的查询，不会因为文档变多而变慢。
+
+    为什么要服务端分页：
+        文档会持续增加，不可能一次全部返回。页码分页（第几页、每页几条）
+        是后台管理最常见的做法：运营能看到总条数和页码，可以直接跳转，
+        而且每一页只查这一页的切片统计，页面再大也不会拖慢。
     """
-    limit = min(max(limit, 1), MAX_DOCUMENT_LIMIT)
+    page = max(page, 1)
+    page_size = min(max(page_size, 1), MAX_PAGE_SIZE)
     conditions = []
     if status:
         conditions.append(KbDocument.status == status.strip())
     if keyword:
         conditions.append(KbDocument.title.contains(keyword.strip()))
 
+    # 总数和列表用同一组筛选条件，否则会出现“总数 30、翻到第 2 页却没有数据”。
+    total = await db.scalar(
+        select(func.count()).select_from(KbDocument).where(*conditions)
+    )
     rows = (
         await db.scalars(
             select(KbDocument)
             .where(*conditions)
             .order_by(KbDocument.created_at.desc(), KbDocument.id.desc())
-            .limit(limit)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
         )
     ).all()
     counts: dict[str, int] = {}
-    draft_counts: dict[str, int] = {}
+    drafts: dict[str, dict[str, Any]] = {}
     if rows:
         document_ids = [doc.id for doc in rows]
         indexed_rows = (
@@ -365,19 +584,47 @@ async def list_documents(
         counts = {document_id: int(count) for document_id, count in indexed_rows}
         draft_rows = (
             await db.execute(
-                select(KbDraftChunk.document_id, func.count(KbDraftChunk.id))
+                select(
+                    KbDraftChunk.document_id,
+                    func.count(KbDraftChunk.id),
+                    func.max(KbDraftChunk.chunk_size),
+                    func.max(KbDraftChunk.chunk_overlap),
+                    func.min(KbDraftChunk.created_at),
+                )
                 .where(KbDraftChunk.document_id.in_(document_ids))
                 .group_by(KbDraftChunk.document_id)
             )
         ).all()
-        draft_counts = {document_id: int(count) for document_id, count in draft_rows}
-    return {
-        "items": [
+        drafts = {
+            document_id: {
+                "count": int(count),
+                "chunkSize": int(chunk_size or 0),
+                "chunkOverlap": int(chunk_overlap or 0),
+                "chunkedAt": created_at,
+            }
+            for document_id, count, chunk_size, chunk_overlap, created_at in draft_rows
+        }
+
+    items = []
+    for doc in rows:
+        draft = drafts.get(doc.id)
+        items.append(
             _document_payload(
-                doc, draft_counts.get(doc.id) or counts.get(doc.id, 0)
+                doc,
+                # 有半成品时展示半成品数量，运营最关心“这次切出来多少”。
+                draft["count"] if draft else counts.get(doc.id, 0),
+                draft_chunk_count=draft["count"] if draft else 0,
+                chunk_size=draft["chunkSize"] if draft else None,
+                chunk_overlap=draft["chunkOverlap"] if draft else None,
+                chunked_at=draft["chunkedAt"] if draft else None,
             )
-            for doc in rows
-        ]
+        )
+    # total 返回给前端计算总页数；page、pageSize 原样返回，前端不用自己猜。
+    return {
+        "items": items,
+        "total": int(total or 0),
+        "page": page,
+        "pageSize": page_size,
     }
 
 
@@ -563,7 +810,7 @@ async def _run_chunk(
         await _chunk_document(db, doc, text_content, version, admin, ip, action=action)
         return None
     except Exception as exc:  # noqa: BLE001 - 需要把任何失败都记录到文档状态
-        message = _error_text(exc)
+        message = error_text(exc)
         await db.rollback()
         failed = await db.get(KbDocument, document_id)
         if failed is not None:
@@ -608,9 +855,15 @@ async def _build_index(
     doc.updated_at = now_utc()
     await db.flush()
 
+    # 图片标记只用于后台预览，对语义检索没有帮助，还会浪费嵌入模型的输入长度；
+    # 因此送去向量化的是去掉图片后的文字。切片本身的内容保持不变。
+    # 如果某个切片只有一张图片、去掉后为空，用“（图片）”占位，避免给模型传空字符串。
+    embedding_texts = [
+        strip_media_markup(draft.content) or "（图片）" for draft in drafts
+    ]
     result = await embedding_service.embed_texts(
         db,
-        [draft.content for draft in drafts],
+        embedding_texts,
         subject_ref=f"kb:{doc.id}",
     )
 
@@ -665,7 +918,7 @@ async def _run_build(
         await _build_index(db, doc, admin, ip)
         return None
     except Exception as exc:  # noqa: BLE001 - 需要把任何失败都记录到文档状态
-        message = _error_text(exc)
+        message = error_text(exc)
         await db.rollback()
         failed = await db.get(KbDocument, document_id)
         if failed is not None:
@@ -685,14 +938,30 @@ async def upload_document(
     mime: str | None,
     data: bytes,
     ip: str | None,
+    images: list[tuple[str, bytes]] | None = None,
+    source_type: str = "upload",
+    import_batch_id: str | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     """上传文档：保存原文件并切片，不调用嵌入模型。
 
+    图片处理：
+        Markdown 里的图片通常是相对路径（例如 `![白灼虾](./白灼虾.webp)`），
+        浏览器不会自动把图片一起上传。管理后台把图片作为同一个表单的
+        `images` 字段一起提交，这里按文件名匹配，保存到文档自己的目录，
+        并把正文里的地址改写成本服务的 `/media/...` 地址，预览时就能直接显示。
+
     返回：
         (文档展示数据, 失败原因)。失败原因为空表示切片成功；
-        切片成功后文档状态是 chunked，需要再到切片列表建立索引。
+        切片成功后文档状态是 chunked，需要在文档列表点“去新建索引”才会生成向量。
+        展示数据额外带 imageCount（成功关联的图片数）和
+        unmatchedImageCount（正文里没匹配到上传文件的图片引用数）。
+
+    批量导入复用说明：
+        source_type 默认 upload，批量导入传入 batch_upload；
+        import_batch_id 记录这份文档来自哪个导入批次，
+        运营可以在批次详情里反查成功写入的文档，也方便以后按批次回滚。
     """
-    safe_name = _safe_filename(filename)
+    safe_name = safe_filename(filename)
     suffix = Path(safe_name).suffix.lower()
     if suffix not in ALLOWED_SUFFIXES:
         raise AppError(
@@ -704,6 +973,12 @@ async def upload_document(
         raise AppError(
             "KB_FILE_TOO_LARGE", "单个文件不能超过 5 MB", status_code=413
         )
+    if images and len(images) > MAX_KB_IMAGES:
+        raise AppError(
+            "KB_IMAGES_TOO_MANY",
+            f"一次最多上传 {MAX_KB_IMAGES} 张图片",
+            status_code=400,
+        )
 
     text_content = _decode_text(data)
     checksum = hashlib.sha256(data).hexdigest()
@@ -713,26 +988,53 @@ async def upload_document(
     if existing is not None:
         raise AppError(
             "KB_DOCUMENT_DUPLICATE",
-            f"相同内容的文档已存在：{existing.title}",
+            f"相同内容的文档已存在：{existing.title}。如需补充图片，请先删除旧文档再重新上传",
             status_code=409,
+        )
+
+    # 先逐张校验，任何一张不合格都在写文件之前失败，避免留下半套图片。
+    prepared_images: dict[str, tuple[str, bytes]] = {}
+    for raw_name, raw_data in images or []:
+        image_name = safe_filename(raw_name or "image.png")
+        validate_image(image_name, raw_data)
+        # 匹配键用上传时的原始文件名：它才和 Markdown 里写的名字一致；
+        # 真正落盘的名称用清洗后的 image_name，保证存储路径安全。
+        prepared_images[_image_basename(raw_name or image_name)] = (
+            image_name,
+            raw_data,
         )
 
     version = await ensure_active_version(db)
     document_id = new_id("kbd")
+
+    # 图片统一放在文档自己的目录下，删除文档时可以按前缀整体清理。
+    image_keys: dict[str, str] = {}
+    for match_key, (image_name, image_data) in prepared_images.items():
+        image_key = f"kb/{document_id}/images/{image_name}"
+        get_storage().put(image_key, image_data)
+        image_keys[match_key] = image_key
+
+    # 保存“改写后”的正文：重新切片时直接读这份文件，图片地址仍然是可访问的。
+    rewritten_text, image_count, unmatched_image_count = _rewrite_markdown_images(
+        text_content, image_keys
+    )
     storage_key = f"kb/{document_id}/{safe_name}"
-    get_storage().put(storage_key, data)
+    get_storage().put(storage_key, rewritten_text.encode("utf-8"))
 
     doc = KbDocument(
         id=document_id,
         title=(title or Path(safe_name).stem).strip()[:120],
-        source_type="upload",
+        source_type=source_type,
         storage_key=storage_key,
         mime=mime or ("text/markdown" if suffix == ".md" else "text/plain"),
+        # bytes 记录原始上传大小，便于运营判断文件体量；存盘内容是改写后的正文。
         bytes=len(data),
         checksum=checksum,
         status="parsing",
         # 还没建立索引，因此先不指向任何版本；点“建立索引”成功后再写入。
         index_version_id=None,
+        # 单篇上传时为空；批量导入时记录所属批次，便于按批次追踪与回滚。
+        import_batch_id=import_batch_id,
         uploaded_by=admin.id,
         created_at=now_utc(),
         updated_at=now_utc(),
@@ -743,10 +1045,15 @@ async def upload_document(
     await db.commit()
 
     error = await _run_chunk(
-        db, doc, text_content, version, admin, ip, action="kb.document.upload"
+        db, doc, rewritten_text, version, admin, ip, action="kb.document.upload"
     )
     refreshed = await db.get(KbDocument, document_id)
-    payload = _document_payload(refreshed, await _effective_chunk_count(db, document_id))
+    payload = await _document_view(db, refreshed)
+    payload["imageCount"] = image_count
+    payload["unmatchedImageCount"] = unmatched_image_count
+    # 这里特意不自动生成菜谱：上传只负责“存资料 + 切片”，
+    # 是否要把资料变成菜谱由运营决定（文档行“生成菜谱”或批量生成），
+    # 避免批量导入几百篇时悄悄创建一批没人核对的草稿。
     return payload, error
 
 
@@ -754,7 +1061,7 @@ async def get_document(db: AsyncSession, document_id: str) -> dict[str, Any]:
     doc = await db.get(KbDocument, document_id)
     if doc is None:
         raise AppError("KB_DOCUMENT_NOT_FOUND", "文档不存在", status_code=404)
-    return _document_payload(doc, await _effective_chunk_count(db, document_id))
+    return await _document_view(db, doc)
 
 
 async def rechunk_document(
@@ -793,7 +1100,7 @@ async def rechunk_document(
         db, doc, text_content, version, admin, ip, action="kb.document.rechunk"
     )
     refreshed = await db.get(KbDocument, document_id)
-    payload = _document_payload(refreshed, await _effective_chunk_count(db, document_id))
+    payload = await _document_view(db, refreshed)
     return payload, error
 
 
@@ -822,57 +1129,8 @@ async def build_index(
 
     error = await _run_build(db, doc, admin, ip)
     refreshed = await db.get(KbDocument, document_id)
-    payload = _document_payload(refreshed, await _effective_chunk_count(db, document_id))
+    payload = await _document_view(db, refreshed)
     return payload, error
-
-
-async def list_chunk_sets(db: AsyncSession) -> dict[str, Any]:
-    """切片列表：所有“切好但还没建立索引”的文档分组。
-
-    用分组查询一次拿到每篇文档的切片数、切片参数和最早切片时间，
-    避免先查文档再逐个查切片（N + 1 查询）。
-    """
-    rows = (
-        await db.execute(
-            select(
-                KbDraftChunk.document_id,
-                func.count(KbDraftChunk.id),
-                func.max(KbDraftChunk.chunk_size),
-                func.max(KbDraftChunk.chunk_overlap),
-                func.min(KbDraftChunk.created_at),
-            )
-            .group_by(KbDraftChunk.document_id)
-            .order_by(func.min(KbDraftChunk.created_at).desc())
-        )
-    ).all()
-    if not rows:
-        return {"items": []}
-
-    document_ids = [row[0] for row in rows]
-    documents = (
-        await db.scalars(select(KbDocument).where(KbDocument.id.in_(document_ids)))
-    ).all()
-    document_map = {doc.id: doc for doc in documents}
-
-    items: list[dict[str, Any]] = []
-    for document_id, count, chunk_size, chunk_overlap, created_at in rows:
-        doc = document_map.get(document_id)
-        if doc is None:
-            continue
-        items.append(
-            {
-                "documentId": doc.id,
-                "title": doc.title,
-                "status": doc.status,
-                "errorMessage": doc.error_message,
-                "chunkCount": int(count),
-                "chunkSize": int(chunk_size or 0),
-                "chunkOverlap": int(chunk_overlap or 0),
-                "createdAt": iso(created_at),
-                "updatedAt": iso(doc.updated_at),
-            }
-        )
-    return {"items": items}
 
 
 async def delete_document(
@@ -885,6 +1143,8 @@ async def delete_document(
 
     数据库记录直接物理删除：知识库文档不是用户内容，不需要保留软删除痕迹；
     删除动作本身会写入审计日志，可以追溯谁在什么时候删了什么。
+    图片和原始文件都放在 `kb/<文档编号>/` 下，这里按前缀整体清理，
+    避免文档删除后图片变成无人引用的孤儿文件。
     """
     doc = await db.get(KbDocument, document_id)
     if doc is None:
@@ -894,6 +1154,8 @@ async def delete_document(
     await db.execute(delete(KbChunk).where(KbChunk.document_id == doc.id))
     await db.execute(delete(KbDraftChunk).where(KbDraftChunk.document_id == doc.id))
     get_storage().delete(doc.storage_key)
+    # 图片和原始文件都在 kb/<文档编号>/ 下，按目录整体清理，避免留下空目录或孤儿图片。
+    get_storage().delete_prefix(f"kb/{doc.id}")
     write_audit(
         db,
         actor=admin,
@@ -906,6 +1168,257 @@ async def delete_document(
     await db.delete(doc)
     await db.commit()
     return {"id": document_id, "deleted": True}
+
+
+async def batch_delete_documents(
+    db: AsyncSession,
+    admin: AdminUser,
+    document_ids: list[str],
+    ip: str | None,
+) -> dict[str, Any]:
+    """批量删除知识库文档：逐条删除、逐条提交，并返回每条的结果。
+
+    为什么逐条提交，而不是把整批放进一个事务：
+        删除文档不只改数据库，还要清理对象存储里的原文件与图片；
+        文件删除不参与数据库事务，一旦整批回滚，已经删掉的文件也回不来。
+        逐条提交能让“数据库记录”和“文件清理”一一对应，
+        也不会因为第 3 篇不存在，就把前 2 篇已经做完的删除回滚掉。
+    为什么失败不中断：
+        运营勾选 10 篇里可能有 1 篇已被别人删除；这时其余 9 篇仍然应该删掉，
+        接口把失败项单独列出来，前端可以只提示这几篇。
+    哪里用到：
+        管理后台知识库文档列表的“批量删除”按钮。
+    """
+    results: list[dict[str, Any]] = []
+    succeeded = 0
+    for document_id in document_ids:
+        try:
+            await delete_document(db, admin, document_id, ip)
+            succeeded += 1
+            results.append({"documentId": document_id, "ok": True})
+        except AppError as exc:
+            results.append(
+                {
+                    "documentId": document_id,
+                    "ok": False,
+                    "errorCode": exc.code,
+                    "message": exc.message,
+                }
+            )
+    return {
+        "succeeded": succeeded,
+        "failed": len(results) - succeeded,
+        "results": results,
+    }
+
+
+async def batch_rechunk_documents(
+    db: AsyncSession,
+    admin: AdminUser,
+    document_ids: list[str],
+    ip: str | None,
+) -> dict[str, Any]:
+    """批量重新切片：逐篇执行，返回每篇结果。
+
+    为什么逐篇执行而不是一个事务：
+        重新切片会删除旧切片再写入新切片，篇与篇之间没有关联；
+        逐篇处理时某一篇失败不会影响其他篇，前端也能准确列出失败项。
+    为什么限制数量：
+        每篇都要读取原文件并重新切分，数量太多会让请求长时间占用连接；
+        批次操作固定上限 20 篇，超过时提示运营分批处理。
+    """
+    results: list[dict[str, Any]] = []
+    succeeded = 0
+    for document_id in document_ids:
+        doc = await db.get(KbDocument, document_id)
+        title = doc.title if doc else ""
+        try:
+            _, error = await rechunk_document(db, admin, document_id, ip)
+            if error:
+                results.append(
+                    {
+                        "documentId": document_id,
+                        "title": title,
+                        "ok": False,
+                        "message": error,
+                    }
+                )
+                continue
+            succeeded += 1
+            results.append({"documentId": document_id, "title": title, "ok": True})
+        except AppError as exc:
+            results.append(
+                {
+                    "documentId": document_id,
+                    "title": title,
+                    "ok": False,
+                    "errorCode": exc.code,
+                    "message": exc.message,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - 单篇失败不能拖垮整批
+            await db.rollback()
+            results.append(
+                {
+                    "documentId": document_id,
+                    "title": title,
+                    "ok": False,
+                    "message": error_text(exc),
+                }
+            )
+    return {
+        "succeeded": succeeded,
+        "failed": len(results) - succeeded,
+        "skipped": 0,
+        "results": results,
+    }
+
+
+async def batch_generate_recipe_drafts(
+    db: AsyncSession,
+    admin: AdminUser,
+    document_ids: list[str],
+    ip: str | None,
+) -> dict[str, Any]:
+    """批量生成菜谱草稿：逐篇解析，返回每篇结果。
+
+    生成草稿是幂等操作：已有草稿会被更新，已发布菜谱会被跳过，
+    因此运营可以放心对同一批文档重复点击。
+    """
+    results: list[dict[str, Any]] = []
+    succeeded = 0
+    skipped = 0
+    for document_id in document_ids:
+        doc = await db.get(KbDocument, document_id)
+        title = doc.title if doc else ""
+        try:
+            draft = await kb_recipe_service.generate_draft(db, admin, document_id, ip)
+            if draft["skipped"]:
+                skipped += 1
+                results.append(
+                    {
+                        "documentId": document_id,
+                        "title": title,
+                        "ok": False,
+                        "skipped": True,
+                        "message": draft["message"],
+                    }
+                )
+                continue
+            succeeded += 1
+            results.append(
+                {
+                    "documentId": document_id,
+                    "title": draft["title"],
+                    "ok": True,
+                    "message": draft["message"],
+                }
+            )
+        except AppError as exc:
+            results.append(
+                {
+                    "documentId": document_id,
+                    "title": title,
+                    "ok": False,
+                    "errorCode": exc.code,
+                    "message": exc.message,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - 单篇失败不能拖垮整批
+            await db.rollback()
+            results.append(
+                {
+                    "documentId": document_id,
+                    "title": title,
+                    "ok": False,
+                    "message": error_text(exc),
+                }
+            )
+    return {
+        "succeeded": succeeded,
+        "failed": len(results) - succeeded - skipped,
+        "skipped": skipped,
+        "results": results,
+    }
+
+
+async def batch_build_index(
+    db: AsyncSession,
+    admin: AdminUser,
+    document_ids: list[str],
+    ip: str | None,
+) -> dict[str, Any]:
+    """批量建立索引：逐篇调用嵌入模型并写入向量。
+
+    这是三个批量操作里最慢的一个：每篇都要调用外部嵌入接口。
+    因此数量上限同样是 20 篇，并且前端请求超时要放宽到分钟级；
+    再大的批量应该改成后台任务，当前版本先保证运营能一次处理一页。
+    """
+    results: list[dict[str, Any]] = []
+    succeeded = 0
+    skipped = 0
+    for document_id in document_ids:
+        doc = await db.get(KbDocument, document_id)
+        title = doc.title if doc else ""
+        if doc is not None and await _draft_count(db, document_id) == 0:
+            skipped += 1
+            results.append(
+                {
+                    "documentId": document_id,
+                    "title": title,
+                    "ok": False,
+                    "skipped": True,
+                    "message": "没有待建立索引的切片，已跳过",
+                }
+            )
+            continue
+        try:
+            payload, error = await build_index(db, admin, document_id, ip)
+            if error or payload.get("status") != "ready":
+                results.append(
+                    {
+                        "documentId": document_id,
+                        "title": title,
+                        "ok": False,
+                        "message": error or payload.get("errorMessage") or "建立索引失败",
+                    }
+                )
+                continue
+            succeeded += 1
+            results.append(
+                {
+                    "documentId": document_id,
+                    "title": title,
+                    "ok": True,
+                    "message": f"已写入 {payload.get('chunkCount', 0)} 个切片",
+                }
+            )
+        except AppError as exc:
+            results.append(
+                {
+                    "documentId": document_id,
+                    "title": title,
+                    "ok": False,
+                    "errorCode": exc.code,
+                    "message": exc.message,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - 单篇失败不能拖垮整批
+            await db.rollback()
+            results.append(
+                {
+                    "documentId": document_id,
+                    "title": title,
+                    "ok": False,
+                    "message": error_text(exc),
+                }
+            )
+    return {
+        "succeeded": succeeded,
+        "failed": len(results) - succeeded - skipped,
+        "skipped": skipped,
+        "results": results,
+    }
 
 
 async def list_chunks(

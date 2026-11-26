@@ -5,17 +5,18 @@
 2. 埋点批量上报、幂等去重、登录账号回填；
 3. 饭帖批量审核；
 4. 用户详情查看发布（不含草稿）；
-5. 后台菜谱增改查与下架；
+5. 后台菜谱增改查、下架与批量上下架/删除；
 6. 口味标签字典维护；
 7. 管理员与角色管理、权限即时生效；
-8. 数据看板聚合。
+8. 数据看板聚合；
+9. 后台列表统一页码分页。
 """
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.security import read_session_token
-from app.db.models import AnalyticsEvent, MealPost, Session
+from app.db.models import AnalyticsEvent, MealPost, Recipe, RecipeCategory, Session
 from app.main import app
 from tests.conftest import API, auth_headers, data_of, login
 
@@ -272,6 +273,270 @@ async def test_admin_recipe_crud(client):
     # 下架后普通用户菜谱列表不可见。
     public = data_of(await client.get(f"{API}/recipes"))
     assert recipe_id not in [item["id"] for item in public["items"]]
+
+
+@pytest.mark.asyncio
+async def test_admin_recipe_batch_operations(client):
+    """批量上架、下架、删除：逐条返回结果，被饭帖引用的菜谱不能删除。"""
+    headers = auth_headers(await login_as_admin(client))
+
+    async def create(title: str, status: str) -> str:
+        response = await client.post(
+            f"{API}/admin/recipes",
+            json={
+                "title": title,
+                "coverUrl": "seed/food_3.jpg",
+                "totalMinutes": 10,
+                "categoryCodes": ["quick"],
+                "ingredients": [{"name": "鸡蛋", "amount": "2 个"}],
+                "steps": ["炒熟"],
+                "status": status,
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        return data_of(response)["id"]
+
+    published_id = await create("批量测试已发布", "published")
+    draft_id = await create("批量测试草稿", "draft")
+    spare_id = await create("批量测试待删除", "published")
+
+    # 1. 批量下架：已发布的和草稿都会变成 archived。
+    archived = data_of(
+        await client.post(
+            f"{API}/admin/recipes/batch-archive",
+            json={"recipeIds": [published_id, draft_id]},
+            headers=headers,
+        )
+    )
+    assert archived["succeeded"] == 2
+    assert archived["failed"] == 0
+
+    # 2. 重复下架：状态没变，记为跳过而不是失败。
+    archived_again = data_of(
+        await client.post(
+            f"{API}/admin/recipes/batch-archive",
+            json={"recipeIds": [published_id, draft_id]},
+            headers=headers,
+        )
+    )
+    assert archived_again["succeeded"] == 0
+    assert archived_again["skipped"] == 2
+
+    # 3. 批量上架：下架的菜谱重新可见。
+    published = data_of(
+        await client.post(
+            f"{API}/admin/recipes/batch-publish",
+            json={"recipeIds": [published_id, draft_id]},
+            headers=headers,
+        )
+    )
+    assert published["succeeded"] == 2
+    detail = data_of(await client.get(f"{API}/admin/recipes/{draft_id}", headers=headers))
+    assert detail["status"] == "published"
+
+    # 造一条引用平台菜谱的饭帖，用来验证删除保护。
+    async with app.state.test_session_factory() as db:
+        db.add(
+            MealPost(
+                id="p_batch_recipe_ref",
+                author_id="u_adao",
+                title="引用平台菜谱",
+                review="这道菜来自平台菜谱，删除菜谱后历史饭帖会失去来源。",
+                source="platform",
+                image_asset_ids=["m_seed_1"],
+                platform_recipe_id=published_id,
+                status="published",
+            )
+        )
+        await db.commit()
+
+    # 4. 批量删除：被引用的跳过，其余物理删除。
+    deleted = data_of(
+        await client.post(
+            f"{API}/admin/recipes/batch-delete",
+            json={"recipeIds": [published_id, draft_id, spare_id]},
+            headers=headers,
+        )
+    )
+    assert deleted["succeeded"] == 2
+    assert deleted["skipped"] == 1
+    skipped = [item for item in deleted["results"] if item.get("skipped")]
+    assert skipped[0]["recipeId"] == published_id
+
+    async with app.state.test_session_factory() as db:
+        # 被引用的菜谱仍然存在；其余菜谱和它们的分类关联都已删除。
+        assert await db.get(Recipe, published_id) is not None
+        assert await db.get(Recipe, draft_id) is None
+        assert await db.get(Recipe, spare_id) is None
+        category_count = await db.scalar(
+            select(func.count())
+            .select_from(RecipeCategory)
+            .where(RecipeCategory.recipe_id.in_([draft_id, spare_id]))
+        )
+        assert category_count == 0
+
+    # 5. 一条不存在的编号只影响自己，其余照常处理。
+    missing = data_of(
+        await client.post(
+            f"{API}/admin/recipes/batch-archive",
+            json={"recipeIds": ["r_not_exists"]},
+            headers=headers,
+        )
+    )
+    assert missing["failed"] == 1
+    assert missing["results"][0]["errorCode"] == "RECIPE_NOT_FOUND"
+
+    # 6. 超过 50 条时由请求模型直接拒绝，避免一次请求长时间占用连接。
+    too_many = await client.post(
+        f"{API}/admin/recipes/batch-delete",
+        json={"recipeIds": [f"r_many_{index}" for index in range(51)]},
+        headers=headers,
+    )
+    assert too_many.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_published_recipe_without_category_defaults_to_recommended(client):
+    """没有分类的菜谱上架后必须出现在 App 的“推荐”列表里。
+
+    回归背景：知识库生成的草稿分类为空，批量上架后状态确实是 published，
+    但客户端列表按分类关联表筛选，导致这些菜谱在 App 里完全看不到，
+    表现为“管理后台已发布、移动端没有同步”。
+    """
+    headers = auth_headers(await login_as_admin(client))
+
+    # 1. 直接以已发布状态创建且不选分类：创建接口自动补“推荐”。
+    created = data_of(
+        await client.post(
+            f"{API}/admin/recipes",
+            json={
+                "title": "无分类直接发布",
+                "coverUrl": "seed/food_3.jpg",
+                "totalMinutes": 10,
+                "ingredients": [{"name": "鸡蛋", "amount": "2 个"}],
+                "steps": ["炒熟"],
+                "status": "published",
+            },
+            headers=headers,
+        )
+    )
+    assert created["categories"] == ["recommended"]
+    public = data_of(await client.get(f"{API}/recipes", params={"limit": 50}))
+    assert created["id"] in [item["id"] for item in public["items"]]
+
+    # 2. 草稿创建时分类为空，批量上架时同样要补“推荐”，并写入关联表。
+    draft = data_of(
+        await client.post(
+            f"{API}/admin/recipes",
+            json={
+                "title": "无分类草稿上架",
+                "coverUrl": "seed/food_3.jpg",
+                "totalMinutes": 10,
+                "ingredients": [{"name": "鸡蛋", "amount": "2 个"}],
+                "steps": ["炒熟"],
+                "status": "draft",
+            },
+            headers=headers,
+        )
+    )
+    assert draft["categories"] == []
+    published = data_of(
+        await client.post(
+            f"{API}/admin/recipes/batch-publish",
+            json={"recipeIds": [draft["id"]]},
+            headers=headers,
+        )
+    )
+    assert published["succeeded"] == 1
+    detail = data_of(
+        await client.get(f"{API}/admin/recipes/{draft['id']}", headers=headers)
+    )
+    assert detail["categories"] == ["recommended"]
+    public_after = data_of(await client.get(f"{API}/recipes", params={"limit": 50}))
+    assert draft["id"] in [item["id"] for item in public_after["items"]]
+
+
+@pytest.mark.asyncio
+async def test_admin_lists_use_page_pagination(client):
+    """后台列表统一返回页码分页结构：items、total、page、pageSize。"""
+    headers = auth_headers(await login_as_admin(client))
+
+    # 饭帖：每页 2 条，前后两页不能出现同一条。
+    posts_page1 = data_of(
+        await client.get(
+            f"{API}/admin/posts", params={"page": 1, "pageSize": 2}, headers=headers
+        )
+    )
+    posts_page2 = data_of(
+        await client.get(
+            f"{API}/admin/posts", params={"page": 2, "pageSize": 2}, headers=headers
+        )
+    )
+    assert posts_page1["page"] == 1
+    assert posts_page1["pageSize"] == 2
+    assert posts_page1["total"] >= 4
+    assert len(posts_page1["items"]) == 2
+    first_ids = {item["id"] for item in posts_page1["items"]}
+    second_ids = {item["id"] for item in posts_page2["items"]}
+    assert first_ids.isdisjoint(second_ids)
+
+    # 用户：返回总数，并允许切换每页条数。
+    users = data_of(
+        await client.get(
+            f"{API}/admin/users", params={"page": 1, "pageSize": 3}, headers=headers
+        )
+    )
+    assert users["page"] == 1
+    assert users["pageSize"] == 3
+    assert users["total"] >= 3
+    assert len(users["items"]) == 3
+
+    # 菜谱：第一页和第二页的编号不重复。
+    recipes_page1 = data_of(
+        await client.get(
+            f"{API}/admin/recipes", params={"page": 1, "pageSize": 1}, headers=headers
+        )
+    )
+    recipes_page2 = data_of(
+        await client.get(
+            f"{API}/admin/recipes", params={"page": 2, "pageSize": 1}, headers=headers
+        )
+    )
+    assert recipes_page1["total"] >= 2
+    assert recipes_page1["items"][0]["id"] != recipes_page2["items"][0]["id"]
+
+    # 先做一次写操作，确保审计日志里至少有本次创建的记录。
+    await client.post(
+        f"{API}/admin/recipes",
+        json={
+            "title": "分页测试菜谱",
+            "coverUrl": "seed/food_3.jpg",
+            "totalMinutes": 10,
+            "ingredients": [{"name": "鸡蛋", "amount": "2 个"}],
+            "steps": ["炒熟"],
+            "status": "draft",
+        },
+        headers=headers,
+    )
+    audit = data_of(
+        await client.get(
+            f"{API}/admin/audit-logs", params={"page": 1, "pageSize": 5}, headers=headers
+        )
+    )
+    assert audit["total"] >= 1
+    assert audit["page"] == 1
+    assert audit["pageSize"] == 5
+
+    # AI 调用日志：即使暂时没有记录，也要返回完整的分页结构。
+    ai_logs = data_of(
+        await client.get(
+            f"{API}/admin/ai-call-logs", params={"page": 1, "pageSize": 5}, headers=headers
+        )
+    )
+    assert ai_logs["page"] == 1
+    assert ai_logs["pageSize"] == 5
+    assert ai_logs["total"] >= 0
 
 
 @pytest.mark.asyncio

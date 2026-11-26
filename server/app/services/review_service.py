@@ -10,10 +10,9 @@
 这样前端网络重试、用户连点都不会产生重复写入。
 """
 
-from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.serializers import authors_map, iso, media_map
@@ -22,21 +21,10 @@ from app.core.security import decrypt_phone, mask_phone
 from app.db.models import AdminUser, MealPost, Recipe, User
 from app.services.audit_service import write_audit
 from app.services.cache import delete_key
-from app.utils.cursor import decode_cursor, encode_cursor
 from app.utils.time import business_date, now_utc
 
 POST_STATUSES = {"pending_review", "published", "rejected", "unpublished", "deleted"}
 MAX_PAGE_SIZE = 50
-
-
-def _parse_dt(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def _snapshot(post: MealPost) -> dict[str, Any]:
@@ -100,20 +88,26 @@ async def list_admin_posts(
     db: AsyncSession,
     *,
     status: str | None,
-    cursor: str | None,
-    limit: int,
+    page: int,
+    page_size: int,
     author_id: str | None = None,
 ) -> dict[str, Any]:
-    """后台饭帖列表，支持按状态、作者筛选和游标分页。
+    """后台饭帖列表，支持按状态、作者筛选和页码分页。
 
     默认按创建时间倒序：新提交的内容排在前面，审核人员先处理最新的。
     author_id 用于用户详情的“查看发布”，复用同一套返回字段，
     避免后台出现两套饭帖摘要格式。
+
+    为什么从游标分页改成页码分页：
+        管理后台的列表需要“第几页/共几页”和跳页，运营核对数据时经常要来回翻；
+        游标分页只能一直往后加载，满足不了这种操作习惯。
+        公开信息流仍然使用游标分页，因为客户端是无限滚动，不需要跳页。
     """
     if status and status not in POST_STATUSES:
         raise AppError("POST_STATUS_INVALID", "饭帖状态筛选值不正确")
 
-    limit = min(max(limit, 1), MAX_PAGE_SIZE)
+    page_size = min(max(page_size, 1), MAX_PAGE_SIZE)
+    page = max(page, 1)
     conditions = []
     if author_id:
         conditions.append(MealPost.author_id == author_id)
@@ -124,33 +118,24 @@ async def list_admin_posts(
         # 草稿是用户没写完的私人内容，已删除内容也不应再占用审核视线。
         conditions.append(MealPost.status.notin_(["draft", "deleted"]))
 
-    cursor_data = decode_cursor(cursor)
-    if cursor:
-        created = _parse_dt(cursor_data.get("createdAt") if cursor_data else None)
-        cursor_id = cursor_data.get("id") if cursor_data else None
-        if created is None or not cursor_id:
-            raise AppError("CURSOR_INVALID", "分页游标无效，请刷新后重试")
-        conditions.append(
-            or_(
-                MealPost.created_at < created,
-                and_(MealPost.created_at == created, MealPost.id < cursor_id),
-            )
-        )
-
+    # 先算总数再取当前页：前端要显示“共 N 条”，也要据此判断总页数。
+    # count 查询不加载整行数据，比取回全部记录再数一遍便宜得多。
+    total = int(
+        await db.scalar(select(func.count()).select_from(MealPost).where(*conditions)) or 0
+    )
     rows = (
         await db.scalars(
             select(MealPost)
             .where(*conditions)
             .order_by(MealPost.created_at.desc(), MealPost.id.desc())
-            .limit(limit + 1)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
         )
     ).all()
-    has_more = len(rows) > limit
-    page = rows[:limit]
 
-    authors = await authors_map(db, page)
-    images = await media_map(db, page)
-    reviewers = await _reviewer_names(db, page)
+    authors = await authors_map(db, rows)
+    images = await media_map(db, rows)
+    reviewers = await _reviewer_names(db, rows)
 
     items = [
         _post_payload(
@@ -159,14 +144,15 @@ async def list_admin_posts(
             images.get(post.id, []),
             reviewers.get(post.reviewed_by or ""),
         )
-        for post in page
+        for post in rows
     ]
 
-    next_cursor = None
-    if has_more and page:
-        last = page[-1]
-        next_cursor = encode_cursor({"createdAt": last.created_at.isoformat(), "id": last.id})
-    return {"items": items, "nextCursor": next_cursor, "hasMore": has_more}
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+    }
 
 
 async def get_admin_post(db: AsyncSession, post_id: str) -> dict[str, Any]:

@@ -5,10 +5,18 @@ export interface ApiEnvelope<T> {
   data: T
 }
 
+/**
+ * 管理后台统一的分页结果。
+ *
+ * 后台列表全部改成“页码 + 每页条数 + 总数”：
+ * 运营需要看到当前第几页、一共多少条，并直接跳到某一页；
+ * 客户端的无限滚动仍然使用游标分页，两者场景不同。
+ */
 export interface PageResult<T> {
   items: T[]
-  nextCursor: string | null
-  hasMore: boolean
+  total: number
+  page: number
+  pageSize: number
 }
 
 export interface AdminProfile {
@@ -103,15 +111,15 @@ export interface AuditLogItem {
 
 export interface PostListParams {
   status?: string
-  cursor?: string
-  limit?: number
+  page?: number
+  pageSize?: number
 }
 
 export interface UserListParams {
   keyword?: string
   status?: string
-  cursor?: string
-  limit?: number
+  page?: number
+  pageSize?: number
 }
 
 export interface AuditListParams {
@@ -121,8 +129,8 @@ export interface AuditListParams {
   targetId?: string
   startAt?: string
   endAt?: string
-  cursor?: string
-  limit?: number
+  page?: number
+  pageSize?: number
 }
 
 export interface DashboardSummary {
@@ -203,8 +211,26 @@ export interface RecipeForm {
 export interface RecipeListParams {
   keyword?: string
   status?: string
-  cursor?: string
-  limit?: number
+  page?: number
+  pageSize?: number
+}
+
+/** 批量上架 / 下架 / 删除菜谱时，后端返回的单条处理结果。 */
+export interface RecipeBatchOperationItem {
+  recipeId: string
+  title: string
+  ok: boolean
+  skipped?: boolean
+  message?: string
+  errorCode?: string
+}
+
+/** 批量菜谱操作的汇总结果：成功、失败、跳过分别计数。 */
+export interface RecipeBatchResult {
+  succeeded: number
+  failed: number
+  skipped: number
+  results: RecipeBatchOperationItem[]
 }
 
 export interface TasteTagItem {
@@ -252,8 +278,8 @@ export interface RoleListResult {
 
 export interface UserPostParams {
   status?: string
-  cursor?: string
-  limit?: number
+  page?: number
+  pageSize?: number
 }
 
 export interface AIProviderItem {
@@ -318,7 +344,40 @@ export interface AICallLogItem {
 export interface AICallLogParams {
   status?: string
   providerId?: string
-  limit?: number
+  page?: number
+  pageSize?: number
+}
+
+/** 一次调用过程中的单个执行步骤，详情页按 seq 升序拼成时间线。 */
+export interface AICallTraceItem {
+  id: string
+  seq: number
+  step: string
+  title: string
+  status: string
+  detail: string | null
+  durationMs: number
+  createdAt: string
+}
+
+export interface AICallLogDetail extends AICallLogItem {
+  traces: AICallTraceItem[]
+}
+
+export interface KbBatchOperationItem {
+  documentId: string
+  title: string
+  ok: boolean
+  skipped?: boolean
+  message?: string
+  errorCode?: string
+}
+
+export interface KbBatchOperationResult {
+  succeeded: number
+  failed: number
+  skipped: number
+  results: KbBatchOperationItem[]
 }
 
 export interface KbDocumentItem {
@@ -340,8 +399,75 @@ export interface KbDocumentItem {
   indexVersionId: string | null
   uploadedBy: string | null
   chunkCount: number
+  /** 仅上传响应返回：成功关联到 Markdown 引用的图片数量。 */
+  imageCount?: number
+  /** 仅上传响应返回：正文里有、但没有匹配到上传文件的图片引用数量。 */
+  unmatchedImageCount?: number
+  /** 待建立索引的切片数量；大于 0 时列表显示“去新建索引”。 */
+  draftChunkCount: number
+  /** 待索引切片的长度；没有待索引切片时为 null。 */
+  chunkSize: number | null
+  /** 待索引切片的相邻重叠长度；没有待索引切片时为 null。 */
+  chunkOverlap: number | null
+  /** 待索引切片的生成时间；没有待索引切片时为 null。 */
+  chunkedAt: string | null
   createdAt: string
   updatedAt: string
+}
+
+/** 批量删除知识库文档的逐条结果。 */
+export interface KbBatchDeleteResult {
+  succeeded: number
+  failed: number
+  results: Array<{
+    documentId: string
+    ok: boolean
+    errorCode?: string
+    message?: string
+  }>
+}
+
+/** 批量导入中的一个文件任务。 */
+export interface KbImportJobItem {
+  id: string
+  /** 文件夹或压缩包内的相对路径，例如 资料/菜谱/白灼虾.md。 */
+  relativePath: string
+  filename: string
+  title: string
+  status: 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped' | 'dead'
+  errorMessage: string | null
+  /** 第几次处理；重试后递增。 */
+  attempts: number
+  documentId: string | null
+  chunkCount: number
+  imageCount: number
+  unmatchedImageCount: number
+  updatedAt: string
+}
+
+/** 一次批量导入的整体状态与统计。 */
+export interface KbImportBatchItem {
+  id: string
+  /** 批次名称：运营手填、压缩包文件名或文件夹名。 */
+  label: string
+  status: 'pending' | 'running' | 'succeeded' | 'partial' | 'failed'
+  stats: {
+    total: number
+    pending: number
+    running: number
+    succeeded: number
+    failed: number
+    skipped: number
+    images: number
+    ignored: number
+    unusedImages: number
+    /** 未被任何文档引用的图片，给出相对路径方便定位（如 `recipes/img/封面.png`）。 */
+    unusedImagePaths?: string[]
+  }
+  errorMessage: string | null
+  createdAt: string
+  finishedAt: string | null
+  items: KbImportJobItem[]
 }
 
 export interface KbIndexVersionItem {
@@ -383,19 +509,6 @@ export interface KbChunkPage {
   hasMore: boolean
   /** draft：待建立索引的切片；indexed：已经建立索引的切片。 */
   source: 'draft' | 'indexed'
-}
-
-/** 切片列表中的一行：一篇文档切好但还没建立索引的切片。 */
-export interface KbChunkSetItem {
-  documentId: string
-  title: string
-  status: string
-  errorMessage: string | null
-  chunkCount: number
-  chunkSize: number
-  chunkOverlap: number
-  createdAt: string
-  updatedAt: string
 }
 
 export interface KbSearchParams {

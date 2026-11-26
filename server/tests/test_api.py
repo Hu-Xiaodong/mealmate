@@ -6,6 +6,7 @@ from datetime import timedelta
 from conftest import API, auth_headers, data_of, login
 from PIL import Image
 
+from app.core.config import settings
 from app.db.models import MealPost
 from app.main import app
 from app.services.map_service import parse_place_items
@@ -332,6 +333,7 @@ async def test_ai_guest_quota_and_recommendations(client):
         data = data_of(resp)
         assert data["origin"] == "ai_reference"
         assert data["quota"] == {
+            "enabled": True,
             "limit": 5,
             "used": expected_used,
             "remaining": 5 - expected_used,
@@ -343,6 +345,29 @@ async def test_ai_guest_quota_and_recommendations(client):
     assert exceeded.status_code == 429
     assert exceeded.json()["code"] == "AI_QUOTA_EXCEEDED"
     assert exceeded.json()["data"] == {"limit": 5, "used": 5}
+
+
+async def test_ai_quota_can_be_paused(client, monkeypatch):
+    """暂停每日次数限制后，超过原额度也继续返回结果，但不再显示剩余次数。
+
+    仍然累计 used，是为了保留真实用量，方便以后恢复限制；
+    quota.enabled=false 告诉客户端隐藏“今日剩余 N 次”。
+    """
+    monkeypatch.setattr(settings, "guest_ai_daily_limit", 1)
+    monkeypatch.setattr(settings, "ai_daily_limit_enabled", False)
+    headers = {"X-Device-Id": "guest-quota-paused"}
+    body = {"message": "随便推荐一道菜"}
+
+    for expected_used in (1, 2):
+        resp = await client.post(f"{API}/ai/chat", json=body, headers=headers)
+        assert resp.status_code == 200, resp.text
+        quota = data_of(resp)["quota"]
+        assert quota == {
+            "enabled": False,
+            "limit": 0,
+            "used": expected_used,
+            "remaining": None,
+        }
 
 
 async def test_media_rejects_non_image(client):

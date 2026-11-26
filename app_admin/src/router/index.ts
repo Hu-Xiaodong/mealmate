@@ -85,6 +85,13 @@ const router = createRouter({
           meta: { title: 'AI 调用日志', permission: 'ai.log.read' },
         },
         {
+          // 详情页从日志列表进入，不出现在左侧菜单，权限沿用日志查看权限。
+          path: 'ai-call-logs/:id',
+          name: 'ai-call-log-detail',
+          component: () => import('@/views/ai/AICallLogDetailView.vue'),
+          meta: { title: '调用详情', permission: 'ai.log.read' },
+        },
+        {
           path: 'knowledge-base',
           name: 'knowledge-base',
           component: () => import('@/views/kb/KnowledgeBaseView.vue'),

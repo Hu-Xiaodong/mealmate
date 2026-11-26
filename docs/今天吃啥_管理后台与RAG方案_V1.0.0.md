@@ -1,4 +1,4 @@
-# 今天吃啥 · 管理后台与 RAG 知识库方案 V1.2.0
+# 今天吃啥 · 管理后台与 RAG 知识库方案 V1.3.0
 
 | 项目 | 内容 |
 | --- | --- |
@@ -7,6 +7,13 @@
 | 依据 | PRD `E-03`（审核、举报、下架、审计）、`A-03`（AI 供应商与配额）、`A-04`（菜谱来源与授权） |
 | 代码基线 | `server/`（FastAPI）、`app_mini/`（uni-app）、`app_flutter/`（Flutter） |
 | 目标读者 | 产品、后端、前端、测试、运营 |
+
+**V1.3.0 更新记录（2026-11-25）**
+
+| 决策 | 结论 |
+| --- | --- |
+| 切片与索引拆分（2026-11-24，2026-11-25 合并界面） | 上传只解析与切片，写入 `kb_draft_chunks`；运营确认后再建立索引，失败可重试，重新切片期间旧索引继续可用。文档列表同时返回待索引切片数量与参数，不再单独提供“切片列表”接口和页面区域 |
+| 知识库图片（2026-11-25） | 上传文档时可同时选择 Markdown 引用的图片，按文件名匹配、保存并改写为 `/media/...`；切片预览显示图片，生成向量前剥离图片标记；细节见 8.1.1 |
 
 **V1.2.0 更新记录（2026-11-23）**
 
@@ -301,7 +308,8 @@ kb_index_versions
 kb_documents
   id              String(40)   主键
   title           String(120)  文档标题
-  source_type     String(20)   pdf / docx / markdown / text
+  source_type     String(20)   upload 单篇上传 / batch_upload 批量导入 / system 系统内置
+  import_batch_id String(40)   批量导入所属批次，可空；单篇上传为空
   storage_key     String(255)  对象存储中的路径
   mime            String(80)   文件类型
   bytes           Integer      文件大小
@@ -313,7 +321,7 @@ kb_documents
   created_at      DateTime     创建时间
   updated_at      DateTime     更新时间
 
-kb_draft_chunks（待索引切片，对应后台“切片列表”）
+kb_draft_chunks（待索引切片，文档列表中待建索引的行）
   id              String(40)   主键
   document_id     String(40)   外键 kb_documents.id，索引
   ordinal         Integer      在文档中的顺序号
@@ -338,6 +346,14 @@ kb_chunks（已索引切片）
 ```
 
 关于向量维度：维度由所选嵌入模型决定，必须在建表前确定，建表后不能随意修改。首版建议固定一个模型和一个维度，换模型时新建索引版本并整体重建。
+
+**批量导入的落表方式（2026-11-25）**：没有为知识库另建批次表，而是复用第 5.4 节的 `import_batches` 与 `ingestion_jobs`：
+
+- `import_batches.source_type = kb_upload`，`source_uri` 保存批次显示名（运营手填、压缩包名或文件夹名），`stats` 保存总数、成功、失败、跳过、图片、忽略、未引用图片数量；
+- `ingestion_jobs.job_type = kb_ingest_document`，一行对应一个文档，`payload` 保存暂存键、相对路径、标题与匹配到的图片，`result` 保存生成的文档编号与切片数，`error_message` 保存失败原因，`attempts` 记录重试次数；
+- `kb_documents.import_batch_id` 是新增外键，用于按批次反查成功写入的文档，也为以后“整批回滚”留出依据；批次记录被清理时文档保留，因此不做级联删除。
+
+为什么复用而不是新表：两张表的字段本来就与“一次导入、多个文件”一一对应，换的只是业务类型。复用后，批次进度、失败重试、以后接入独立任务队列都能共用一套实现，避免同一套逻辑维护两份。
 
 **SQLite 兼容策略**：`pgvector` 的向量类型只有 PostgreSQL 支持。本地开发与生产使用 `docker compose` 里的 PostgreSQL；单元测试使用 SQLite，`kb_chunks.embedding` 列在该方言下退化为 `Text`，保存 JSON 数组字符串，检索时在 Python 里计算余弦相似度。RAG 相关模型统一放在 `app/db/rag_models.py`，向量列通过 `with_variant` 按数据库方言切换类型。
 
@@ -439,7 +455,7 @@ ingestion_jobs
 
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
-| GET | `/admin/posts` | `post.review` | 列表，支持 `status`、`cursor`、`limit` |
+| GET | `/admin/posts` | `post.review` | 列表，支持 `status`、`page`、`pageSize`，返回 `total` |
 | GET | `/admin/posts/{id}` | `post.review` | 详情，含全部图片、作者、来源 |
 | POST | `/admin/posts/{id}/approve` | `post.review` | 通过，状态改为 `published` 并写入发布时间 |
 | POST | `/admin/posts/{id}/reject` | `post.review` | 拒绝，必须传 `reason` |
@@ -451,8 +467,9 @@ ingestion_jobs
 
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
-| GET | `/admin/users` | `user.read` | 列表，支持昵称、手机号后四位搜索 |
+| GET | `/admin/users` | `user.read` | 列表，支持昵称、手机号后四位搜索，页码分页 |
 | GET | `/admin/users/{id}` | `user.read` | 详情，含发布数、点赞数、收藏数 |
+| GET | `/admin/users/{id}/posts` | `user.read` | 该用户的发布记录，支持状态筛选与页码分页 |
 | POST | `/admin/users/{id}/ban` | `user.ban` | 封禁，必须传 `reason` |
 | POST | `/admin/users/{id}/unban` | `user.ban` | 解封 |
 
@@ -460,14 +477,43 @@ ingestion_jobs
 
 封禁只把 `users.status` 改为 `disabled`，同时撤销该用户全部会话，不删除数据。
 
+**列表分页约定（2026-11-26）**：管理后台会持续增长的业务列表
+（饭帖审核、菜谱、用户、审计日志、AI 调用日志、用户发布记录）统一使用
+页码分页，参数为 `page`（从 1 开始）与 `pageSize`，响应包含
+`items`、`total`、`page`、`pageSize`。选择页码分页而不是游标分页，
+是因为后台需要显示总数、直接跳页和回看；客户端信息流仍然使用游标分页，
+因为它是无限滚动，不需要跳页。配置类小列表（口味标签、管理员与角色、
+模型配置）数量有限，保持一次性返回，不做分页。
+
 ### 6.4 菜谱管理
 
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
-| GET | `/admin/recipes` | `recipe.manage` | 列表，含草稿与已发布 |
-| POST | `/admin/recipes` | `recipe.manage` | 新建草稿 |
+| GET | `/admin/recipes` | `recipe.manage` | 列表，含草稿、已发布与已下架，支持关键词和状态筛选 |
+| GET | `/admin/recipes/{id}` | `recipe.manage` | 详情 |
+| POST | `/admin/recipes` | `recipe.manage` | 新增，可直接发布或存草稿 |
 | PUT | `/admin/recipes/{id}` | `recipe.manage` | 编辑 |
-| POST | `/admin/recipes/{id}/publish` | `recipe.manage` | 发布，要求 `validation_status=tested` |
+| POST | `/admin/recipes/{id}/archive` | `recipe.manage` | 单个下架（软下架），历史饭帖关联保留 |
+| POST | `/admin/recipes/batch-publish` | `recipe.manage` | 批量上架，已是上架状态的菜谱记为跳过 |
+| POST | `/admin/recipes/batch-archive` | `recipe.manage` | 批量下架，已是下架状态的菜谱记为跳过 |
+| POST | `/admin/recipes/batch-delete` | `recipe.manage` | 批量物理删除，被饭帖引用的菜谱跳过并提示改为下架 |
+
+菜谱批量操作的行为（2026-11-26）：
+
+1. **逐条执行、逐条提交**：上架、下架、删除都以单条菜谱为单位提交事务，
+   某一条失败或不满足条件不会回滚其他菜谱，接口按条返回结果。
+2. **状态幂等**：批量上架时已经是 `published`、批量下架时已经是 `archived`
+   的菜谱记为“跳过”，不重复写审计日志，也不当成失败。
+3. **删除保护**：菜谱可能被饭帖的 `platform_recipe_id` 引用，
+   物理删除前先统计引用数量；有引用时跳过该条并提示改为下架，
+   避免历史饭帖失去“这道菜来自哪个平台菜谱”的来源线索。
+4. **关联清理**：删除菜谱时同步删除 `recipe_categories` 分类关联，
+   以及 `favorites` 中 `target_type=recipe` 的收藏记录，避免孤儿数据。
+5. **数量上限**：一次最多 50 条，与菜谱列表单页上限一致；
+   除删除外每个操作都要写审计日志，条数过多会长时间占用数据库连接。
+6. **返回结构**：`{"succeeded", "failed", "skipped", "results"}`，
+   每条结果包含 `recipeId`、`title`、`ok`、`skipped`、`message`、
+   `errorCode`；前端只把失败和跳过项汇总到弹窗。
 
 ### 6.5 AI 管理
 
@@ -480,18 +526,27 @@ ingestion_jobs
 
 密钥不允许通过接口读取；写入后只保存在服务端环境变量或密钥管理服务中。
 
+App 端问答使用 `/api/v1/ai/chat`；新增流式版本 `/api/v1/ai/chat/stream`，按 SSE 依次返回 `status`、`delta`、`done`，最后一条 `done` 的数据结构与普通接口一致。查询供应商时必须按用途过滤：聊天只选 `kind=chat`，嵌入只选 `kind=embedding`，避免把嵌入模型拿去调聊天接口。请求可携带最近 8 条 `history`，用于多轮追问。
+
 ### 6.6 知识库与 RAG
 
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
-| GET | `/admin/kb/documents` | `kb.document.manage` | 文档列表与状态 |
-| POST | `/admin/kb/documents` | `kb.document.manage` | 上传文档，只解析与切片，进入切片列表 |
+| GET | `/admin/kb/documents` | `kb.document.manage` | 文档列表，服务端分页（`page`、`pageSize`，返回 `total`），含待索引切片数量、切片参数与切片时间 |
+| POST | `/admin/kb/documents` | `kb.document.manage` | 上传文档与可选图片，只解析与切片，等待建立索引；不会自动创建菜谱 |
+| POST | `/admin/kb/documents/{id}/recipe-draft` | `kb.document.manage` | 按固定模板把文档解析成菜谱草稿；已有草稿则更新，已发布菜谱不覆盖 |
 | GET | `/admin/kb/documents/{id}` | `kb.document.manage` | 文档详情与解析错误 |
 | DELETE | `/admin/kb/documents/{id}` | `kb.document.manage` | 删除文档、已索引/待索引切片与文件 |
-| POST | `/admin/kb/documents/{id}/rechunk` | `kb.document.manage` | 按当前启用版本重新切片，进入切片列表 |
-| POST | `/admin/kb/documents/{id}/index` | `kb.document.manage` | 把切片列表中的切片建立成索引 |
+| POST | `/admin/kb/documents/batch-delete` | `kb.document.manage` | 批量删除文档，逐条返回成功与失败原因 |
+| POST | `/admin/kb/documents/batch-rechunk` | `kb.document.manage` | 批量重新切片，逐篇执行并返回逐篇结果，一次最多 20 篇 |
+| POST | `/admin/kb/documents/batch-recipe-draft` | `kb.document.manage` | 批量生成菜谱草稿，已发布菜谱跳过 |
+| POST | `/admin/kb/documents/batch-index` | `kb.document.manage` | 批量建立索引，没有待索引切片的文档自动跳过 |
+| POST | `/admin/kb/documents/{id}/rechunk` | `kb.document.manage` | 按当前启用版本重新切片，替换待索引切片 |
+| POST | `/admin/kb/documents/{id}/index` | `kb.document.manage` | 把待索引切片建立成索引 |
 | GET | `/admin/kb/documents/{id}/chunks` | `kb.document.manage` | 查看切片，分页；优先返回待索引切片 |
-| GET | `/admin/kb/chunk-sets` | `kb.document.manage` | 切片列表：待建立索引的文档与切片参数 |
+| POST | `/admin/kb/import-batches` | `kb.document.manage` | 批量导入：多文件、整个文件夹或 ZIP 压缩包 |
+| GET | `/admin/kb/import-batches/{id}` | `kb.document.manage` | 批次进度、每篇切片结果与失败清单 |
+| POST | `/admin/kb/import-batches/{id}/retry` | `kb.document.manage` | 只重试失败文件，已成功的文件不重复处理 |
 | POST | `/admin/kb/documents/{id}/extract-recipes` | `recipe.manage` | 从 PDF 抽取菜谱草稿，进入人工审核 |
 | GET | `/admin/kb/index-versions` | `kb.document.manage` | 索引版本列表与状态 |
 | POST | `/admin/kb/index-versions` | `kb.document.manage` | 新建索引版本 |
@@ -509,6 +564,100 @@ HowToCook 导入接口的行为：
 2. 运营确认后调用 `apply`，才写入草稿；
 3. 同一固定版本重复 `apply` 不会产生重复菜谱，按来源路径和内容摘要幂等；
 4. 源内容变化时不覆盖已发布菜谱，而是生成“待复核更新”。
+
+知识库批量导入接口的行为：
+
+1. **三种来源**：一次多选多个文件、选择整个文件夹、或上传一个 ZIP 压缩包。
+   文件夹上传时前端提交 `paths`（与文件顺序一一对应的相对路径），
+   后端用 `webkitRelativePath` 判断图片和文档是否在同一个目录。
+2. **复用批次模型**：不新建表，批次写入 `import_batches`（`source_type=kb_upload`），
+   每个文档写入一条 `ingestion_jobs`（`job_type=kb_ingest_document`）。
+   批次负责整体统计，任务负责单文件状态、重试次数与失败原因。
+3. **自动解析**：创建批次后立刻返回 `pending`，后台任务逐篇复用单篇上传管道
+   完成解码、切片与图片保存。前端每 1.5 秒轮询批次详情，直到状态不再是
+   `pending` 或 `running`。
+4. **只处理白名单**：`.md`、`.txt` 为文档；`.jpg`、`.jpeg`、`.png`、`.webp` 为图片；
+   其他文件不报错，计入 `ignored`。`__MACOSX/`、`.DS_Store` 等系统垃圾文件同样忽略。
+5. **图片匹配**：先从 Markdown 提取本地图片文件名，再优先选择与文档同目录的图片；
+   同目录没有时才使用其他目录的同名图片。没有被任何文档引用的图片不会创建任务：
+   数量记入 `unusedImages`，相对路径清单记入 `unusedImagePaths`，
+   批次详情里逐条列出，方便运营判断是正文写错了文件名，还是图片本来就是多余素材。
+6. **ZIP 安全**：压缩包本体不超过 50 MB、解压后不超过 100 MB、条目不超过 1000；
+   拒绝加密包、符号链接、绝对路径与 `..` 路径穿越；单文件按 5 MB 截断读取，
+   不信任压缩包内声明的大小。嵌套 ZIP 不递归解压。
+7. **幂等去重**：文档仍按内容 SHA-256 去重。批次内或知识库中已存在相同内容时，
+   该任务记为 `skipped`（不算失败），知识库不会出现第二份相同文档。
+8. **单独重试**：`retry` 只把 `failed`/`dead` 任务重置为 `pending`，已经成功的文档
+   不会再次解析；如果失败原因是文件内容损坏，需要修正源文件后重新上传该篇。
+9. **暂存与清理**：原始文件先暂存到 `kb/imports/{批次编号}/`，失败重试依赖它；
+   整批没有失败时自动删除暂存目录，避免对象存储出现重复副本。
+10. **执行方式**：当前使用 FastAPI 后台任务，适合单实例部署与面试演示。
+    上生产多实例时需要换成独立任务队列（例如 Celery 或 ARQ），
+    任务表与重试逻辑可以原样复用。
+
+知识库文档生成菜谱草稿的行为：
+
+1. **触发时机**：上传和批量导入只负责存资料与切片，不会创建菜谱；
+   运营在文档行点“生成菜谱”，或勾选多篇后点“批量生成菜谱”才执行解析。
+   这样批量导入几百篇时不会悄悄产生一批没人核对的草稿。
+2. **固定模板**：复用 HowToCook 菜谱解析器，只认一级标题和四个二级小节，
+   不依赖大模型，结果稳定、可测试、零调用成本；格式混乱的资料才需要后续接入模型抽取。
+3. **字段映射**：菜名取一级标题；原料与厨具取「必备原料和工具」；份数取「计算」；
+   步骤取「操作」；小贴士取「附加内容」。厨具按别名映射为 `wok`、`pot` 等内部编码，
+   与 AI 筛选使用的编码一致。
+4. **草稿状态**：生成时写入 `recipes`，`status=draft`、`validation_status=pending`、
+   `content_origin=kb`；来源记为 `source_type=kb_document`、`source_uri=文档编号`，
+   正文 SHA-256 同时写入 `source_checksum`，便于追溯文档变化。
+5. **封面与分类**：封面优先取文档中第一张本地图片，没有则留空；
+   分类编码需要人工判断，草稿默认归入 `recommended` 并同步写入 `recipe_categories`，
+   原文分类放进标签；运营核对时可以改成 `quick`、`one_pot`、`few` 等更精确的分类。
+   默认值的作用是保证“上架即可见”：客户端列表按分类关联表筛选，分类为空的菜谱
+   在任何一个分类下都查不到，会出现“后台已发布、App 没同步”的假象。
+6. **幂等与保护**：一篇文档最多对应一条菜谱。重复生成只更新仍为草稿的记录；
+   已经发布或下架的菜谱不会被覆盖，接口返回跳过原因。
+7. **审核发布**：菜谱管理把状态筛选为“草稿”，核对原料、步骤、封面与分类后发布到 App；
+   新增、编辑和批量上架时，如果菜谱已发布但没有任何分类，服务端会自动补 `recommended`。
+
+知识库批量操作的行为：
+
+1. **三个动作**：批量重新切片、批量生成菜谱草稿、批量建立索引，分别对应
+   `/documents/batch-rechunk`、`/documents/batch-recipe-draft`、`/documents/batch-index`。
+2. **逐篇执行**：篇与篇之间没有事务关联，某篇失败不会回滚其他篇；
+   接口返回成功、失败、跳过数量与逐篇结果，前端只把未完成项列出来。
+3. **数量上限 20 篇**：重新切片要读原文件，建立索引要逐篇调用嵌入模型，
+   数量太多会让单个请求长时间占用连接；更大的批量应改成后台任务加轮询。
+4. **跳过语义**：批量建立索引时，没有待索引切片的文档直接跳过；
+   批量生成菜谱时，已有已发布菜谱的文档跳过，避免覆盖人工修改。
+
+模板示例：
+
+```markdown
+# 番茄炒蛋
+
+预估烹饪时间：15 分钟
+预估烹饪难度：★★
+
+## 必备原料和工具
+
+- 番茄 2 个
+- 鸡蛋 3 个
+- 食用油 10ml
+- 炒锅
+
+## 计算
+
+一份正好够 2 个人食用
+
+## 操作
+
+1. 番茄切块，鸡蛋打散。
+2. 热锅下油，倒入蛋液炒至凝固后盛出。
+3. 下番茄翻炒出汁，倒回鸡蛋，加盐调味。
+
+## 附加内容
+
+- 番茄去皮口感更好。
+```
 
 `search-test` 响应示例：
 
@@ -538,7 +687,7 @@ HowToCook 导入接口的行为：
 
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
-| GET | `/admin/audit-logs` | `audit.read` | 按操作人、动作、时间范围筛选，只读 |
+| GET | `/admin/audit-logs` | `audit.read` | 按操作人、动作、时间范围筛选，只读，页码分页 |
 
 ---
 
@@ -591,12 +740,12 @@ app_admin/
 | 登录 | 用户名密码、错误提示、登录失败次数提示 |
 | 待审列表 | 状态筛选、图片缩略图、批量通过、单条拒绝并填写原因 |
 | 内容详情 | 图片大图、来源、作者、定位、审核记录 |
+| 菜谱管理 | 标题搜索与状态筛选、新增/编辑、单个下架；勾选后批量上架、批量下架、批量删除；批量结果弹窗列出失败与跳过原因 |
 | 用户列表 | 昵称与手机号后四位搜索、封禁/解封、查看发布 |
 | AI 日志 | 时间范围、成功/失败筛选、耗时排序 |
 | AI 配置 | 配额输入、供应商状态、测试按钮 |
-| 知识库列表 | 上传、状态轮询、失败原因、重新切片 |
-| 切片列表 | 待建索引文档、切片数量与参数、去新建索引、切片预览 |
-| 文档详情 | 切片预览、重新切片、建立索引 |
+| 知识库列表 | 上传、状态轮询、失败原因、重新切片、待索引切片参数、去新建索引、批量重新切片/生成菜谱/建立索引/删除 |
+| 切片预览 | 查看待索引或已索引切片、重新切片、建立索引 |
 | 召回测试 | 输入问题、展示命中片段与相似度、可跳转文档 |
 | 审计日志 | 只读表格、操作前后值对比 |
 
@@ -611,20 +760,38 @@ app_admin/
 ```text
 上传文档（第一步：只切片）
   → 校验类型与大小
+  → 校验随文档上传的图片（可选，多张）
+  → 图片存入 kb/{文档编号}/images/，Markdown 地址改写为 /media/...
   → 存入对象存储，记录 kb_documents
   → 解析出纯文本（PDF / Word / Markdown）
   → 清洗（去页眉页脚、合并断行、去除空段）
-  → 切片（按字符数 + 重叠）
-  → 写入 kb_draft_chunks（切片列表），状态 chunked
+  → 切片（按字符数 + 重叠，保留图片标记供预览）
+  → 写入 kb_draft_chunks，状态 chunked（文档列表显示待索引切片数与参数）
   → 运营检查切片，点“去新建索引”
 
 建立索引（第二步：生成向量）
   → 读取 kb_draft_chunks
-  → 调用嵌入服务，得到每段的向量
+  → 去掉图片标记后再调用嵌入服务，得到每段的向量
   → 写入 kb_chunks，绑定当前索引版本
   → 删除待索引切片，状态 ready
   → 旧切片整批替换，检索不中断
 ```
+
+#### 8.1.1 Markdown 图片处理（2026-11-25）
+
+Markdown 菜谱里的图片通常是本地相对路径，例如 `![白灼虾](./白灼虾.webp)`。浏览器只会提交文档文件本身，不会自动带上图片，因此切片里会留下一行图片语法，预览时也看不到图。
+
+处理方式：
+
+1. 上传接口在同一个 `multipart/form-data` 请求里增加可选字段 `images`，可以一次选择多张 JPG / PNG / WebP，单张不超过 5 MB，最多 30 张。
+2. 后端用 Pillow 真正打开每张图片，确认不是“改后缀的文本文件”；校验失败直接返回 `KB_IMAGE_INVALID`，不创建文档记录。
+3. 按“文件名”匹配 Markdown 引用：`./白灼虾.webp`、`../../images/白灼虾.webp`、URL 编码后的中文名都能对上；`http://`、`https://`、`data:` 等外部地址保持原样。
+4. 图片保存到 `kb/{文档编号}/images/`，正文地址改写为 `/media/kb/{文档编号}/images/...`；没匹配到的引用保留原文，并返回 `unmatchedImageCount` 提醒运营补传。管理后台在选择文档后会读取正文，列出 Markdown 引用的本地图片；没有选择对应文件时显示橙色提示，提交前再弹一次确认，避免上传后才发现切片里只有图片地址。
+5. 切片正文保留图片标记，管理后台按“文字 + 图片”渲染；生成向量前用 `strip_media_markup` 去掉图片标记和地址，避免图片路径占用嵌入模型的输入长度。
+6. 删除文档时按 `kb/{文档编号}/` 前缀整体清理原始文件与图片，不留孤儿文件。
+
+这样做的取舍：按文件名匹配不需要浏览器上传相对路径，也不要求打包 ZIP，操作最简单；代价是同一篇文档里不能出现两张同名但内容不同的图片。后续接入对象存储或 ZIP 上传时，可以把匹配键换成包内相对路径，正文改写逻辑不需要改。
+
 
 状态机：
 
@@ -636,6 +803,8 @@ uploaded → parsing → chunking → chunked → indexing → ready
 切片阶段失败只需重新切片；索引阶段失败保留待索引切片，修好嵌入模型配置后可直接重试。
 
 每一步失败都写入 `error_message`，前端可看到具体原因并重试。
+
+嵌入供应商的选择规则（2026-11-26）：只使用 `kind=embedding` 且启用的配置；同一用途同时只启用一个模型，后台打开新嵌入模型会自动停用旧模型，因此这里拿到的是唯一一个启用项。聊天模型不会参与嵌入。建立索引失败时会返回供应商名称、模型名和实际请求地址；HTTP 404 表示该地址没有 `/embeddings` 接口，例如 DeepSeek 只有对话接口，需要换成支持文本嵌入且输出 1024 维的供应商。“测试连接”同样按用途分流，嵌入配置会真实调用 `/embeddings` 并校验维度。
 
 ### 8.2 查询链路
 
@@ -673,7 +842,7 @@ uploaded → parsing → chunking → chunked → indexing → ready
 | 云厂商嵌入接口 | 无需显卡，按量计费，效果好 | 数据要出网，按调用付费 | 首版推荐 |
 | 本地开源嵌入模型 | 数据不出内网，无调用费 | 需要显卡或较强处理器，运维复杂 | 有合规要求时 |
 
-首版已确认使用云厂商的 OpenAI 兼容嵌入接口，固定 1024 维，降低工程量。具体供应商仍属于 PRD `A-03` 待确认项，但技术上不再阻塞：模型配置表增加 `kind`（chat / embedding）和 `dimensions` 字段，对话模型与嵌入模型共用同一套密钥加密、连通性测试和审计，查询时按用途过滤，避免对话模型列表混入嵌入模型。
+首版已确认使用云厂商的 OpenAI 兼容嵌入接口，固定 1024 维，降低工程量。具体供应商仍属于 PRD `A-03` 待确认项，但技术上不再阻塞：模型配置表增加 `kind`（chat / embedding）和 `dimensions` 字段，对话模型与嵌入模型共用同一套密钥加密、连通性测试和审计；查询时按用途过滤，并且每个用途同时只启用一个模型，避免对话模型与嵌入模型混用。
 
 ### 8.6 HowToCook 导入链路
 
@@ -740,7 +909,7 @@ HowToCook 是一个社区维护的中文菜谱仓库，目录结构是 `dishes/{
 
 结论：可以进入正式入库。人工抽查重点是 19 道完全没有数值用量的菜、64 条特殊名称和 10 道没写总时长的菜。试运行报告保存在 `tools/howtocook/dry-run-report.json`，重新生成命令见 `docs/测试用例.md` 第 5.15 节。
 
-**与切片嵌入的衔接（2026-11-23）**：切片与嵌入能力已经落地，但入口目前只有管理后台上传 `.md` / `.txt` 文档；HowToCook 批量导入还没有自动写入 `kb_documents` 与 `kb_chunks`，需要等导入应用（P2-3）完成后，在同一个事务里复用 `text_chunker.split_document` 与 `embedding_service.embed_texts`，避免另写一套切片逻辑。当前可以先手工把单份 Markdown 菜谱上传到知识库验证检索效果。
+**与切片嵌入的衔接（2026-11-23，图片说明补充于 2026-11-25）**：切片与嵌入能力已经落地，但入口目前只有管理后台上传 `.md` / `.txt` 文档，上传时可同时选择 Markdown 引用的图片，后端保存并改写为 `/media/...` 地址；HowToCook 批量导入还没有自动写入 `kb_documents` 与 `kb_chunks`，也还没有自动下载 351 张图片，需要等导入应用（P2-3）完成后，在同一个事务里复用 `text_chunker.split_document` 与 `embedding_service.embed_texts`，并复用图片保存与地址改写逻辑，避免另写一套切片逻辑。当前可以先手工把单份 Markdown 菜谱连同图片上传到知识库验证检索效果。
 
 ### 8.7 PDF 与后续格式扩展
 
@@ -874,7 +1043,7 @@ PDF 转菜谱与 RAG 是两条独立链路：全部文本都可以进入 RAG；�
 验收标准：
 
 1. 每次 AI 调用产生一条日志，含耗时与状态；
-2. 后台修改配额后立即生效；
+2. 配额可通过 `AI_DAILY_LIMIT_ENABLED` 暂停或恢复，重建服务后生效；后台切换模型开关立即生效；
 3. 密钥不可通过接口读取；
 4. 供应商不可用时接口返回明确错误码，不阻塞浏览。
 

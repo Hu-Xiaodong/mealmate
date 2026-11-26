@@ -298,19 +298,21 @@ class _AiChatSheet extends StatefulWidget {
 }
 
 class _AiChatSheetState extends State<_AiChatSheet> {
-  static const _homeGreeting = '今天想吃什么？告诉我口味、预算或能用多久，我帮你缩小选择。也可以直接说家里有什么食材。';
-  static const _recipeListGreeting = '想用手里的食材做点什么？告诉我食材、器具和时间，我从平台菜谱里帮你挑。';
-  static const _postGreeting = '就着这条饭帖继续聊：告诉我你还缺什么、有多少时间，我从平台菜谱里帮你补几道搭配。';
+  static const _homeGreeting =
+      '今天想吃什么？也可以问我做饭方法、食材搭配或时间安排。想让我选菜时，直接说口味、食材或能用多久。';
+  static const _recipeListGreeting =
+      '想用手里的食材做点什么？告诉我食材、器具和时间，我从平台菜谱里帮你挑；也可以直接问做饭问题。';
+  static const _postGreeting = '就着这条饭帖继续聊：告诉我你还缺什么、有多少时间，我帮你补几道搭配；也可以问具体做法。';
 
   /// 三个入口的引导问题不同，避免看起来像同一个功能。
   List<String> get _prompts {
     if (widget.contextType == 'recipe_list') {
-      return const ['有番茄和鸡蛋做什么', '15 分钟能搞定的菜'];
+      return const ['有番茄和鸡蛋做什么', '15 分钟能搞定的菜', '煮虾要几分钟'];
     }
     if (widget.contextType == 'post') {
       return const ['这条还能配点什么', '15 分钟能加一道菜吗'];
     }
-    return const ['帮我选一顿', '家里有番茄和鸡蛋'];
+    return const ['帮我选一顿', '家里有番茄和鸡蛋', '番茄炒蛋先放蛋还是先放番茄'];
   }
 
   String get _greeting {
@@ -322,7 +324,7 @@ class _AiChatSheetState extends State<_AiChatSheet> {
   String get _contextLabel {
     if (widget.contextType == 'recipe_list') return '菜谱 · 帮你挑菜';
     if (widget.contextType == 'post') return '饭帖 · 就着这条聊';
-    return '首页 · 帮你选饭';
+    return '首页 · 做饭助手';
   }
 
   /// 埋点里的页面名：同一个面板被多个页面复用，按入口还原真实页面。
@@ -339,11 +341,51 @@ class _AiChatSheetState extends State<_AiChatSheet> {
   bool _sending = false;
   int? _remaining;
 
+  /// 最近几轮对话，发请求时一起带给后端。
+  /// 不包含开场白，也不包含正在输入的这一句；后端会把它拼进提示词，
+  /// 这样“那换成鸡肉呢”这类追问才能知道“那”指什么。
+  final List<Map<String, String>> _history = [];
+
+  /// 正在流式接收的助手文字。为空时界面显示“思考中…”。
+  String _streamingText = '';
+  bool _streaming = false;
+
   @override
   void dispose() {
     _controller.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  /// 只带最近 6 条（约 3 轮），避免提示词越聊越长、费用和延迟不断上升。
+  List<Map<String, String>> _historyPayload() {
+    final recent = _history.length > 6
+        ? _history.sublist(_history.length - 6)
+        : _history;
+    return recent
+        .map((item) => Map<String, String>.from(item))
+        .toList(growable: false);
+  }
+
+  void _applyResult(AIChatResult result, String userMessage) {
+    setState(() {
+      _messages.add(
+        _ChatMessage(
+          text: result.message,
+          recommendations: result.recommendations,
+        ),
+      );
+      _history.add({'role': 'user', 'content': userMessage});
+      _history.add({'role': 'assistant', 'content': result.message});
+      if (_history.length > 8) {
+        _history.removeRange(0, _history.length - 8);
+      }
+      _streamingText = '';
+      _streaming = false;
+      // 后端暂停次数限制时 remaining 为空，界面随之隐藏“今日剩余 N 次”。
+      _remaining = result.quota.enabled ? result.quota.remaining : null;
+    });
+    _scrollToEnd();
   }
 
   Future<void> _send(String raw) async {
@@ -352,27 +394,30 @@ class _AiChatSheetState extends State<_AiChatSheet> {
     _controller.clear();
     setState(() {
       _messages.add(_ChatMessage(text: message, fromUser: true));
+      _streamingText = '';
+      _streaming = true;
     });
     _scrollToEnd();
 
     final stopwatch = Stopwatch()..start();
     setState(() => _sending = true);
+    var receivedDelta = false;
     try {
-      final result = await apiClient.aiChat(
+      // 优先走流式接口：服务端生成一段就显示一段。
+      final result = await apiClient.aiChatStream(
         contextType: widget.contextType,
         contextId: widget.contextId,
         message: message,
+        history: _historyPayload(),
+        onDelta: (delta) {
+          receivedDelta = true;
+          if (!mounted) return;
+          setState(() => _streamingText += delta);
+          _scrollToEnd();
+        },
       );
       if (!mounted) return;
-      setState(() {
-        _messages.add(
-          _ChatMessage(
-            text: result.message,
-            recommendations: result.recommendations,
-          ),
-        );
-        _remaining = result.quota.remaining;
-      });
+      _applyResult(result, message);
       analytics.track(
         'ai_message_result',
         pageName: _pageName,
@@ -380,12 +425,71 @@ class _AiChatSheetState extends State<_AiChatSheet> {
           'inputMode': 'text',
           'contextType': widget.contextType,
           'constraintTypes': const <String>[],
+          'streaming': true,
           'latencyMs': stopwatch.elapsedMilliseconds,
           'resultCode': 'ok',
         },
       );
-      _scrollToEnd();
     } on ApiException catch (error) {
+      // 流式接口还没吐出一个字就失败（例如旧版后端没有这个路由），
+      // 退回普通接口再试一次；用户不会因为版本不匹配而完全用不了 AI。
+      if (!receivedDelta) {
+        try {
+          final result = await apiClient.aiChat(
+            contextType: widget.contextType,
+            contextId: widget.contextId,
+            message: message,
+            history: _historyPayload(),
+          );
+          if (!mounted) return;
+          _applyResult(result, message);
+          analytics.track(
+            'ai_message_result',
+            pageName: _pageName,
+            properties: {
+              'inputMode': 'text',
+              'contextType': widget.contextType,
+              'constraintTypes': const <String>[],
+              'streaming': false,
+              'latencyMs': stopwatch.elapsedMilliseconds,
+              'resultCode': 'ok',
+            },
+          );
+          return;
+        } on ApiException catch (fallbackError) {
+          analytics.track(
+            'ai_message_result',
+            pageName: _pageName,
+            properties: {
+              'inputMode': 'text',
+              'contextType': widget.contextType,
+              'constraintTypes': const <String>[],
+              'streaming': false,
+              'latencyMs': stopwatch.elapsedMilliseconds,
+              'resultCode': '${fallbackError.code}',
+            },
+          );
+          analytics.clientError(
+            module: 'ai_chat',
+            errorCode: fallbackError.code,
+          );
+          if (mounted) showError(context, fallbackError);
+          return;
+        }
+      }
+      // 已经显示了一部分文字：保留它，并明确告诉用户可以重试，
+      // 避免整段内容突然消失、用户以为刚才看到的是幻觉。
+      if (mounted) {
+        setState(() {
+          final partial = _streamingText.trim();
+          if (partial.isNotEmpty) {
+            _messages.add(_ChatMessage(text: '$partial\n\n（回答中断，请重试）'));
+          }
+          _streamingText = '';
+          _streaming = false;
+        });
+        showError(context, error);
+      }
       analytics.track(
         'ai_message_result',
         pageName: _pageName,
@@ -393,15 +497,20 @@ class _AiChatSheetState extends State<_AiChatSheet> {
           'inputMode': 'text',
           'contextType': widget.contextType,
           'constraintTypes': const <String>[],
+          'streaming': true,
           'latencyMs': stopwatch.elapsedMilliseconds,
           'resultCode': '${error.code}',
         },
       );
       analytics.clientError(module: 'ai_chat', errorCode: error.code);
-      if (mounted) showError(context, error);
     } finally {
       stopwatch.stop();
-      if (mounted) setState(() => _sending = false);
+      if (mounted) {
+        setState(() {
+          _sending = false;
+          _streaming = false;
+        });
+      }
     }
   }
 
@@ -519,6 +628,14 @@ class _AiChatSheetState extends State<_AiChatSheet> {
         padding: const EdgeInsets.all(12),
         children: [
           for (final message in _messages) _bubble(message),
+          // 流式回答先在列表末尾显示一个临时气泡：
+          // 还没收到文字时显示“思考中…”，收到后逐字追加，最后再用正式消息替换。
+          if (_streaming)
+            _bubble(
+              _ChatMessage(
+                text: _streamingText.isEmpty ? '思考中…' : '$_streamingText▍',
+              ),
+            ),
           if (_remaining != null)
             Padding(
               padding: const EdgeInsets.only(top: 2, bottom: 6),
@@ -693,7 +810,7 @@ class _AiChatSheetState extends State<_AiChatSheet> {
           const Padding(
             padding: EdgeInsets.only(bottom: 4),
             child: Text(
-              '说说想吃什么，我帮你从平台菜谱里挑',
+              '说说想吃什么，或问一个做饭问题',
               style: TextStyle(fontSize: 12, color: AppColors.muted),
             ),
           ),
@@ -712,7 +829,7 @@ class _AiChatSheetState extends State<_AiChatSheet> {
                     counterText: '',
                     filled: true,
                     fillColor: AppColors.bg,
-                    hintText: '输入要求…',
+                    hintText: '输入问题或要求…',
                     hintStyle: const TextStyle(
                       fontSize: 13,
                       color: AppColors.faint,
@@ -754,7 +871,7 @@ class _AiChatSheetState extends State<_AiChatSheet> {
                       borderRadius: BorderRadius.circular(12),
                     ),
                     child: Text(
-                      _sending ? '思考中' : '发送',
+                      _sending ? '回答中' : '发送',
                       style: const TextStyle(
                         fontSize: 13,
                         fontWeight: FontWeight.w500,

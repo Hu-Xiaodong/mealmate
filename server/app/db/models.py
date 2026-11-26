@@ -308,7 +308,8 @@ class Recipe(Base):
     # 菜系或类型标签，例如“素菜”“水产”。与 category_codes 分开：
     # category_codes 决定客户端顶部分类，tags 用于检索和展示。
     tags: Mapped[list[str]] = mapped_column(JSON, default=list)
-    # 来源类型：manual 手工创建、howtocook 仓库导入、pdf 文档抽取。
+    # 来源类型：manual 手工创建、howtocook 仓库导入、pdf 文档抽取、
+    # kb_document 知识库文档自动生成草稿。
     source_type: Mapped[str] = mapped_column(String(20), default="manual", index=True)
     # 来源地址。HowToCook 保存仓库内的相对路径；手工菜谱为空。
     source_uri: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -341,7 +342,7 @@ class ImportBatch(Base):
     __tablename__ = "import_batches"
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
-    # 数据源类型：howtocook / pdf。
+    # 数据源类型：howtocook / pdf / kb_upload（知识库批量导入）。
     source_type: Mapped[str] = mapped_column(String(20), index=True)
     # 数据源地址：仓库地址或文件存储路径。
     source_uri: Mapped[str] = mapped_column(String(255))
@@ -380,7 +381,8 @@ class IngestionJob(Base):
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
     batch_id: Mapped[str] = mapped_column(ForeignKey("import_batches.id"), index=True)
     # 任务类型：parse_repository 解析仓库、download_images 下载图片、
-    # extract_recipes 从文档抽取菜谱、embed_chunks 生成向量。
+    # extract_recipes 从文档抽取菜谱、embed_chunks 生成向量、
+    # kb_ingest_document 知识库批量导入中的单篇文档切片。
     job_type: Mapped[str] = mapped_column(String(30), index=True)
     # pending 待领取、running 执行中、succeeded 成功、
     # failed 失败待重试、dead 超过重试上限。
@@ -563,6 +565,52 @@ class AICallLog(Base):
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
     error_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
+class AICallTrace(Base):
+    """模型调用过程明细：一次调用尝试中的每个执行步骤都记一行。
+
+    为什么要在“调用日志”之外再加一张明细表：
+    调用日志只回答“哪个模型、成功还是失败、耗时多少、token 多少”，
+    是给列表和统计用的汇总数据；但排查问题时还需要知道
+    “当时发出去的提示词是什么、模型原样返回了什么、哪一步校验把它拦下了”。
+    这些内容长度不定、条数不定，如果都塞进调用日志的列里，
+    列表查询会被大量文本拖慢，表结构也会变得难以维护。
+    拆成子表后，列表仍然只读汇总字段，只有打开详情页才读取明细。
+
+    为什么用“每一步一行”而不是“整段 JSON 存一列”：
+    1. 时间线需要按顺序展示，一行一步可以直接排序、按步骤筛选；
+    2. 单步内容可能很长（提示词、模型原始输出），单独一行便于截断和单独加载；
+    3. 以后要统计“哪一步最慢”时，可以直接按 step 聚合，不需要解析 JSON。
+
+    为什么 call_log_id 不做外键：
+    与 ai_call_logs 中 provider_id 的处理保持一致——日志属于历史事实，
+    不应该因为上层记录被清理而级联删除；这里只保留编号并建索引。
+    """
+
+    __tablename__ = "ai_call_traces"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    # 所属的调用日志编号，对应 ai_call_logs.id。
+    call_log_id: Mapped[str] = mapped_column(String(40), index=True)
+    # 冗余保存请求标识：详情页按请求串联多次尝试时可以直接筛选，少一次关联查询。
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # 步骤顺序号，从 1 开始。同一毫秒内写入的多条记录也能按确定的顺序展示。
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    # 机器可读的步骤标识，例如 model_request、output_parse、fallback。
+    step: Mapped[str] = mapped_column(String(40))
+    # 中文标题，直接展示在详情页时间线上，避免前端再维护一份翻译表。
+    title: Mapped[str] = mapped_column(String(80))
+    # 步骤结果：success 成功、failed 失败、info 中性信息（例如“开始请求”）。
+    status: Mapped[str] = mapped_column(String(20), default="info")
+    # 该步骤的详细内容：提示词、原始返回、解析结果、错误堆栈说明等。
+    # 使用 Text 而不是 String，因为提示词和模型输出可能超过几千字符。
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 该步骤自身的耗时，单位毫秒；不是整次调用的耗时。
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )

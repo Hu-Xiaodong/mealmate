@@ -16,8 +16,10 @@ const keyword = ref('')
 const statusFilter = ref('')
 const items = ref<AdminUserItem[]>([])
 const loading = ref(false)
-const hasMore = ref(false)
-const nextCursor = ref<string | null>(null)
+// 页码分页：与知识库、菜谱等列表保持一致，返回总数用于显示“共多少条”。
+const page = ref(1)
+const pageSize = ref(20)
+const total = ref(0)
 
 const detailVisible = ref(false)
 const detailLoading = ref(false)
@@ -34,8 +36,10 @@ const banDialog = reactive({
 
 const userPosts = ref<AdminPost[]>([])
 const userPostsLoading = ref(false)
-const userPostsHasMore = ref(false)
-const userPostsCursor = ref<string | null>(null)
+// 用户详情里的发布记录单独分页：它嵌在抽屉里，页大小比主列表小。
+const userPostsPage = ref(1)
+const userPostsPageSize = ref(10)
+const userPostsTotal = ref(0)
 const userPostsStatus = ref('')
 const previewPost = ref<AdminPost | null>(null)
 
@@ -51,7 +55,7 @@ function userStatus(status: string) {
   return USER_STATUS_META[status] || { label: status, type: 'info' as const }
 }
 
-async function load(reset = false) {
+async function load() {
   if (loading.value) {
     return
   }
@@ -60,12 +64,11 @@ async function load(reset = false) {
     const data = await listUsers({
       keyword: keyword.value.trim() || undefined,
       status: statusFilter.value || undefined,
-      cursor: reset ? undefined : nextCursor.value || undefined,
-      limit: 20,
+      page: page.value,
+      pageSize: pageSize.value,
     })
-    items.value = reset ? data.items : [...items.value, ...data.items]
-    nextCursor.value = data.nextCursor
-    hasMore.value = data.hasMore
+    items.value = data.items
+    total.value = data.total
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '加载用户失败')
   } finally {
@@ -74,8 +77,13 @@ async function load(reset = false) {
 }
 
 function search() {
-  nextCursor.value = null
-  load(true)
+  page.value = 1
+  load()
+}
+
+function changePageSize() {
+  page.value = 1
+  void load()
 }
 
 function reset() {
@@ -95,19 +103,18 @@ async function loadDetail(userId: string) {
   }
 }
 
-async function loadUserPosts(reset = true) {
+async function loadUserPosts() {
   if (!activeUserId.value) return
   if (userPostsLoading.value) return
   userPostsLoading.value = true
   try {
     const data = await listUserPosts(activeUserId.value, {
       status: userPostsStatus.value || undefined,
-      cursor: reset ? undefined : userPostsCursor.value || undefined,
-      limit: 10,
+      page: userPostsPage.value,
+      pageSize: userPostsPageSize.value,
     })
-    userPosts.value = reset ? data.items : [...userPosts.value, ...data.items]
-    userPostsCursor.value = data.nextCursor
-    userPostsHasMore.value = data.hasMore
+    userPosts.value = data.items
+    userPostsTotal.value = data.total
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '加载用户发布失败')
   } finally {
@@ -115,16 +122,27 @@ async function loadUserPosts(reset = true) {
   }
 }
 
+/** 切换发布状态筛选时回到第 1 页，否则可能停在一个空页上。 */
+function resetUserPosts() {
+  userPostsPage.value = 1
+  void loadUserPosts()
+}
+
+function changeUserPostsPageSize() {
+  userPostsPage.value = 1
+  void loadUserPosts()
+}
+
 function openDetail(row: AdminUserItem) {
   activeUserId.value = row.id
   detail.value = null
   userPosts.value = []
-  userPostsCursor.value = null
-  userPostsHasMore.value = false
+  userPostsPage.value = 1
+  userPostsTotal.value = 0
   userPostsStatus.value = ''
   detailVisible.value = true
   loadDetail(row.id)
-  loadUserPosts(true)
+  loadUserPosts()
 }
 
 function askBan(user: AdminUserItem | AdminUserDetail) {
@@ -145,7 +163,7 @@ async function submitBan() {
     const result = await banUser(banDialog.userId, reason)
     ElMessage.success(result.changed ? '已封禁该用户，并撤销其全部会话' : '该用户已被封禁')
     banDialog.visible = false
-    await load(true)
+    await load()
     if (detailVisible.value) {
       await loadDetail(activeUserId.value)
     }
@@ -173,7 +191,7 @@ async function handleUnban(user: AdminUserItem | AdminUserDetail) {
   try {
     const result = await unbanUser(user.id)
     ElMessage.success(result.changed ? '已解封' : '该用户当前可正常使用')
-    await load(true)
+    await load()
     if (detailVisible.value) {
       await loadDetail(activeUserId.value)
     }
@@ -182,7 +200,7 @@ async function handleUnban(user: AdminUserItem | AdminUserDetail) {
   }
 }
 
-onMounted(() => load(true))
+onMounted(() => load())
 </script>
 
 <template>
@@ -194,7 +212,7 @@ onMounted(() => load(true))
           手机号默认脱敏展示。封禁会立即撤销该用户的全部会话，解封后需要重新登录。
         </p>
       </div>
-      <el-button :icon="Refresh" :loading="loading" @click="load(true)">
+      <el-button :icon="Refresh" :loading="loading" @click="load()">
         刷新
       </el-button>
     </header>
@@ -303,8 +321,17 @@ onMounted(() => load(true))
         </template>
       </el-table>
 
-      <div v-if="hasMore" class="load-more">
-        <el-button :loading="loading" @click="load(false)">加载更多</el-button>
+      <div class="pager">
+        <el-pagination
+          v-model:current-page="page"
+          v-model:page-size="pageSize"
+          :total="total"
+          :page-sizes="[10, 20, 50]"
+          layout="total, sizes, prev, pager, next, jumper"
+          background
+          @current-change="load"
+          @size-change="changePageSize"
+        />
       </div>
     </section>
 
@@ -350,7 +377,7 @@ onMounted(() => load(true))
                 placeholder="全部状态"
                 clearable
                 style="width: 130px"
-                @change="loadUserPosts(true)"
+                @change="resetUserPosts"
               >
                 <el-option label="待审核" value="pending_review" />
                 <el-option label="已公开" value="published" />
@@ -391,10 +418,18 @@ onMounted(() => load(true))
                 description="该用户还没有公开或待审核内容"
                 :image-size="60"
               />
-              <div v-if="userPostsHasMore" class="load-more">
-                <el-button size="small" :loading="userPostsLoading" @click="loadUserPosts(false)">
-                  加载更多
-                </el-button>
+              <div v-if="userPostsTotal > userPostsPageSize" class="pager">
+                <el-pagination
+                  v-model:current-page="userPostsPage"
+                  v-model:page-size="userPostsPageSize"
+                  :total="userPostsTotal"
+                  :page-sizes="[5, 10, 20]"
+                  layout="total, sizes, prev, pager, next"
+                  size="small"
+                  background
+                  @current-change="loadUserPosts"
+                  @size-change="changeUserPostsPageSize"
+                />
               </div>
             </div>
           </div>

@@ -84,8 +84,15 @@ class KbDocument(Base):
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
     title: Mapped[str] = mapped_column(String(120))
-    # 来源类型：upload 后台上传，system 系统内置（预留）。
+    # 来源类型：upload 后台上传、batch_upload 批量导入、system 系统内置（预留）。
     source_type: Mapped[str] = mapped_column(String(20), default="upload", index=True)
+    # 批量导入所属批次。单篇上传为空。
+    # 为什么不把文档编号写进批次统计：统计会随失败重试变化，
+    # 文档与批次的关系是稳定的，落成外键才能按批次反查、审计和以后做整批回滚。
+    # 批次被清理时文档保留，因此不做级联删除。
+    import_batch_id: Mapped[str | None] = mapped_column(
+        ForeignKey("import_batches.id"), nullable=True, index=True
+    )
     storage_key: Mapped[str] = mapped_column(String(255))
     mime: Mapped[str] = mapped_column(String(80))
     bytes: Mapped[int] = mapped_column(Integer)

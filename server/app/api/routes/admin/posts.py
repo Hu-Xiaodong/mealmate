@@ -21,15 +21,15 @@ router = APIRouter(prefix="/admin/posts", tags=["admin-posts"])
 @router.get("")
 async def list_posts(
     status_filter: str | None = Query(default=None, alias="status"),
-    cursor: str | None = None,
-    limit: int = Query(default=20, ge=1, le=50),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=50, alias="pageSize"),
     principal: AdminPrincipal = Depends(require_permission("post.review")),
     db: AsyncSession = Depends(get_db),
 ):
-    """饭帖列表，可按状态筛选。默认按提交时间倒序。"""
+    """饭帖列表，可按状态筛选。默认按提交时间倒序，页码分页。"""
     return ok(
         await list_admin_posts(
-            db, status=status_filter, cursor=cursor, limit=limit
+            db, status=status_filter, page=page, page_size=page_size
         )
     )
 

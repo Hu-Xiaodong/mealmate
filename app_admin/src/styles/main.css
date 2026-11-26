@@ -298,6 +298,13 @@ a {
   color: var(--admin-muted);
 }
 
+/* 所有后台列表的分页条统一靠右，和表格留出固定间距。 */
+.pager {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
 .strong {
   font-weight: 600;
 }
