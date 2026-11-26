@@ -56,6 +56,7 @@ def _payload(provider: AIProvider) -> dict[str, Any]:
         "priority": provider.priority,
         "timeoutSeconds": provider.timeout_seconds,
         "maxOutputTokens": provider.max_output_tokens,
+        "contextWindowTokens": provider.context_window_tokens,
         "lastTestAt": iso(provider.last_test_at),
         "lastTestOk": provider.last_test_ok,
         "lastTestMessage": provider.last_test_message,
@@ -81,6 +82,7 @@ def _snapshot(provider: AIProvider) -> dict[str, Any]:
         "priority": provider.priority,
         "timeoutSeconds": provider.timeout_seconds,
         "maxOutputTokens": provider.max_output_tokens,
+        "contextWindowTokens": provider.context_window_tokens,
     }
 
 
@@ -159,6 +161,7 @@ async def create_provider(
         priority=body.priority,
         timeout_seconds=body.timeout_seconds,
         max_output_tokens=body.max_output_tokens,
+        context_window_tokens=body.context_window_tokens,
         created_at=now_utc(),
         updated_at=now_utc(),
     )
@@ -218,6 +221,8 @@ async def update_provider(
         provider.timeout_seconds = body.timeout_seconds
     if body.max_output_tokens is not None:
         provider.max_output_tokens = body.max_output_tokens
+    if body.context_window_tokens is not None:
+        provider.context_window_tokens = body.context_window_tokens
     # 空字符串表示“保留原密钥”，只有真正填写了新密钥才重新加密。
     if body.api_key and body.api_key.strip():
         provider.api_key_encrypted = encrypt_secret(body.api_key.strip())

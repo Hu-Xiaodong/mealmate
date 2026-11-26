@@ -237,9 +237,49 @@ class AIChatRequest(CamelModel):
     context_id: str | None = Field(default=None, max_length=40)
     message: str = Field(min_length=1, max_length=500)
     constraints: AIConstraints = Field(default_factory=AIConstraints)
-    # 最近 8 条消息（约 4 轮）。再多对模型理解当前问题帮助有限，
-    # 反而会增加 token 费用和延迟，所以由 schema 直接限制上限。
+    # 服务端返回的会话编号。同一段连续对话复用同一个编号，
+    # 服务端据此读取摘要和最近消息；为空表示开始一段新会话。
+    conversation_id: str | None = Field(default=None, max_length=40)
+    # 客户端为这条用户消息生成的唯一编号。
+    # 作用有两个：1) 网络重试时服务端按编号去重，不会写入两条相同提问；
+    # 2) 登录后同步本地记录时，本地消息与服务端消息能对上，不会重复合并。
+    message_id: str | None = Field(default=None, max_length=64)
+    # 最近 8 条消息（约 4 轮）。正常情况下服务端会从 Redis/数据库读取，
+    # 这里保留是为了兼容两种场景：游客且 Redis 不可用时用客户端历史兜底；
+    # 旧版本客户端也仍然可以只带历史提问。
     history: list[AIChatMessage] = Field(default_factory=list, max_length=8)
+
+
+class AISyncMessage(CamelModel):
+    """登录后同步本地记录时的一条消息。"""
+
+    client_message_id: str = Field(min_length=1, max_length=64)
+    role: Literal["user", "assistant"]
+    # 同步是本机已经发生过的真实内容，允许比在线提问更长，
+    # 但仍要设上限，避免有人把整个文件塞进一次同步请求。
+    content: str = Field(min_length=1, max_length=8000)
+    created_at: datetime | None = None
+
+
+class AISyncConversation(CamelModel):
+    """登录后同步的一段本地会话。
+
+    为什么由客户端带上本地会话编号：
+    同步必须可重复执行（网络失败重试、多次登录），服务端用
+    “用户编号 + 本地会话编号”判断这段记录是否已经合并过，
+    重复同步时只补新增消息，不会产生重复会话。
+    """
+
+    client_conversation_id: str = Field(min_length=1, max_length=64)
+    context_type: Literal["home", "post", "recipe_list"] = "home"
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    messages: list[AISyncMessage] = Field(default_factory=list, max_length=200)
+
+
+class AISyncRequest(CamelModel):
+    # 一次最多 20 段会话，避免登录瞬间上传过多数据拖慢登录流程。
+    conversations: list[AISyncConversation] = Field(min_length=1, max_length=20)
 
 
 class AIProviderCreateRequest(CamelModel):
@@ -267,6 +307,9 @@ class AIProviderCreateRequest(CamelModel):
     priority: int = Field(default=100, ge=0, le=9999)
     timeout_seconds: int = Field(default=20, ge=3, le=120)
     max_output_tokens: int = Field(default=800, ge=100, le=4000)
+    # 模型上下文窗口，单位 token。用来判断历史是否达到 60% 的压缩阈值。
+    # 上限 2000000 只是挡住误输入；真实值以供应商文档为准。
+    context_window_tokens: int = Field(default=32768, ge=1024, le=2000000)
 
     @model_validator(mode="after")
     def _normalize_kind(self):
@@ -301,6 +344,7 @@ class AIProviderUpdateRequest(CamelModel):
     priority: int | None = Field(default=None, ge=0, le=9999)
     timeout_seconds: int | None = Field(default=None, ge=3, le=120)
     max_output_tokens: int | None = Field(default=None, ge=100, le=4000)
+    context_window_tokens: int | None = Field(default=None, ge=1024, le=2000000)
 
 
 class KbIndexVersionCreateRequest(CamelModel):

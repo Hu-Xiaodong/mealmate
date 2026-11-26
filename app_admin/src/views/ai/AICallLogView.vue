@@ -22,6 +22,9 @@ const CONTEXT_LABELS: Record<string, string> = {
   post: '饭帖详情',
   recipe_list: '菜谱列表',
   admin_test: '后台测试',
+  kb_embedding: '知识库嵌入',
+  // 历史压缩是后台维护动作，不是用户提问；单独标注便于在日志里快速筛出来。
+  history_compress: '历史压缩',
 }
 
 async function load() {

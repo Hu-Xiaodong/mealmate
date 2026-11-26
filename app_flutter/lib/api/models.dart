@@ -624,6 +624,8 @@ class AIQuota {
 class AIChatResult {
   const AIChatResult({
     required this.conversationId,
+    this.messageId = '',
+    this.replyMessageId = '',
     required this.origin,
     required this.message,
     required this.recommendations,
@@ -631,6 +633,15 @@ class AIChatResult {
   });
 
   final String conversationId;
+
+  /// 服务端确认的用户消息编号。客户端发送的 messageId 会原样返回，
+  /// 本地记录用它和云端对齐，登录后同步时才能正确去重。
+  final String messageId;
+
+  /// 服务端为这条助手回答生成的编号。客户端本地记录直接使用它，
+  /// 之后重复同步同一条回答不会产生重复数据。
+  final String replyMessageId;
+
   final String origin;
   final String message;
   final List<AIRecommendation> recommendations;
@@ -641,6 +652,8 @@ class AIChatResult {
     final quota = json['quota'];
     return AIChatResult(
       conversationId: json['conversationId'] as String? ?? '',
+      messageId: json['messageId'] as String? ?? '',
+      replyMessageId: json['replyMessageId'] as String? ?? '',
       origin: json['origin'] as String? ?? '',
       message: json['message'] as String? ?? '',
       recommendations: recommendations is List

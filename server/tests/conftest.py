@@ -6,6 +6,10 @@ from pathlib import Path
 
 os.environ["APP_ENV"] = "test"
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_placeholder.db"
+# 测试不依赖真实 Redis：显式清空连接地址，让缓存层走降级分支。
+# 否则开发机启动了本地 Redis 时，测试会话可能写进真实缓存，
+# 造成“单独跑通过、全量跑互相污染”的不稳定结果。
+os.environ["REDIS_URL"] = ""
 # 测试固定启用配额，避免本地 .env 为了演示把限制暂停后影响配额用例。
 os.environ["AI_DAILY_LIMIT_ENABLED"] = "true"
 os.environ["SECRET_KEY"] = "test-secret-key"

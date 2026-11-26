@@ -20,6 +20,7 @@ LangChain 负责“把问题发给模型并拿回文本”，而“只能推荐�
 """
 
 import json
+import logging
 import re
 import time
 import traceback
@@ -44,9 +45,19 @@ from app.db.models import (
     Recipe,
     User,
 )
-from app.schemas import AIChatMessage, AIChatRequest, AIConstraints
+from app.schemas import AIChatRequest, AIConstraints
+from app.services.ai_history_service import (
+    ConversationState,
+    append_turn,
+    pending_old_messages,
+    resolve_conversation,
+    save_summary,
+    should_compress,
+)
 from app.services.storage import object_url
 from app.utils.time import business_date
+
+logger = logging.getLogger("mealmate.ai")
 
 TOOL_LABELS = {
     "wok": "炒锅",
@@ -129,6 +140,33 @@ RECIPES_CLOSE = "</recipes>"
 # 连通性测试用最短的提示词，避免测试连接消耗过多 token。
 PROBE_SYSTEM_PROMPT = "你是连通性测试助手，只回复用户要求的内容。"
 PROBE_USER_PROMPT = "请只回复两个字：可用"
+
+# 历史压缩（摘要）用的系统提示词。
+#
+# 为什么不用主对话的提示词：
+# 主提示词要求模型输出 JSON 或标签格式、只能推荐平台菜谱；
+# 摘要任务只需要“把旧对话合并成一段文字”，
+# 两件事的目标不同，混在一起会让模型不知道该遵守哪套格式。
+#
+# 为什么要明确“不要编造”和“保留菜谱编号”：
+# 摘要会被当作后续对话的长期记忆。如果模型在摘要里编造了用户偏好，
+# 后面每一轮都会基于错误信息回答；菜谱编号丢失则会导致追问时接不上。
+SUMMARY_SYSTEM_PROMPT = (
+    "你是 MealMate 的对话摘要助手。请把用户与做饭助手的旧对话"
+    "合并成一段不超过 300 字的中文摘要。\n"
+    "必须保留：用户的口味偏好、忌口、可用器具、时间限制、"
+    "已经推荐过的菜谱编号、尚未解决的问题。\n"
+    "不能编造对话里没有的信息；不要输出 Markdown，不要解释，只输出摘要正文。"
+)
+
+# 压缩时单条旧消息最多放进提示词多少字符。
+# 同步上来的消息可能有几千字，原样拼进去会让摘要请求本身超长；
+# 800 字符足以保留一条消息的核心意思，也符合“先压缩再总结”的目的。
+SUMMARY_MESSAGE_CHARS = 800
+
+# 摘要结果最多保存多少字符。系统提示词要求 300 字，
+# 留一倍余量是为了兼容模型偶尔啰嗦，同时避免摘要无限增长。
+SUMMARY_MAX_CHARS = 600
 
 
 @dataclass
@@ -1003,6 +1041,316 @@ async def _chat_context(
     return context_post, recipes, catalog, constraints, providers
 
 
+def _is_context_length_error(exc: AICallError) -> bool:
+    """判断一个模型错误是不是“上下文长度超限”。
+
+    为什么不能只看错误码：
+    不同供应商对超限的 HTTP 状态码并不统一，常见的是 400，
+    也有 413、422，甚至返回 200 但在 body 里写错误。
+    真正稳定的是错误信息里的关键词，所以同时检查错误码和文字。
+    """
+    text = f"{exc.code} {exc.message}".lower()
+    markers = (
+        "context_length_exceeded",
+        "context length",
+        "maximum context",
+        "too many tokens",
+        "token limit",
+        "prompt is too long",
+        "上下文长度",
+        "上下文窗口",
+        "超出上下文",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _summary_prompt(summary: str, messages: list[Any]) -> str:
+    """拼装历史压缩用的用户提示词。
+
+    只把“窗口之外的旧消息”放进来，最近 8 条会原样保留在主提示词里，
+    不需要重复总结。每条旧消息截断到 800 字符，防止摘要请求本身过长。
+    """
+    lines: list[str] = []
+    if summary:
+        lines.append(f"已有摘要（需要和新内容合并）：\n{summary}")
+    lines.append("需要合并的旧对话（按时间顺序）：")
+    for item in messages:
+        role = "用户" if item.role == "user" else "助手"
+        content = item.content.strip()
+        if len(content) > SUMMARY_MESSAGE_CHARS:
+            content = content[:SUMMARY_MESSAGE_CHARS] + "…"
+        lines.append(f"{role}：{content}")
+    lines.append("请输出合并后的摘要正文。")
+    return "\n".join(lines)
+
+
+async def _prepare_history(
+    db: AsyncSession,
+    viewer: User | None,
+    subject_ref: str,
+    body: AIChatRequest,
+    providers: list[AIProvider],
+) -> ConversationState:
+    """准备本次问答要使用的会话与历史。
+
+    步骤：
+    1. 找到可复用的会话；没有或已空闲 30 分钟就新建；
+    2. 如果启用了模型，判断整段会话是否达到模型窗口的 60%；
+    3. 达到阈值且存在窗口外的旧消息时，调用模型把它们压缩成摘要。
+
+    为什么压缩失败不影响问答：
+    主提示词只带“摘要 + 最近 8 条”，并不需要把全部旧消息发给模型。
+    压缩只是维护长期记忆，失败时保留原摘要和原消息即可继续回答，
+    等下一次触发再重试，不能用“压缩失败”把用户的问题也挡掉。
+    """
+    state = await resolve_conversation(
+        db,
+        subject_ref=subject_ref,
+        user=viewer,
+        conversation_id=body.conversation_id,
+        context_type=body.context_type,
+        message=body.message,
+        fallback_history=body.history,
+    )
+    if providers and should_compress(state, providers[0].context_window_tokens):
+        try:
+            await _compress_history(db, providers[0], state, subject_ref)
+        except Exception:  # noqa: BLE001 - 压缩属于维护动作，任何异常都不能阻断问答
+            logger.exception("历史压缩出现未预期异常，已保留原历史并继续问答")
+    return state
+
+
+def _history_detail(state: ConversationState, provider: AIProvider) -> str:
+    """生成“对话历史与窗口”步骤的详情，供后台调用详情页排查。
+
+    开发者最常问的两个问题是：
+    “这次到底带了哪些历史”“为什么没有带更早的内容”。
+    把会话编号、窗口条数、摘要长度、估算 token 和压缩阈值一次写清楚，
+    不用再反推服务端当时的状态。
+    """
+    window = state.window()
+    return (
+        f"会话编号：{state.conversation_id}\n"
+        f"会话状态：{'新建' if state.is_new else '复用'}\n"
+        f"历史消息总数：{len(state.messages)} 条\n"
+        f"本次提示词窗口：最近 {len(window)} 条"
+        f"（上限 {settings.ai_history_window_messages} 条）\n"
+        f"已有摘要：{len(state.summary)} 字符；"
+        f"已摘要消息：{state.summary_message_count} 条\n"
+        f"整段会话估算 token：{state.total_tokens()}\n"
+        f"模型上下文窗口：{provider.context_window_tokens} token；"
+        f"压缩阈值："
+        f"{int(provider.context_window_tokens * settings.ai_history_compress_ratio)} token\n"
+        "压缩规则：达到阈值且存在窗口外未摘要消息时，"
+        "把旧消息交给模型总结成摘要；摘要 + 最近窗口一起进入提示词。"
+    )
+
+
+async def _compress_history(
+    db: AsyncSession,
+    provider: AIProvider,
+    state: ConversationState,
+    subject_ref: str,
+) -> bool:
+    """把窗口外的旧消息压缩成摘要，成功返回 True。
+
+    兜底策略（对应需求里的两条）：
+    1. 压缩调用失败：不改摘要、不改消息，直接回滚（本函数什么都不写）；
+    2. 模型报“上下文超限”：说明后台填的窗口比模型真实上限大，
+       自动把待压缩消息砍掉一半（保留最旧的一半）再试一次，
+       并单独写一条醒目的失败日志，方便运营去后台修正配置。
+
+    为什么砍“最旧的一半”而不是“最新的一半”：
+    摘要按时间顺序推进。先总结更早的内容，指针向前移动；
+    剩余较新的旧消息留在下一次压缩继续处理，不会丢信息。
+    如果砍最新的一半，较旧的消息永远轮不到，摘要会断层。
+    """
+    segments = pending_old_messages(state)
+    if not segments:
+        return False
+
+    for attempt in (1, 2):
+        # 每次尝试单独一份过程记录：失败日志和成功日志各自完整，
+        # 在后台详情页不会混进另一次尝试的步骤。
+        trace = CallTrace()
+        trace.add(
+            "compress_trigger",
+            "历史达到窗口阈值，准备压缩",
+            detail=(
+                f"会话编号：{state.conversation_id}\n"
+                f"历史总条数：{len(state.messages)}；"
+                f"已摘要条数：{state.summary_message_count}\n"
+                f"本次待压缩旧消息：{len(segments)} 条\n"
+                f"整段会话估算 token：{state.total_tokens()}\n"
+                f"模型上下文窗口：{provider.context_window_tokens} token；"
+                f"触发比例：{settings.ai_history_compress_ratio:.0%}"
+            ),
+        )
+        prompt = _summary_prompt(state.summary, segments)
+        trace.add(
+            "compress_prompt",
+            "组装摘要提示词",
+            detail=(
+                f"摘要模型：{provider.model}\n"
+                f"待合并消息：{len(segments)} 条\n"
+                f"提示词字符数：{len(prompt)}\n\n"
+                f"【摘要提示词】\n{prompt}"
+            ),
+        )
+        try:
+            result = await _invoke_model_traced(
+                provider, SUMMARY_SYSTEM_PROMPT, prompt, trace
+            )
+        except AICallError as exc:
+            if _is_context_length_error(exc) and attempt == 1 and len(segments) > 1:
+                # 这条日志的标题和错误码都刻意写成“配置错误”，
+                # 后台调用日志列表会显示成一条红色的失败记录，
+                # 运营不用翻详情就能发现“窗口填大了”。
+                trace.add(
+                    "context_window_error",
+                    "【配置错误】上下文窗口超过模型真实上限",
+                    status="failed",
+                    detail=(
+                        "后台填写的上下文窗口可能大于模型真实上限，"
+                        "压缩请求被模型拒绝。\n"
+                        f"配置窗口：{provider.context_window_tokens} token\n"
+                        f"待压缩消息：{len(segments)} 条\n"
+                        f"错误码：{exc.code}\n"
+                        f"错误信息：{exc.message}\n\n"
+                        "处理建议：请到管理后台“模型配置”核对该模型的上下文窗口，"
+                        "按供应商文档改成真实值。本次已自动砍半重试，用户问答不受影响。"
+                    ),
+                    duration_ms=exc.latency_ms,
+                )
+                record_call(
+                    db,
+                    subject_ref=subject_ref,
+                    context_type="history_compress",
+                    provider=provider,
+                    status="failed",
+                    latency_ms=exc.latency_ms,
+                    error_code="AI_CONTEXT_WINDOW_INVALID",
+                    error_message="【配置错误】上下文窗口超过模型真实上限，已自动砍半重试",
+                    trace=trace,
+                )
+                await db.commit()
+                logger.error(
+                    "AI 上下文窗口配置可能错误：provider=%s model=%s "
+                    "配置窗口=%s token，压缩请求返回上下文超限；已自动砍半重试",
+                    provider.name,
+                    provider.model,
+                    provider.context_window_tokens,
+                )
+                # 保留更早的一半，摘要指针只前进这一半，
+                # 剩下的消息下一次触发时继续压缩。
+                half = max(1, len(segments) // 2)
+                segments = segments[:half]
+                continue
+
+            if _is_context_length_error(exc):
+                trace.add(
+                    "context_window_error",
+                    "【配置错误】砍半后仍然超出模型上下文窗口",
+                    status="failed",
+                    detail=(
+                        "自动砍半后压缩请求仍被模型拒绝，已回滚原历史。\n"
+                        f"错误码：{exc.code}\n错误信息：{exc.message}\n"
+                        "请尽快核对后台模型配置的上下文窗口大小。"
+                    ),
+                    duration_ms=exc.latency_ms,
+                )
+                logger.error(
+                    "AI 历史压缩砍半后仍超限：provider=%s model=%s",
+                    provider.name,
+                    provider.model,
+                )
+            else:
+                trace.add(
+                    "compress_failed",
+                    "压缩失败，回滚原历史",
+                    status="failed",
+                    detail=(
+                        f"错误码：{exc.code}\n错误信息：{exc.message}\n"
+                        "本次不修改摘要与消息，下次达到阈值时会重试。"
+                    ),
+                    duration_ms=exc.latency_ms,
+                )
+            record_call(
+                db,
+                subject_ref=subject_ref,
+                context_type="history_compress",
+                provider=provider,
+                status="failed",
+                latency_ms=exc.latency_ms,
+                error_code=exc.code or "AI_HISTORY_COMPRESS_FAILED",
+                error_message=f"【历史压缩失败】{exc.message}"[:200],
+                trace=trace,
+            )
+            await db.commit()
+            return False
+
+        summary_text = result.text.strip()[:SUMMARY_MAX_CHARS]
+        if not summary_text:
+            trace.add(
+                "compress_failed",
+                "压缩结果为空，回滚原历史",
+                status="failed",
+                detail="模型返回了空内容，摘要与消息保持原样。",
+                duration_ms=result.latency_ms,
+            )
+            record_call(
+                db,
+                subject_ref=subject_ref,
+                context_type="history_compress",
+                provider=provider,
+                status="failed",
+                latency_ms=result.latency_ms,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                total_tokens=result.total_tokens,
+                error_code="AI_HISTORY_COMPRESS_EMPTY",
+                error_message="【历史压缩失败】模型返回空摘要，已回滚",
+                trace=trace,
+            )
+            await db.commit()
+            return False
+
+        new_count = state.summary_message_count + len(segments)
+        await save_summary(
+            db,
+            state,
+            summary=summary_text,
+            summary_message_count=new_count,
+        )
+        trace.add(
+            "compress_applied",
+            "摘要已保存",
+            status="success",
+            detail=(
+                f"本次合并：{len(segments)} 条旧消息\n"
+                f"摘要长度：{len(summary_text)} 字符\n"
+                f"已摘要条数更新为：{state.summary_message_count}\n"
+                f"摘要内容：{summary_text}"
+            ),
+            duration_ms=result.latency_ms,
+        )
+        record_call(
+            db,
+            subject_ref=subject_ref,
+            context_type="history_compress",
+            provider=provider,
+            status="success",
+            latency_ms=result.latency_ms,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            trace=trace,
+        )
+        await db.commit()
+        return True
+    return False
+
+
 def _fallback_result(
     recipes: list[Recipe],
     constraints: AIConstraints,
@@ -1066,16 +1414,27 @@ async def chat(
     流程：
     1. 检查并占用配额；
     2. 读取已发布菜谱，作为模型唯一可选的内容集合；
-    3. 把用户消息解析成结构化条件（时间、器具、食材、忌口）；
-    4. 调用后台启用的聊天模型（同一用途同时只启用一个），失败则回退本地规则；
-    5. 校验模型返回的菜谱编号与条件，全部不合格则使用本地规则推荐；
-    6. 写调用日志并返回统一的响应结构。
+    3. 准备会话历史：复用 30 分钟内的会话，必要时压缩旧消息；
+    4. 把用户消息解析成结构化条件（时间、器具、食材、忌口）；
+    5. 调用后台启用的聊天模型（同一用途同时只启用一个），失败则回退本地规则；
+    6. 校验模型返回的菜谱编号与条件，全部不合格则使用本地规则推荐；
+    7. 保存本轮用户问题与助手回答，写调用日志并返回统一响应。
     """
     quota = await _consume_quota(db, viewer, subject_ref)
     context_post, recipes, catalog, constraints, providers = await _chat_context(db, body)
+    # 历史准备必须在拼提示词之前完成：压缩会改写摘要，
+    # 提示词需要使用压缩后的最新摘要。
+    state = await _prepare_history(db, viewer, subject_ref, body, providers)
 
     if providers:
-        user_prompt = _user_prompt(body, constraints, context_post, recipes)
+        user_prompt = _user_prompt(
+            body,
+            constraints,
+            context_post,
+            recipes,
+            history=state.window(),
+            summary=state.summary,
+        )
         attempted_log_ids: list[str] = []
         for provider in providers:
             # 每次模型尝试单独一份过程记录，最终随这条调用日志一起落库。
@@ -1123,6 +1482,11 @@ async def chat(
                 ),
             )
             trace.add(
+                "history_window",
+                "加载对话历史与窗口",
+                detail=_history_detail(state, provider),
+            )
+            trace.add(
                 "provider_selected",
                 "选择启用的模型",
                 detail=(
@@ -1148,6 +1512,29 @@ async def chat(
                     provider, SYSTEM_PROMPT, user_prompt, trace
                 )
             except AICallError as exc:
+                # 上下文超限单独记一条醒目步骤：这说明后台填写的窗口
+                # 大于模型真实上限，属于配置问题，不是普通网络波动。
+                if _is_context_length_error(exc):
+                    trace.add(
+                        "context_window_error",
+                        "【配置错误】上下文超出模型真实窗口",
+                        status="failed",
+                        detail=(
+                            "本次提示词被模型判定为超出上下文窗口。\n"
+                            f"配置窗口：{provider.context_window_tokens} token\n"
+                            f"会话估算 token：{state.total_tokens()}\n"
+                            f"错误码：{exc.code}\n错误信息：{exc.message}\n"
+                            "请到管理后台核对模型配置的上下文窗口大小。"
+                        ),
+                        duration_ms=exc.latency_ms,
+                    )
+                    logger.error(
+                        "AI 上下文超限：provider=%s model=%s 配置窗口=%s token，"
+                        "请核对后台配置",
+                        provider.name,
+                        provider.model,
+                        provider.context_window_tokens,
+                    )
                 attempted_log_ids.append(
                     record_call(
                         db,
@@ -1218,6 +1605,21 @@ async def chat(
                 )
                 continue
 
+            # 先保存对话再写调用日志：
+            # 两者在同一个事务里提交，保证“有一条成功回答，就一定有对应历史”。
+            user_turn = await append_turn(
+                db,
+                state,
+                role="user",
+                content=body.message,
+                client_message_id=body.message_id,
+            )
+            reply_turn = await append_turn(
+                db,
+                state,
+                role="assistant",
+                content=f"{reply_text}\n\n{SOURCE_NOTE}",
+            )
             record_call(
                 db,
                 subject_ref=subject_ref,
@@ -1232,7 +1634,9 @@ async def chat(
             )
             await db.commit()
             return {
-                "conversationId": new_id("c"),
+                "conversationId": state.conversation_id,
+                "messageId": user_turn.client_message_id,
+                "replyMessageId": reply_turn.client_message_id,
                 "origin": "ai_reference",
                 "message": f"{reply_text}\n\n{SOURCE_NOTE}",
                 "recommendations": _recommendation_payload(selected),
@@ -1260,9 +1664,26 @@ async def chat(
         context_post,
         ai_configured=bool(providers),
     )
+    # 即使模型不可用，用户的问题和本地规则的回答也要进入历史：
+    # 下一轮用户追问“那它呢”时，模型仍然能看到上一轮聊了什么。
+    user_turn = await append_turn(
+        db,
+        state,
+        role="user",
+        content=body.message,
+        client_message_id=body.message_id,
+    )
+    reply_turn = await append_turn(
+        db,
+        state,
+        role="assistant",
+        content=message,
+    )
     await db.commit()
     return {
-        "conversationId": new_id("c"),
+        "conversationId": state.conversation_id,
+        "messageId": user_turn.client_message_id,
+        "replyMessageId": reply_turn.client_message_id,
         "origin": "ai_reference",
         "message": message,
         "recommendations": recommendations,
@@ -1405,13 +1826,28 @@ async def chat_stream(
     """
     quota = await _consume_quota(db, viewer, subject_ref)
     context_post, recipes, catalog, constraints, providers = await _chat_context(db, body)
-    user_prompt = _user_prompt(body, constraints, context_post, recipes)
+    # 与普通接口共用同一套历史准备：复用会话、判断阈值、必要时压缩。
+    state = await _prepare_history(db, viewer, subject_ref, body, providers)
+    user_prompt = _user_prompt(
+        body,
+        constraints,
+        context_post,
+        recipes,
+        history=state.window(),
+        summary=state.summary,
+    )
 
     def done_payload(
-        message: str, recommendations: list[dict[str, Any]]
+        message: str,
+        recommendations: list[dict[str, Any]],
+        *,
+        message_id: str | None = None,
+        reply_message_id: str | None = None,
     ) -> dict[str, Any]:
         return {
-            "conversationId": new_id("c"),
+            "conversationId": state.conversation_id,
+            "messageId": message_id or body.message_id,
+            "replyMessageId": reply_message_id,
             "origin": "ai_reference",
             "message": message,
             "recommendations": recommendations,
@@ -1427,8 +1863,29 @@ async def chat_stream(
             message, recommendations = _fallback_result(
                 recipes, constraints, context_post, ai_configured=False
             )
+            user_turn = await append_turn(
+                db,
+                state,
+                role="user",
+                content=body.message,
+                client_message_id=body.message_id,
+            )
+            reply_turn = await append_turn(
+                db, state, role="assistant", content=message
+            )
+            await db.commit()
             yield _sse({"type": "delta", "text": message})
-            yield _sse({"type": "done", "data": done_payload(message, recommendations)})
+            yield _sse(
+                {
+                    "type": "done",
+                    "data": done_payload(
+                        message,
+                        recommendations,
+                        message_id=user_turn.client_message_id,
+                        reply_message_id=reply_turn.client_message_id,
+                    ),
+                }
+            )
             return
 
         attempted_log_ids: list[str] = []
@@ -1482,6 +1939,11 @@ async def chat_stream(
                 detail=_trace_context_detail(
                     body, subject_ref, constraints, context_post, recipes
                 ),
+            )
+            trace.add(
+                "history_window",
+                "加载对话历史与窗口",
+                detail=_history_detail(state, provider),
             )
             trace.add(
                 "provider_selected",
@@ -1563,6 +2025,27 @@ async def chat_stream(
                     ),
                     duration_ms=exc.latency_ms,
                 )
+                if _is_context_length_error(exc):
+                    trace.add(
+                        "context_window_error",
+                        "【配置错误】上下文超出模型真实窗口",
+                        status="failed",
+                        detail=(
+                            "流式请求被模型判定为超出上下文窗口。\n"
+                            f"配置窗口：{provider.context_window_tokens} token\n"
+                            f"会话估算 token：{state.total_tokens()}\n"
+                            f"错误码：{exc.code}\n错误信息：{exc.message}\n"
+                            "请到管理后台核对模型配置的上下文窗口大小。"
+                        ),
+                        duration_ms=exc.latency_ms,
+                    )
+                    logger.error(
+                        "AI 流式上下文超限：provider=%s model=%s 配置窗口=%s token，"
+                        "请核对后台配置",
+                        provider.name,
+                        provider.model,
+                        provider.context_window_tokens,
+                    )
                 attempted_log_ids.append(
                     record_call(
                         db,
@@ -1584,8 +2067,29 @@ async def chat_stream(
                     message = f"{partial}\n\n（回答中断，请重试）" if partial else (
                         "回答中断，请重试"
                     )
+                    # 中断的回答也要入历史：用户已经看到了这段文字，
+                    # 下一轮追问时模型必须知道刚才说到哪里。
+                    user_turn = await append_turn(
+                        db,
+                        state,
+                        role="user",
+                        content=body.message,
+                        client_message_id=body.message_id,
+                    )
+                    reply_turn = await append_turn(
+                        db, state, role="assistant", content=message
+                    )
+                    await db.commit()
                     yield _sse(
-                        {"type": "done", "data": done_payload(message, [])}
+                        {
+                            "type": "done",
+                            "data": done_payload(
+                                message,
+                                [],
+                                message_id=user_turn.client_message_id,
+                                reply_message_id=reply_turn.client_message_id,
+                            ),
+                        }
                     )
                     return
                 continue
@@ -1671,7 +2175,28 @@ async def chat_stream(
                         if partial
                         else "回答不完整，请重试"
                     )
-                    yield _sse({"type": "done", "data": done_payload(message, [])})
+                    user_turn = await append_turn(
+                        db,
+                        state,
+                        role="user",
+                        content=body.message,
+                        client_message_id=body.message_id,
+                    )
+                    reply_turn = await append_turn(
+                        db, state, role="assistant", content=message
+                    )
+                    await db.commit()
+                    yield _sse(
+                        {
+                            "type": "done",
+                            "data": done_payload(
+                                message,
+                                [],
+                                message_id=user_turn.client_message_id,
+                                reply_message_id=reply_turn.client_message_id,
+                            ),
+                        }
+                    )
                     return
                 continue
 
@@ -1680,6 +2205,19 @@ async def chat_stream(
             if not emitted and reply_text:
                 yield _sse({"type": "delta", "text": reply_text})
 
+            user_turn = await append_turn(
+                db,
+                state,
+                role="user",
+                content=body.message,
+                client_message_id=body.message_id,
+            )
+            reply_turn = await append_turn(
+                db,
+                state,
+                role="assistant",
+                content=f"{reply_text}\n\n{SOURCE_NOTE}",
+            )
             record_call(
                 db,
                 subject_ref=subject_ref,
@@ -1699,6 +2237,8 @@ async def chat_stream(
                     "data": done_payload(
                         f"{reply_text}\n\n{SOURCE_NOTE}",
                         _recommendation_payload(selected),
+                        message_id=user_turn.client_message_id,
+                        reply_message_id=reply_turn.client_message_id,
                     ),
                 }
             )
@@ -1720,8 +2260,27 @@ async def chat_stream(
         message, recommendations = _fallback_result(
             recipes, constraints, context_post, ai_configured=True
         )
+        user_turn = await append_turn(
+            db,
+            state,
+            role="user",
+            content=body.message,
+            client_message_id=body.message_id,
+        )
+        reply_turn = await append_turn(db, state, role="assistant", content=message)
+        await db.commit()
         yield _sse({"type": "delta", "text": message})
-        yield _sse({"type": "done", "data": done_payload(message, recommendations)})
+        yield _sse(
+            {
+                "type": "done",
+                "data": done_payload(
+                    message,
+                    recommendations,
+                    message_id=user_turn.client_message_id,
+                    reply_message_id=reply_turn.client_message_id,
+                ),
+            }
+        )
 
     return generate()
 
@@ -1843,24 +2402,31 @@ def _recommendation_payload(selected: list[tuple[Recipe, str]]) -> list[dict[str
     ]
 
 
-def _history_text(history: list[AIChatMessage]) -> str:
-    """把最近几轮对话拼成提示词里的“对话记录”。
+def _history_text(history: list[Any], summary: str = "") -> str:
+    """把摘要和最近几轮对话拼成提示词里的“对话记录”。
 
-    为什么不把历史拆成多条消息交给模型：
+    为什么历史放在用户提示词里，而不是拆成多条消息：
     当前调用层只接收“系统提示词 + 用户提示词”两段文本，
     把历史放进用户提示词里改动最小，也不会影响已经写好的多模型切换逻辑。
     对模型来说，这段记录同样能帮助它理解“那它呢”“换成鸡肉呢”这类追问。
 
-    只保留最后 6 条（约 3 轮）：更早的内容对当前问题帮助有限，
+    为什么摘要要单独放在最前面：
+    摘要代表更早的对话，时间上早于最近 8 条消息；
+    先给摘要再给最近对话，模型才能按时间顺序理解上下文。
+
+    最近对话最多取 8 条：
+    这是产品定义的消息窗口，更早的内容已经由摘要承接，
     继续带上只会增加 token 费用和首字延迟。
     """
-    if not history:
-        return ""
-    lines = ["最近对话（按时间顺序，仅供理解上下文）："]
-    for item in history[-6:]:
-        role = "用户" if item.role == "user" else "助手"
-        # 单条历史再截断一次，防止客户端绕过 schema 的 1000 字限制。
-        lines.append(f"{role}：{item.content.strip()[:300]}")
+    lines: list[str] = []
+    if summary:
+        lines.append(f"较早对话摘要（已压缩，供理解上下文）：{summary}")
+    if history:
+        lines.append("最近对话（按时间顺序，仅供理解上下文）：")
+        for item in history[-settings.ai_history_window_messages :]:
+            role = "用户" if item.role == "user" else "助手"
+            # 单条历史再截断一次，防止客户端绕过 schema 的长度限制。
+            lines.append(f"{role}：{item.content.strip()[:300]}")
     return "\n".join(lines)
 
 
@@ -1869,12 +2435,20 @@ def _user_prompt(
     constraints: AIConstraints,
     context_post: MealPost | None,
     recipes: list[Recipe],
+    *,
+    history: list[Any] | None = None,
+    summary: str = "",
 ) -> str:
-    """拼装用户提示词：历史、问题、已解析条件、饭帖上下文和菜谱目录。"""
+    """拼装用户提示词：摘要、最近对话、问题、条件、饭帖上下文和菜谱目录。
+
+    history 由服务端会话状态提供（最近 8 条）；
+    如果服务端没有历史（游客 Redis 不可用），调用方会回退到请求体里的
+    body.history，保证旧客户端也能正常提问。
+    """
     parts = []
-    history = _history_text(body.history)
-    if history:
-        parts.append(history)
+    history_text = _history_text(history or body.history, summary)
+    if history_text:
+        parts.append(history_text)
     parts.append(f"用户问题：{body.message.strip()}")
     parts.append(f"后端已解析出的硬性条件：{_condition_text(constraints)}")
     if context_post is not None:

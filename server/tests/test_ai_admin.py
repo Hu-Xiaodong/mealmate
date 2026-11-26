@@ -499,6 +499,7 @@ async def test_call_log_detail_returns_execution_trace(client, monkeypatch):
         "quota",
         "context_db",
         "context",
+        "history_window",
         "provider_selected",
         "prompt_built",
         "function_call",

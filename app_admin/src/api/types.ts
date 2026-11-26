@@ -295,6 +295,7 @@ export interface AIProviderItem {
   priority: number
   timeoutSeconds: number
   maxOutputTokens: number
+  contextWindowTokens: number
   lastTestAt: string | null
   lastTestOk: boolean | null
   lastTestMessage: string | null
@@ -314,6 +315,7 @@ export interface AIProviderForm {
   priority: number
   timeoutSeconds: number
   maxOutputTokens: number
+  contextWindowTokens: number
 }
 
 export interface AIProviderTestResult {

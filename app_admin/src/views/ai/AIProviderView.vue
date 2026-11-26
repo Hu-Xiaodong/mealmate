@@ -33,6 +33,7 @@ function emptyForm(): AIProviderForm {
     priority: 100,
     timeoutSeconds: 20,
     maxOutputTokens: 800,
+    contextWindowTokens: 32768,
   }
 }
 
@@ -70,6 +71,7 @@ function openEdit(item: AIProviderItem) {
     priority: item.priority,
     timeoutSeconds: item.timeoutSeconds,
     maxOutputTokens: item.maxOutputTokens,
+    contextWindowTokens: item.contextWindowTokens,
   })
   dialogVisible.value = true
 }
@@ -89,6 +91,13 @@ function validate(): boolean {
   }
   if (form.kind === 'embedding' && form.dimensions !== 1024) {
     ElMessage.warning('嵌入模型的向量维度必须为 1024')
+    return false
+  }
+  if (
+    form.kind === 'chat' &&
+    (form.contextWindowTokens < 1024 || form.contextWindowTokens > 2000000)
+  ) {
+    ElMessage.warning('上下文窗口需要在 1024 到 2000000 token 之间')
     return false
   }
   return true
@@ -112,6 +121,7 @@ async function save() {
       priority: form.priority,
       timeoutSeconds: form.timeoutSeconds,
       maxOutputTokens: form.maxOutputTokens,
+      contextWindowTokens: form.contextWindowTokens,
     }
     // 编辑时留空表示保留原密钥，不把空字符串发给后端覆盖。
     if (form.apiKey.trim()) {
@@ -235,6 +245,14 @@ onMounted(load)
         </template>
       </el-table-column>
       <el-table-column prop="apiKeyMasked" label="密钥" width="170" />
+      <el-table-column label="上下文窗口" width="130" align="center">
+        <template #default="{ row }">
+          <span v-if="row.kind === 'chat'">
+            {{ row.contextWindowTokens.toLocaleString() }} token
+          </span>
+          <span v-else class="muted">—</span>
+        </template>
+      </el-table-column>
       <el-table-column label="最近测试" min-width="200">
         <template #default="{ row }">
           <el-tag v-if="row.lastTestOk === true" type="success" size="small">正常</el-tag>
@@ -335,6 +353,19 @@ onMounted(load)
         <el-form-item label="最大输出">
           <el-input-number v-model="form.maxOutputTokens" :min="100" :max="4000" />
           <div class="muted form-hint">限制模型单次回复长度，避免异常长回复拖慢响应。</div>
+        </el-form-item>
+        <el-form-item v-if="form.kind === 'chat'" label="上下文窗口">
+          <el-input-number
+            v-model="form.contextWindowTokens"
+            :min="1024"
+            :max="2000000"
+            :step="1024"
+          />
+          <div class="muted form-hint">
+            单位 token，按供应商文档填写。历史达到该窗口的 60% 时，
+            超出最近 8 条的旧对话会被压缩成摘要；填得比模型真实上限大时，
+            系统会自动砍半重试，并在调用日志里记录配置错误。
+          </div>
         </el-form-item>
         <el-form-item label="立即启用">
           <el-switch v-model="form.enabled" />

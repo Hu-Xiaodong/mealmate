@@ -3,9 +3,11 @@ import 'package:flutter/services.dart';
 
 import '../api/api_client.dart';
 import '../api/models.dart';
+import '../core/ai_history_store.dart';
 import '../core/analytics.dart';
 import '../core/format.dart';
 import '../pages/recipe_detail_page.dart';
+import '../session/session_store.dart';
 import '../theme/app_theme.dart';
 
 /// 「问 AI」悬浮按钮的纯视觉部分，交互由 [DraggableAiFab] 负责。
@@ -341,14 +343,19 @@ class _AiChatSheetState extends State<_AiChatSheet> {
   bool _sending = false;
   int? _remaining;
 
-  /// 最近几轮对话，发请求时一起带给后端。
-  /// 不包含开场白，也不包含正在输入的这一句；后端会把它拼进提示词，
-  /// 这样“那换成鸡肉呢”这类追问才能知道“那”指什么。
-  final List<Map<String, String>> _history = [];
+  /// 当前正在聊的本地会话。为空表示还没发第一条消息，
+  /// 或者用户刚点了“新聊天”还没开始输入。
+  LocalAiConversation? _conversation;
 
   /// 正在流式接收的助手文字。为空时界面显示“思考中…”。
   String _streamingText = '';
   bool _streaming = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _restoreLocalHistory();
+  }
 
   @override
   void dispose() {
@@ -357,17 +364,245 @@ class _AiChatSheetState extends State<_AiChatSheet> {
     super.dispose();
   }
 
-  /// 只带最近 6 条（约 3 轮），避免提示词越聊越长、费用和延迟不断上升。
+  /// 打开面板时恢复最近一段仍在 30 分钟内的会话。
+  ///
+  /// 超过 30 分钟没有操作，按产品定义自动开始新会话：
+  /// 面板显示开场白，旧对话仍保留在“历史”列表里，不删除。
+  Future<void> _restoreLocalHistory() async {
+    await aiHistoryStore.load(isLoggedIn: sessionStore.isLoggedIn);
+    if (!mounted) return;
+    final latest = aiHistoryStore.latestActiveConversation();
+    if (latest != null) {
+      setState(() {
+        _conversation = latest;
+        if (latest.messages.isNotEmpty) {
+          _messages
+            ..clear()
+            ..addAll(
+              latest.messages.map(
+                (item) => _ChatMessage(
+                  text: item.content,
+                  fromUser: item.role == 'user',
+                ),
+              ),
+            );
+        }
+      });
+      _scrollToEnd();
+    }
+    // 已登录时补一次云端同步：上次登录可能因为断网没有传完。
+    // 后端按消息编号去重，重复调用不会产生重复记录。
+    if (sessionStore.isLoggedIn) {
+      try {
+        await aiHistoryStore.syncToCloud(apiClient);
+      } catch (_) {
+        // 同步失败不影响本地聊天。
+      }
+    }
+  }
+
+  /// 开始一段全新的本地会话（“新聊天”按钮）。
+  ///
+  /// 不删除任何历史：旧会话还留在本地记录里，可以随时从“历史”打开。
+  void _startNewChat() {
+    // 回答生成过程中不允许切换会话，否则这一轮的回答会写进错误的历史。
+    if (_sending) return;
+    setState(() {
+      _conversation = null;
+      _messages
+        ..clear()
+        ..add(_ChatMessage(text: _greeting));
+      _streamingText = '';
+      _streaming = false;
+    });
+  }
+
+  /// 打开历史会话列表。
+  ///
+  /// 只提供“打开”，不提供删除：产品明确要求历史记录由超时自动清理，
+  /// 避免用户误删后无法找回。
+  Future<void> _openHistory() async {
+    // 同样不允许在回答生成过程中切换会话。
+    if (_sending) return;
+    await aiHistoryStore.load(isLoggedIn: sessionStore.isLoggedIn);
+    if (!mounted) return;
+    final items = aiHistoryStore.conversations;
+    if (items.isEmpty) {
+      showMessage(context, '还没有历史对话');
+      return;
+    }
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (sheetContext) => Container(
+        margin: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(context).size.height * 0.6,
+        ),
+        decoration: BoxDecoration(
+          color: AppColors.card,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: AppColors.line),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    '历史对话',
+                    style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w500,
+                      color: AppColors.text,
+                    ),
+                  ),
+                ),
+                GestureDetector(
+                  onTap: () => Navigator.of(sheetContext).maybePop(),
+                  behavior: HitTestBehavior.opaque,
+                  child: const SizedBox(
+                    width: 40,
+                    height: 40,
+                    child: Icon(Icons.close, size: 18, color: AppColors.muted),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Flexible(
+              child: ListView.separated(
+                shrinkWrap: true,
+                itemCount: items.length,
+                separatorBuilder: (_, _) =>
+                    const Divider(height: 1, color: AppColors.line),
+                itemBuilder: (_, index) {
+                  final item = items[index];
+                  final title = item.title.isEmpty ? '未命名对话' : item.title;
+                  return GestureDetector(
+                    onTap: () {
+                      Navigator.of(sheetContext).maybePop();
+                      _openConversation(item);
+                    },
+                    behavior: HitTestBehavior.opaque,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w500,
+                              color: AppColors.text,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            '${_formatHistoryTime(item.updatedAt)} · ${item.messages.length} 条消息',
+                            style: const TextStyle(
+                              fontSize: 11,
+                              color: AppColors.muted,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _openConversation(LocalAiConversation conversation) {
+    setState(() {
+      _conversation = conversation;
+      _messages
+        ..clear()
+        ..addAll(
+          conversation.messages.map(
+            (item) => _ChatMessage(
+              text: item.content,
+              fromUser: item.role == 'user',
+            ),
+          ),
+        );
+      _streamingText = '';
+      _streaming = false;
+    });
+    _scrollToEnd();
+  }
+
+  String _formatHistoryTime(DateTime time) {
+    final now = DateTime.now();
+    final sameDay =
+        now.year == time.year && now.month == time.month && now.day == time.day;
+    final hour = time.hour.toString().padLeft(2, '0');
+    final minute = time.minute.toString().padLeft(2, '0');
+    if (sameDay) return '今天 $hour:$minute';
+    return '${time.month}月${time.day}日 $hour:$minute';
+  }
+
+  /// 只带最近 8 条给后端，作为 Redis 不可用时的兜底。
+  /// 正常情况下服务端会用自己的历史，不依赖这份数据。
   List<Map<String, String>> _historyPayload() {
-    final recent = _history.length > 6
-        ? _history.sublist(_history.length - 6)
-        : _history;
+    final messages = _conversation?.messages ?? const <LocalAiMessage>[];
+    final recent = messages.length > 8
+        ? messages.sublist(messages.length - 8)
+        : messages;
     return recent
-        .map((item) => Map<String, String>.from(item))
+        .map((item) => {'role': item.role, 'content': item.content})
         .toList(growable: false);
   }
 
-  void _applyResult(AIChatResult result, String userMessage) {
+  /// 只有服务端生成的会话编号（conv_ 开头）才回传。
+  /// 本地临时编号发给服务端没有意义，服务端会当成新会话。
+  String? _serverConversationId() {
+    final id = _conversation?.id ?? '';
+    return id.startsWith('conv_') ? id : null;
+  }
+
+  String _newMessageId() {
+    final now = DateTime.now().microsecondsSinceEpoch;
+    return 'cm_${now}_${_conversation?.messages.length ?? 0}';
+  }
+
+  Future<void> _applyResult(
+    AIChatResult result,
+    LocalAiMessage userMessage,
+  ) async {
+    final conversation = _conversation;
+    if (conversation != null) {
+      if (result.conversationId.isNotEmpty) {
+        conversation.id = result.conversationId;
+      }
+      // 服务端会原样返回客户端消息编号；如果它生成了新编号，以服务端为准。
+      if (result.messageId.isNotEmpty && result.messageId != userMessage.id) {
+        userMessage.id = result.messageId;
+      }
+      final reply = LocalAiMessage(
+        id: result.replyMessageId.isNotEmpty
+            ? result.replyMessageId
+            : _newMessageId(),
+        role: 'assistant',
+        content: result.message,
+        createdAt: DateTime.now(),
+      );
+      // 登录状态下，这一轮已经由服务端保存，标记为已同步。
+      conversation.synced = sessionStore.isLoggedIn;
+      await aiHistoryStore.appendMessage(conversation, reply);
+    }
+    if (!mounted) return;
     setState(() {
       _messages.add(
         _ChatMessage(
@@ -375,11 +610,6 @@ class _AiChatSheetState extends State<_AiChatSheet> {
           recommendations: result.recommendations,
         ),
       );
-      _history.add({'role': 'user', 'content': userMessage});
-      _history.add({'role': 'assistant', 'content': result.message});
-      if (_history.length > 8) {
-        _history.removeRange(0, _history.length - 8);
-      }
       _streamingText = '';
       _streaming = false;
       // 后端暂停次数限制时 remaining 为空，界面随之隐藏“今日剩余 N 次”。
@@ -392,6 +622,25 @@ class _AiChatSheetState extends State<_AiChatSheet> {
     final message = raw.trim();
     if (message.isEmpty || _sending) return;
     _controller.clear();
+
+    // 本地为主：先把这条问题写进本地记录，再发网络请求。
+    // 即使请求失败或用户马上关掉面板，问题也不会丢；
+    // 登录后同步时，服务端会按这个编号去重。
+    final history = _historyPayload();
+    _conversation ??= aiHistoryStore.createConversation(widget.contextType);
+    final userMessage = LocalAiMessage(
+      id: _newMessageId(),
+      role: 'user',
+      content: message,
+      createdAt: DateTime.now(),
+    );
+    // 先标记为未同步：如果这次请求失败，这条用户消息只存在本地，
+    // 下次登录同步时还需要补传到云端；成功后再由 _applyResult 标回已同步。
+    _conversation!.synced = false;
+    await aiHistoryStore.appendMessage(_conversation!, userMessage);
+    final conversationId = _serverConversationId();
+    if (!mounted) return;
+
     setState(() {
       _messages.add(_ChatMessage(text: message, fromUser: true));
       _streamingText = '';
@@ -407,8 +656,10 @@ class _AiChatSheetState extends State<_AiChatSheet> {
       final result = await apiClient.aiChatStream(
         contextType: widget.contextType,
         contextId: widget.contextId,
+        conversationId: conversationId,
+        messageId: userMessage.id,
         message: message,
-        history: _historyPayload(),
+        history: history,
         onDelta: (delta) {
           receivedDelta = true;
           if (!mounted) return;
@@ -416,8 +667,7 @@ class _AiChatSheetState extends State<_AiChatSheet> {
           _scrollToEnd();
         },
       );
-      if (!mounted) return;
-      _applyResult(result, message);
+      await _applyResult(result, userMessage);
       analytics.track(
         'ai_message_result',
         pageName: _pageName,
@@ -438,11 +688,12 @@ class _AiChatSheetState extends State<_AiChatSheet> {
           final result = await apiClient.aiChat(
             contextType: widget.contextType,
             contextId: widget.contextId,
+            conversationId: conversationId,
+            messageId: userMessage.id,
             message: message,
-            history: _historyPayload(),
+            history: history,
           );
-          if (!mounted) return;
-          _applyResult(result, message);
+          await _applyResult(result, userMessage);
           analytics.track(
             'ai_message_result',
             pageName: _pageName,
@@ -599,11 +850,14 @@ class _AiChatSheetState extends State<_AiChatSheet> {
                   ),
                 ),
               ),
+              _headerAction('历史', _openHistory),
+              const SizedBox(width: 2),
+              _headerAction('新聊天', _startNewChat),
               GestureDetector(
                 onTap: () => Navigator.of(context).maybePop(),
                 behavior: HitTestBehavior.opaque,
                 child: const SizedBox(
-                  width: 44,
+                  width: 40,
                   height: 44,
                   child: Icon(Icons.close, size: 18, color: AppColors.muted),
                 ),
@@ -616,6 +870,24 @@ class _AiChatSheetState extends State<_AiChatSheet> {
             style: const TextStyle(fontSize: 12, color: AppColors.muted),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 标题栏上的文字按钮。历史与新聊天入口都很轻量，不用图标，
+  /// 让用户一眼知道可以“翻旧对话”和“重新开始”。
+  Widget _headerAction(String label, VoidCallback onTap) {
+    return GestureDetector(
+      onTap: onTap,
+      behavior: HitTestBehavior.opaque,
+      child: Container(
+        height: 44,
+        padding: const EdgeInsets.symmetric(horizontal: 6),
+        alignment: Alignment.center,
+        child: Text(
+          label,
+          style: const TextStyle(fontSize: 12, color: AppColors.primary),
+        ),
       ),
     );
   }

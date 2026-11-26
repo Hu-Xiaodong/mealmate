@@ -20,6 +20,7 @@ const CONTEXT_LABELS: Record<string, string> = {
   recipe_list: '菜谱列表',
   admin_test: '后台测试',
   kb_embedding: '知识库嵌入',
+  history_compress: '历史压缩',
 }
 
 const STATUS_META: Record<string, { label: string; type: TagType }> = {

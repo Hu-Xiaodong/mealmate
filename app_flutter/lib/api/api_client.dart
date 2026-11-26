@@ -455,6 +455,8 @@ class ApiClient {
   Future<AIChatResult> aiChat({
     String contextType = 'home',
     String? contextId,
+    String? conversationId,
+    String? messageId,
     required String message,
     List<Map<String, String>> history = const [],
   }) async {
@@ -464,11 +466,29 @@ class ApiClient {
       body: {
         'contextType': contextType,
         'contextId': contextId,
+        'conversationId': conversationId,
+        'messageId': messageId,
         'message': message,
         if (history.isNotEmpty) 'history': history,
       },
     );
     return AIChatResult.fromJson(data);
+  }
+
+  /// 把手机本地保存的 AI 对话合并到云端。
+  ///
+  /// 只在登录成功后调用；后端按“客户端会话编号 + 客户端消息编号”去重，
+  /// 重复调用不会产生重复记录，因此网络失败后可以放心重试。
+  Future<Map<String, dynamic>> syncAiConversations(
+    List<Map<String, dynamic>> conversations,
+  ) async {
+    final data = await _request(
+      '/api/v1/ai/conversations/sync',
+      method: 'POST',
+      body: {'conversations': conversations},
+      auth: true,
+    );
+    return data;
   }
 
   /// 流式问答：服务端按 SSE 逐段推送文字，收到一段就回调一次 [onDelta]。
@@ -480,6 +500,8 @@ class ApiClient {
   Future<AIChatResult> aiChatStream({
     String contextType = 'home',
     String? contextId,
+    String? conversationId,
+    String? messageId,
     required String message,
     List<Map<String, String>> history = const [],
     required void Function(String delta) onDelta,
@@ -492,6 +514,8 @@ class ApiClient {
     request.body = jsonEncode({
       'contextType': contextType,
       'contextId': contextId,
+      'conversationId': conversationId,
+      'messageId': messageId,
       'message': message,
       if (history.isNotEmpty) 'history': history,
     });

@@ -72,6 +72,24 @@ class Settings(BaseSettings):
     # 用于演示、联调或模型额度充足时临时放开，不需要改代码。
     ai_daily_limit_enabled: bool = True
 
+    # ---- AI 对话历史 ----
+    # 每次请求只把最近多少条消息放进提示词。
+    # 8 条约等于 4 轮问答，足够理解“那换成鸡肉呢”这类追问；
+    # 再多对当前问题帮助有限，反而增加 token 费用和首字延迟。
+    ai_history_window_messages: int = 8
+    # 历史 token 达到模型上下文窗口的多少比例时触发压缩。
+    # 0.6 给系统提示词、菜谱目录和本次回答留出余量；
+    # 等到接近 100% 再压缩，压缩请求本身就可能先超限。
+    ai_history_compress_ratio: float = 0.6
+    # 会话空闲多久后自动开始新会话，单位分钟。
+    ai_conversation_idle_minutes: int = 30
+    # Redis 中会话快照的存活时间（秒），每次有新消息都会重新计时（滑动过期）。
+    ai_history_redis_ttl_seconds: int = 1800
+    # 登录用户会话在数据库中保留多少天。超期由每日清理命令物理删除。
+    ai_conversation_retention_days: int = 30
+    # AI 调用日志保留多少天。日志是排障与成本核算依据，要求保留更久。
+    ai_call_log_retention_days: int = 180
+
     rank_cache_seconds: int = 10
 
     # ---- 地图服务（腾讯位置服务 WebService API）----

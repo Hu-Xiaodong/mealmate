@@ -518,6 +518,20 @@ class AIProvider(Base):
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=20)
     # 限制模型最多输出多少 token（模型计费与长度单位），防止异常长回复拖慢响应。
     max_output_tokens: Mapped[int] = mapped_column(Integer, default=800)
+    # 模型上下文窗口大小，单位 token。
+    #
+    # 什么是上下文窗口：模型一次请求最多能“看到”多少内容，
+    # 包括系统提示词、历史对话、当前问题和模型自己的回答。
+    # 超过这个上限，供应商会直接报错（context length exceeded），
+    # 而不是自动截断，所以必须由调用方自己控制。
+    #
+    # 为什么必须由运营在后台填写而不是代码写死：
+    # 不同模型差别很大（4K、8K、32K、128K 都有），而且同一家供应商
+    # 不同型号也不一样；代码写死会导致换模型后要么浪费额度、要么直接报错。
+    #
+    # 默认 32768 只是保守起点，运营新增模型时应按供应商文档填写；
+    # 填大了不会立刻出问题，但会在真实请求超过模型上限时触发自动减半兜底。
+    context_window_tokens: Mapped[int] = mapped_column(Integer, default=32768)
     # 最近一次“测试连接”的结果，便于运营在后台直接看到是否可用。
     last_test_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -611,6 +625,115 @@ class AICallTrace(Base):
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 该步骤自身的耗时，单位毫秒；不是整次调用的耗时。
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
+class AIConversation(Base):
+    """一次 AI 会话（一段连续对话）。
+
+    为什么要单独建会话表，而不是只把消息一条条存下来：
+    1. “最近 8 条”和“超过窗口的旧对话”需要按会话范围计算，
+       没有会话归属就只能靠时间窗猜测，用户同时开多个话题时会串味；
+    2. 30 分钟无操作自动开新会话，需要记录最后一次操作时间；
+    3. 对话摘要（旧消息压缩后的结果）属于会话级数据，不适合重复存在每条消息上。
+
+    为什么游客不写这张表：
+    产品方案是“游客记录存本地，登录后合并上云”。游客没有稳定账号，
+    服务端只把最近 30 分钟的消息放在 Redis 里做多轮上下文，
+    Redis 过期即自然结束；客户端负责游客的长期本地记录。
+    登录用户才有 user_id，并在数据库中长期保存（默认 30 天）。
+
+    为什么 summary 和 summary_message_count 放在会话上：
+    压缩历史时，我们只把“超出最近 8 条窗口的旧消息”合并成一段摘要，
+    再记住已经合并到第几条。这样下一轮压缩只需要处理新增的旧消息，
+    不会把已经压缩过的内容反复喂给模型，既省钱又避免摘要越滚越失真。
+    """
+
+    __tablename__ = "ai_conversations"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    # 调用者标识：登录用户是 user:xxx，游客是 guest:设备号。用于日志与游客 Redis 归属校验。
+    subject_ref: Mapped[str] = mapped_column(String(80), index=True)
+    # 登录用户编号；游客为空。删除账号时按这个字段级联清理 AI 记录。
+    user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )
+    # 客户端生成的会话标识，只在“登录后把本地记录合并上云”时使用。
+    # 有了它，同一批本地记录重复同步时不会在云端建出多份。
+    client_conversation_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    # 产生会话的入口：home 首页、post 饭帖详情、recipe_list 菜谱列表。
+    context_type: Mapped[str] = mapped_column(String(20), default="home")
+    # 会话标题：取第一条用户消息的前 30 个字，历史列表直接展示。
+    title: Mapped[str] = mapped_column(String(60), default="")
+    # 旧对话压缩后的摘要。为空表示还没有触发过压缩。
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 已有多少条（按时间正序）消息被合并进 summary。
+    # 压缩只处理这个位置之后、最近窗口之前的消息。
+    summary_message_count: Mapped[int] = mapped_column(Integer, default=0)
+    # 消息总条数。列表页不需要再对消息表做 count 查询。
+    message_count: Mapped[int] = mapped_column(Integer, default=0)
+    # 最后一次有消息的时间。超过 30 分钟视为新会话；超过 30 天由清理任务删除。
+    last_active_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "client_conversation_id",
+            name="uq_ai_conversation_client",
+        ),
+    )
+
+
+class AIMessage(Base):
+    """会话中的一条消息。
+
+    为什么用户消息和助手消息放同一张表：
+    它们只是 role 不同，查询“最近 8 条”“第 N 条之后的消息”时
+    必须按时间统一排序。拆成两张表会让每次查询都要做合并排序，
+    也容易在压缩计数时对不上。
+
+    为什么需要 client_message_id：
+    移动端是“本地为主”：消息先在本地生成唯一编号并立即展示。
+    登录后把本地记录同步上云、或网络重试导致同一请求到达两次时，
+    服务端用（会话编号 + 客户端消息编号）做唯一约束，
+    重复写入直接跳过，避免历史里出现两条一模一样的话。
+    """
+
+    __tablename__ = "ai_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            "client_message_id",
+            name="uq_ai_message_client",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("ai_conversations.id"), index=True
+    )
+    # 冗余保存用户编号：清理账号数据时可以直接按 user_id 删除，
+    # 不必先查会话再删消息；游客消息为 None。
+    user_id: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
+    # 客户端生成的唯一编号。服务端自己产生的消息也遵守同一规则。
+    client_message_id: Mapped[str] = mapped_column(String(64))
+    # user 用户、assistant 助手。system 提示词由服务端固定，不落库。
+    role: Mapped[str] = mapped_column(String(20))
+    # 消息正文。用户问题最长 500 字，助手回答限制 400 字，Text 足够，
+    # 使用 Text 是为了同步本地记录时不必因为超长内容丢数据。
+    content: Mapped[str] = mapped_column(Text)
+    # 估算的 token 数。中文按 1 字约 1 token、英文按 4 字符约 1 token 估算，
+    # 用于判断是否达到模型窗口的 60% 触发压缩。不是计费口径，只做容量判断。
+    token_estimate: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )
