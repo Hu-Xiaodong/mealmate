@@ -1,18 +1,24 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { ArrowLeft, Refresh } from '@element-plus/icons-vue'
 
-import { getAICallLog } from '@/api/admin'
+import { getAICallLog, scoreAICallLog } from '@/api/admin'
 import type { AICallLogDetail } from '@/api/types'
+import { useAdminStore } from '@/stores/admin'
 import { formatDateTime, type TagType } from '@/utils/format'
 
 const route = useRoute()
 const router = useRouter()
+const store = useAdminStore()
 
 const loading = ref(false)
 const detail = ref<AICallLogDetail | null>(null)
+const scoring = ref(false)
+const scoreForm = reactive({ score: 5, comment: '' })
+// 评分属于“评测写入”，与查看日志分开授权：运营可以打分，但改不了模型配置。
+const canScore = computed(() => store.hasPermission('ai.eval.write'))
 
 const CONTEXT_LABELS: Record<string, string> = {
   home: '首页',
@@ -60,6 +66,25 @@ function statusMeta(value: string) {
   return STATUS_META[value] || { label: value || '-', type: 'info' as TagType }
 }
 
+// 提示词来源决定排查方向：本地改过就看后台，代码默认值就要发版本。
+const PROMPT_SOURCE_LABELS: Record<string, string> = {
+  local: '本地数据库',
+  langfuse: 'Langfuse',
+  default: '代码默认值',
+}
+
+function promptSourceLabel(value?: string | null) {
+  if (!value) {
+    return '-'
+  }
+  return PROMPT_SOURCE_LABELS[value] || value
+}
+
+// 精确到 6 位小数：单次调用可能只有 0.0001 美元，四舍五入过早会全显示成 0。
+function formatCost(value?: number | null) {
+  return `$${(value ?? 0).toFixed(6)}`
+}
+
 /**
  * 把所有步骤拼成一份连续文本。
  *
@@ -83,6 +108,8 @@ const traceText = computed(() => {
     `状态：${statusMeta(log.status).label}`,
     `耗时：${log.latencyMs} ms`,
     `Token：输入 ${log.promptTokens} / 输出 ${log.completionTokens} / 合计 ${log.totalTokens}`,
+    `成本：${formatCost(log.costUsd)}（按调用时单价固定，后续调价不改写历史）`,
+    `提示词：${log.promptName || '-'} / v${log.promptVersion ?? '-'} / 来源 ${promptSourceLabel(log.promptSource)}`,
     `调用者：${log.subjectRef || '-'}`,
   ]
   if (log.errorCode || log.errorMessage) {
@@ -135,6 +162,36 @@ async function load() {
 
 function back() {
   router.push('/ai-call-logs')
+}
+
+/**
+ * 提交人工评分。
+ *
+ * 评分先保存在本地数据库，再尽力同步到 Langfuse。
+ * 所以即使 Langfuse 未配置或网络失败，这里也会返回成功，
+ * 列表里用“已同步 / 未同步”标签区分，便于以后补推。
+ */
+async function submitScore() {
+  const log = detail.value
+  if (!log) {
+    return
+  }
+  scoring.value = true
+  try {
+    const item = await scoreAICallLog(log.id, {
+      score: scoreForm.score,
+      comment: scoreForm.comment.trim() || undefined,
+    })
+    log.scores.unshift(item)
+    scoreForm.comment = ''
+    ElMessage.success(
+      item.langfuseSynced ? '评分已保存并同步到 Langfuse' : '评分已保存（Langfuse 未同步）',
+    )
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '评分失败')
+  } finally {
+    scoring.value = false
+  }
 }
 
 onMounted(load)
@@ -200,10 +257,66 @@ watch(() => route.params.id, load)
           <el-descriptions-item label="请求标识">
             <span class="mono">{{ detail.requestId || '-' }}</span>
           </el-descriptions-item>
-          <el-descriptions-item label="调用编号" :span="3">
+          <el-descriptions-item label="提示词版本">
+            <template v-if="detail.promptName">
+              <span class="mono">{{ detail.promptName }}</span>
+              <el-tag size="small" effect="plain" class="prompt-tag">
+                v{{ detail.promptVersion ?? '-' }}
+              </el-tag>
+              <el-tag size="small" type="info" effect="plain">
+                {{ promptSourceLabel(detail.promptSource) }}
+              </el-tag>
+            </template>
+            <span v-else class="muted">未记录（功能上线前的日志）</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="成本">
+            {{ formatCost(detail.costUsd) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="调用编号">
             <span class="mono">{{ detail.id }}</span>
           </el-descriptions-item>
         </el-descriptions>
+      </section>
+
+      <section class="panel">
+        <h3 class="drawer-section__title">人工评测</h3>
+        <div v-if="detail.scores.length" class="score-list">
+          <div v-for="item in detail.scores" :key="item.id" class="score-item">
+            <el-rate :model-value="item.score" disabled show-score />
+            <el-tag
+              :type="item.langfuseSynced ? 'success' : 'info'"
+              size="small"
+              effect="plain"
+            >
+              {{ item.langfuseSynced ? '已同步 Langfuse' : '未同步 Langfuse' }}
+            </el-tag>
+            <span class="muted score-meta">
+              {{ item.scorerName }} · {{ formatDateTime(item.createdAt) }}
+            </span>
+            <p v-if="item.comment" class="score-comment">{{ item.comment }}</p>
+          </div>
+        </div>
+        <p v-else class="muted">还没有评分。评分用于对比不同提示词版本的回答质量。</p>
+
+        <div v-if="canScore" class="score-form">
+          <el-rate v-model="scoreForm.score" show-text :texts="['很差', '较差', '一般', '不错', '很好']" />
+          <el-input
+            v-model="scoreForm.comment"
+            type="textarea"
+            :rows="2"
+            maxlength="500"
+            show-word-limit
+            placeholder="可选：为什么给这个分，例如“推荐菜谱正确但回答太长”"
+          />
+          <el-button type="primary" :loading="scoring" @click="submitScore">
+            提交评分
+          </el-button>
+        </div>
+        <p v-else class="muted">当前账号没有评测写入权限，只能查看已有评分。</p>
+        <p class="footnote muted">
+          评分先写入本地数据库，再尽力同步 Langfuse。Langfuse 未配置或网络失败时，
+          评分仍然保留，标签会显示“未同步”。
+        </p>
       </section>
 
       <section class="panel">
@@ -266,5 +379,42 @@ watch(() => route.params.id, load)
   margin: 12px 0 0;
   font-size: 12px;
   line-height: 1.7;
+}
+
+.score-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.score-item {
+  padding: 10px 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  background: var(--el-fill-color-lighter);
+}
+
+.score-meta {
+  margin-left: 10px;
+  font-size: 12px;
+}
+
+.score-comment {
+  margin: 6px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.score-form {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  max-width: 560px;
+}
+
+.prompt-tag {
+  margin: 0 0 0 6px;
 }
 </style>

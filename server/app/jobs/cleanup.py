@@ -31,7 +31,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.db.models import AICallLog, AICallTrace
+from app.db.models import AICallLog, AICallScore, AICallTrace
 from app.db.session import SessionLocal
 from app.services.ai_history_service import (
     purge_expired_conversations,
@@ -61,8 +61,15 @@ async def purge_expired_call_logs(
         trace_result = await db.execute(
             delete(AICallTrace).where(AICallTrace.created_at < cutoff)
         )
+        score_result = await db.execute(
+            delete(AICallScore).where(AICallScore.created_at < cutoff)
+        )
         await db.commit()
-        return {"callLogs": 0, "callTraces": int(trace_result.rowcount or 0)}
+        return {
+            "callLogs": 0,
+            "callTraces": int(trace_result.rowcount or 0),
+            "callScores": int(score_result.rowcount or 0),
+        }
 
     trace_result = await db.execute(
         delete(AICallTrace).where(
@@ -70,15 +77,27 @@ async def purge_expired_call_logs(
             | (AICallTrace.created_at < cutoff)
         )
     )
+    # 评分跟随调用日志保留 180 天，日志删掉后评分也没有了归属。
+    score_result = await db.execute(
+        delete(AICallScore).where(
+            (AICallScore.call_log_id.in_(log_ids))
+            | (AICallScore.created_at < cutoff)
+        )
+    )
     await db.execute(delete(AICallLog).where(AICallLog.id.in_(log_ids)))
     await db.commit()
     logger.info(
-        "清理 AI 调用日志：%s 条日志、%s 条明细（早于 %s 天）",
+        "清理 AI 调用日志：%s 条日志、%s 条明细、%s 条评分（早于 %s 天）",
         len(log_ids),
         trace_result.rowcount or 0,
+        score_result.rowcount or 0,
         days,
     )
-    return {"callLogs": len(log_ids), "callTraces": int(trace_result.rowcount or 0)}
+    return {
+        "callLogs": len(log_ids),
+        "callTraces": int(trace_result.rowcount or 0),
+        "callScores": int(score_result.rowcount or 0),
+    }
 
 
 async def run_cleanup() -> dict[str, int]:
@@ -97,6 +116,7 @@ async def run_cleanup() -> dict[str, int]:
         "orphanConversations": orphan_conversations,
         "callLogs": logs["callLogs"],
         "callTraces": logs["callTraces"],
+        "callScores": logs["callScores"],
     }
     logger.info("AI 数据清理完成：%s", result)
     return result
@@ -113,7 +133,8 @@ def main() -> None:
         f"过期会话 {result['expiredConversations']} 段，"
         f"孤儿会话 {result['orphanConversations']} 段，"
         f"调用日志 {result['callLogs']} 条，"
-        f"调用明细 {result['callTraces']} 条"
+        f"调用明细 {result['callTraces']} 条，"
+        f"人工评分 {result['callScores']} 条"
     )
 
 

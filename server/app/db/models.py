@@ -8,15 +8,19 @@ from datetime import date, datetime
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, utcnow
@@ -532,6 +536,17 @@ class AIProvider(Base):
     # 默认 32768 只是保守起点，运营新增模型时应按供应商文档填写；
     # 填大了不会立刻出问题，但会在真实请求超过模型上限时触发自动减半兜底。
     context_window_tokens: Mapped[int] = mapped_column(Integer, default=32768)
+    # 输入与输出价格，单位：美元 / 1000 token。
+    #
+    # 为什么要自己在配置里存单价：
+    # Langfuse 只有在认识某个模型时才会自动算成本；本项目接的是自建模型、
+    # 国内厂商模型和各种改名版本，Langfuse 的预置价格表未必覆盖。
+    # 由运营按供应商账单填写单价后，上报调用时直接带上成本，
+    # 看板就能算出“这次问答花了多少钱”，不依赖第三方价格库。
+    #
+    # 默认 0 表示“未填写单价”：成本显示为 0，但不影响 Token 与调用次数统计。
+    input_price_per_1k: Mapped[float] = mapped_column(Float, default=0.0)
+    output_price_per_1k: Mapped[float] = mapped_column(Float, default=0.0)
     # 最近一次“测试连接”的结果，便于运营在后台直接看到是否可用。
     last_test_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -579,6 +594,20 @@ class AICallLog(Base):
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
     error_code: Mapped[str | None] = mapped_column(String(40), nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # 本次调用实际使用的提示词名称、版本与来源。
+    #
+    # 为什么要落到调用日志里：
+    # 提示词版本管理如果不能和调用结果关联，就只能“看版本”，不能回答
+    # “v3 和 v4 哪个失败率高、哪个评分低”。本地记录不依赖 Langfuse，
+    # 没接观测平台时也能按版本做对比。
+    prompt_name: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    prompt_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # local 本地版本；langfuse 远端版本；default 代码默认值。
+    prompt_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # 本次调用按模型单价计算出的美元成本。
+    # 在调用时就算好并落库，而不是看板查询时再乘单价：
+    # 供应商调价后，历史调用仍按当时的单价计算，成本趋势不会被改写。
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )
@@ -626,6 +655,146 @@ class AICallTrace(Base):
     # 该步骤自身的耗时，单位毫秒；不是整次调用的耗时。
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
+class AICallScore(Base):
+    """人工对一次 AI 回答的评分。
+
+    为什么评分要自己存一份，而不是只写进 Langfuse：
+    1. Langfuse 是可选接入。没有配置密钥时，评测功能仍然要能用；
+    2. 本地表能直接和调用日志、调用过程明细关联，后台打开详情就能看到；
+    3. 评分属于用户质量数据，保留策略跟随调用日志（180 天），
+       不能被第三方服务的保留期限制。
+
+    Langfuse 配置成功后，评分会同时推送一份过去，方便在 Langfuse 里做趋势；
+    推送失败不影响本地保存，下一次仍可重新提交。
+    """
+
+    __tablename__ = "ai_call_scores"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    # 被评分的调用日志编号，对应 ai_call_logs.id。
+    # 不做外键：与调用日志的保留策略保持一致，由清理任务按时间删除。
+    call_log_id: Mapped[str] = mapped_column(String(40), index=True)
+    # 评分值：1 到 5，5 表示最好。
+    # 为什么用 1-5 而不是 0/1：人工标注时二分法太粗，
+    # 五级量表能区分“能用但一般”和“明显答错”，也方便算平均分趋势。
+    score: Mapped[int] = mapped_column(Integer)
+    # 评语：为什么给这个分。可以为空，但建议填写，便于复盘。
+    comment: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # 评分人显示名。保存快照而不是只存编号，管理员改名或删除后历史仍可读。
+    scorer_name: Mapped[str] = mapped_column(String(80))
+    # 来源：manual 人工评分；以后接入自动评测时可写 auto。
+    source: Mapped[str] = mapped_column(String(20), default="manual")
+    # 是否已经成功推送到 Langfuse。未配置或推送失败时为 false，便于补推。
+    langfuse_synced: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
+class AIPromptVersion(Base):
+    """提示词版本（本地为主，Langfuse 可选镜像）。
+
+    为什么提示词版本要存自己的数据库：
+    1. 提示词管理是核心能力，不能在没接 Langfuse 时不可用；
+    2. 版本记录需要和调用日志、评分放在同一个库里，才能按版本做质量对比；
+    3. 版本内容属于业务配置，保留时间和权限由自己控制。
+
+    版本规则与 Langfuse 保持一致：
+    - 每次发布新增一行，旧版本不可修改；
+    - status=production 表示线上正在使用，同一名称同时只有一行；
+    - 回滚不是改内容，而是把 production 状态移回旧版本（本项目通过
+      “用旧内容发布一个新版本”实现，历史仍然完整）。
+    """
+
+    __tablename__ = "ai_prompt_versions"
+    __table_args__ = (UniqueConstraint("name", "version", name="uq_prompt_name_version"),)
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    # 提示词名称，例如 mealmate.chat.system。
+    name: Mapped[str] = mapped_column(String(80), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    content: Mapped[str] = mapped_column(Text)
+    # production 线上版本；archived 历史版本。
+    status: Mapped[str] = mapped_column(String(20), default="production", index=True)
+    # 变更说明，便于回溯“为什么改这一版”。
+    commit_message: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # 发布人显示名快照，管理员改名或删除后历史仍可读。
+    created_by: Mapped[str] = mapped_column(String(80))
+    # 同步到 Langfuse 后记录远端版本号；未配置或失败时为 NULL。
+    # 只作为镜像状态展示，不作为运行时读取依据。
+    langfuse_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 发布时专属变量的快照（只记录该提示词自己的变量）。
+    # 共用变量是全局配置，不进入版本快照；专属变量跟随版本回滚。
+    # PostgreSQL 用 JSONB 存，SQLite 测试环境退回普通 JSON。
+    variables: Mapped[list[dict] | None] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
+class AIPromptVariable(Base):
+    """提示词变量：维护者自定义 Key / Value，供提示词正文用 {{key}} 引用。
+
+    两类作用域：
+    - shared：共用变量，所有提示词都能查看和引用，保存后全局生效；
+    - prompt：专属变量，绑定到单个提示词，跟着提示词一起发布和回滚。
+
+    为什么不用 JSON 字段直接挂在提示词上：
+    变量需要在「变量管理」页按 Key 查询、按提示词筛选、单独删除，
+    并且要能判断“删除后有没有已发布提示词缺值”，用独立表才能做唯一约束和引用检查。
+
+    唯一性由数据库保证：
+    - 共用变量：同一个 key 只能有一条；
+    - 专属变量：同一个提示词下同一个 key 只能有一条。
+    这里使用“部分唯一索引”，因为 SQLite 和 PostgreSQL 都把 NULL 视为不相等，
+    普通联合唯一约束无法约束“prompt_name 为空的共用变量”。
+    """
+
+    __tablename__ = "ai_prompt_variables"
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN ('shared', 'prompt')",
+            name="ck_ai_prompt_variable_scope",
+        ),
+        Index(
+            "uq_ai_prompt_variable_shared_key",
+            "key",
+            unique=True,
+            postgresql_where=text("scope = 'shared'"),
+            sqlite_where=text("scope = 'shared'"),
+        ),
+        Index(
+            "uq_ai_prompt_variable_prompt_key",
+            "prompt_name",
+            "key",
+            unique=True,
+            postgresql_where=text("scope = 'prompt'"),
+            sqlite_where=text("scope = 'prompt'"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    key: Mapped[str] = mapped_column(String(80), index=True)
+    # 变量值。允许为空字符串：空值在解析时视为“没有提供值”，继续向下一层取值。
+    value: Mapped[str] = mapped_column(Text, default="")
+    # 可选默认值：专属值和共用值都没有时使用。
+    default_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # shared 共用；prompt 专属。
+    scope: Mapped[str] = mapped_column(String(20), default="shared", index=True)
+    # 专属变量绑定的提示词名称；共用变量为 NULL。
+    prompt_name: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    # 最后修改人显示名快照，便于审计与排查。
+    updated_by: Mapped[str] = mapped_column(String(80), default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )
 

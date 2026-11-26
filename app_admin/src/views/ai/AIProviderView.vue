@@ -34,6 +34,8 @@ function emptyForm(): AIProviderForm {
     timeoutSeconds: 20,
     maxOutputTokens: 800,
     contextWindowTokens: 32768,
+    inputPricePer1k: 0,
+    outputPricePer1k: 0,
   }
 }
 
@@ -71,7 +73,11 @@ function openEdit(item: AIProviderItem) {
     priority: item.priority,
     timeoutSeconds: item.timeoutSeconds,
     maxOutputTokens: item.maxOutputTokens,
-    contextWindowTokens: item.contextWindowTokens,
+    // 后端版本较旧时列表可能没有这个字段，回填默认值，
+    // 避免页面上出现空白的数字输入框或渲染报错。
+    contextWindowTokens: item.contextWindowTokens ?? 32768,
+    inputPricePer1k: item.inputPricePer1k ?? 0,
+    outputPricePer1k: item.outputPricePer1k ?? 0,
   })
   dialogVisible.value = true
 }
@@ -122,6 +128,8 @@ async function save() {
       timeoutSeconds: form.timeoutSeconds,
       maxOutputTokens: form.maxOutputTokens,
       contextWindowTokens: form.contextWindowTokens,
+      inputPricePer1k: form.inputPricePer1k,
+      outputPricePer1k: form.outputPricePer1k,
     }
     // 编辑时留空表示保留原密钥，不把空字符串发给后端覆盖。
     if (form.apiKey.trim()) {
@@ -247,9 +255,17 @@ onMounted(load)
       <el-table-column prop="apiKeyMasked" label="密钥" width="170" />
       <el-table-column label="上下文窗口" width="130" align="center">
         <template #default="{ row }">
-          <span v-if="row.kind === 'chat'">
+          <span v-if="row.kind === 'chat' && row.contextWindowTokens">
             {{ row.contextWindowTokens.toLocaleString() }} token
           </span>
+          <span v-else class="muted">—</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="单价（美元/千 token）" width="170" align="center">
+        <template #default="{ row }">
+          <div v-if="row.kind === 'chat'">
+            输入 {{ row.inputPricePer1k || 0 }} / 输出 {{ row.outputPricePer1k || 0 }}
+          </div>
           <span v-else class="muted">—</span>
         </template>
       </el-table-column>
@@ -365,6 +381,31 @@ onMounted(load)
             单位 token，按供应商文档填写。历史达到该窗口的 60% 时，
             超出最近 8 条的旧对话会被压缩成摘要；填得比模型真实上限大时，
             系统会自动砍半重试，并在调用日志里记录配置错误。
+          </div>
+        </el-form-item>
+        <el-form-item v-if="form.kind === 'chat'" label="输入单价">
+          <el-input-number
+            v-model="form.inputPricePer1k"
+            :min="0"
+            :max="10000"
+            :precision="4"
+            :step="0.1"
+          />
+          <div class="muted form-hint">
+            单位：美元 / 1000 token。按供应商账单填写；填 0 表示暂不计算成本，
+            不影响调用次数与 Token 统计。
+          </div>
+        </el-form-item>
+        <el-form-item v-if="form.kind === 'chat'" label="输出单价">
+          <el-input-number
+            v-model="form.outputPricePer1k"
+            :min="0"
+            :max="10000"
+            :precision="4"
+            :step="0.1"
+          />
+          <div class="muted form-hint">
+            单位：美元 / 1000 token。输入与输出分开计价，是因为多数供应商输出更贵。
           </div>
         </el-form-item>
         <el-form-item label="立即启用">

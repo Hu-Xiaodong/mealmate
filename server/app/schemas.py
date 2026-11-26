@@ -310,6 +310,17 @@ class AIProviderCreateRequest(CamelModel):
     # 模型上下文窗口，单位 token。用来判断历史是否达到 60% 的压缩阈值。
     # 上限 2000000 只是挡住误输入；真实值以供应商文档为准。
     context_window_tokens: int = Field(default=32768, ge=1024, le=2000000)
+    # 单价，单位：美元 / 1000 token。用于计算成本；0 表示未填写。
+    # 上限只是挡住误输入，真实价格以供应商账单为准。
+    #
+    # 这里显式写 alias，是因为自动驼峰转换会把 1k 转成 "1K"，
+    # 与前端约定的 inputPricePer1k 不一致；显式声明后接口字段稳定。
+    input_price_per_1k: float = Field(
+        default=0, ge=0, le=10000, alias="inputPricePer1k"
+    )
+    output_price_per_1k: float = Field(
+        default=0, ge=0, le=10000, alias="outputPricePer1k"
+    )
 
     @model_validator(mode="after")
     def _normalize_kind(self):
@@ -345,6 +356,80 @@ class AIProviderUpdateRequest(CamelModel):
     timeout_seconds: int | None = Field(default=None, ge=3, le=120)
     max_output_tokens: int | None = Field(default=None, ge=100, le=4000)
     context_window_tokens: int | None = Field(default=None, ge=1024, le=2000000)
+    input_price_per_1k: float | None = Field(
+        default=None, ge=0, le=10000, alias="inputPricePer1k"
+    )
+    output_price_per_1k: float | None = Field(
+        default=None, ge=0, le=10000, alias="outputPricePer1k"
+    )
+
+
+class AICallScoreRequest(CamelModel):
+    """给一次 AI 回答打人工分。
+
+    评分值固定 1-5：五级量表比“好/坏”二分更能区分“能用但一般”，
+    平均分也更适合做趋势对比。评语可选，但建议填写原因。
+    """
+
+    score: int = Field(ge=1, le=5)
+    comment: str | None = Field(default=None, max_length=500)
+
+
+class PromptVariableInput(CamelModel):
+    """编辑器里的一行提示词变量。
+
+    value 允许为空：空值表示“没有提供值”，解析时会继续使用共用变量或默认值。
+    """
+
+    key: str = Field(min_length=1, max_length=80)
+    value: str = Field(default="", max_length=20000)
+    default_value: str | None = Field(default=None, max_length=20000)
+
+
+class PromptVariableSaveRequest(PromptVariableInput):
+    """变量管理页新增或修改变量。"""
+
+    scope: Literal["shared", "prompt"]
+    prompt_name: str | None = Field(default=None, max_length=80)
+
+    @model_validator(mode="after")
+    def _check_scope(self):
+        if self.scope == "prompt" and not (self.prompt_name or "").strip():
+            raise ValueError("专属变量必须选择提示词")
+        if self.scope == "shared" and self.prompt_name:
+            raise ValueError("共用变量不能绑定提示词")
+        return self
+
+
+class PromptPublishRequest(CamelModel):
+    """发布一个新的提示词版本。
+
+    content 是完整提示词正文；Langfuse 的提示词版本是不可修改的，
+    每次发布都会生成新版本，旧版本保留，方便回滚和对比。
+    variables 是编辑器提交的专属变量列表；不传表示沿用数据库当前值。
+    """
+
+    content: str = Field(min_length=1, max_length=20000)
+    commit_message: str | None = Field(default=None, max_length=200)
+    variables: list[PromptVariableInput] | None = None
+
+
+class PromptPreviewRequest(CamelModel):
+    """预览提示词渲染结果。
+
+    content 为空时使用当前线上正文；
+    variables 为编辑器里尚未保存的专属变量，传空数组表示删除全部专属变量。
+    """
+
+    content: str | None = Field(default=None, min_length=1, max_length=20000)
+    variables: list[PromptVariableInput] | None = None
+
+
+class PromptRollbackRequest(CamelModel):
+    """把某个历史版本的内容和专属变量恢复成新的线上版本。"""
+
+    version: int = Field(ge=1)
+    commit_message: str | None = Field(default=None, max_length=200)
 
 
 class KbIndexVersionCreateRequest(CamelModel):

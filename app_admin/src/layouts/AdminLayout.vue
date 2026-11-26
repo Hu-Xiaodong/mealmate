@@ -10,10 +10,13 @@ import {
   DataAnalysis,
   Dish,
   Document,
+  EditPen,
+  Key,
   List,
   PriceTag,
   SwitchButton,
   Tickets,
+  TrendCharts,
   User,
 } from '@element-plus/icons-vue'
 
@@ -31,6 +34,9 @@ const iconMap: Record<string, Component> = {
   '/taste-tags': PriceTag,
   '/ai-providers': Cpu,
   '/ai-call-logs': Tickets,
+  '/ai-observability': TrendCharts,
+  '/ai-prompts': EditPen,
+  '/prompt-variables': Key,
   '/knowledge-base': Collection,
   '/users': User,
   '/admins': Avatar,

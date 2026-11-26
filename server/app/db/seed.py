@@ -17,6 +17,7 @@ from app.db.models import (
     AdminRolePermission,
     AdminUser,
     AdminUserRole,
+    AIPromptVariable,
     Like,
     MealPost,
     MediaAsset,
@@ -25,6 +26,7 @@ from app.db.models import (
     TasteTag,
     User,
 )
+from app.services.prompt_variable_service import DEFAULT_SHARED_VARIABLES
 from app.utils.time import business_day_bounds, now_utc
 
 SEED_AUTHORS = [
@@ -56,7 +58,7 @@ ROLE_DEFINITIONS = [
     (
         "ai_operator",
         "AI 运营",
-        ["ai.log.read", "ai.config.write", "kb.document.manage", "kb.search.test"],
+        ["ai.log.read", "ai.config.write", "ai.eval.write", "kb.document.manage", "kb.search.test"],
     ),
     # 审计员只读：能看用户列表和审计日志，不能修改任何数据。
     ("auditor", "审计员", ["audit.read", "user.read"]),
@@ -558,6 +560,36 @@ async def seed_demo_data(db: AsyncSession) -> None:
     await db.commit()
 
 
+async def _seed_prompt_variables(db: AsyncSession) -> None:
+    """补齐提示词默认共用变量。
+
+    这些不是后端硬编码限制，而是初始默认配置：
+    维护者可以在「变量管理」里改值，提示词正文只引用 Key。
+    幂等：已存在的 Key 不覆盖，避免重启把运营改过的值冲掉。
+    """
+    existing = set(
+        (
+            await db.scalars(
+                select(AIPromptVariable.key).where(AIPromptVariable.scope == "shared")
+            )
+        ).all()
+    )
+    for key, value in DEFAULT_SHARED_VARIABLES:
+        if key in existing:
+            continue
+        db.add(
+            AIPromptVariable(
+                id=new_id("aiv"),
+                key=key,
+                value=value,
+                default_value=None,
+                scope="shared",
+                prompt_name=None,
+                updated_by="system",
+            )
+        )
+
+
 async def seed_admin_data(db: AsyncSession) -> None:
     """初始化后台角色、权限点和首个管理员。
 
@@ -565,6 +597,7 @@ async def seed_admin_data(db: AsyncSession) -> None:
     管理员密码只从环境变量 ADMIN_INITIAL_PASSWORD 读取；
     未配置时不创建账号，代码中不写死任何默认密码。
     """
+    await _seed_prompt_variables(db)
     roles = {role.code: role for role in (await db.scalars(select(AdminRole))).all()}
 
     for code, name, permissions in ROLE_DEFINITIONS:

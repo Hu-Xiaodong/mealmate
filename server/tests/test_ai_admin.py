@@ -509,6 +509,8 @@ async def test_call_log_detail_returns_execution_trace(client, monkeypatch):
         "tool_calls",
         "output_parse",
         "validation",
+        "cost_summary",
+        "sql_summary",
     ]
     assert [step["seq"] for step in traces] == list(range(1, len(traces) + 1))
 
@@ -527,6 +529,14 @@ async def test_call_log_detail_returns_execution_trace(client, monkeypatch):
     assert "未接入 MCP" in tool_step["detail"]
     validation_step = next(step for step in traces if step["step"] == "validation")
     assert "r_101" in validation_step["detail"]
+    # 末尾必须能直接核对成本与 Token，不用再翻列表页。
+    cost_step = next(step for step in traces if step["step"] == "cost_summary")
+    assert "总成本" in cost_step["detail"]
+    assert "总 Token" in cost_step["detail"]
+    # SQL 摘要只记录语句结构，且确实包含本次请求执行过的查询。
+    sql_step = next(step for step in traces if step["step"] == "sql_summary")
+    assert "SELECT" in sql_step["detail"]
+    assert "ai_providers" in sql_step["detail"]
 
 
 async def test_call_log_detail_records_failure_and_fallback(client, monkeypatch):

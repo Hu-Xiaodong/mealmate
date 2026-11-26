@@ -4,12 +4,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.admin_deps import AdminPrincipal, client_ip, require_permission
 from app.core.responses import ok
 from app.db.session import get_db
-from app.schemas import AIProviderCreateRequest, AIProviderUpdateRequest
+from app.schemas import (
+    AICallScoreRequest,
+    AIProviderCreateRequest,
+    AIProviderUpdateRequest,
+)
 from app.services.admin_ai_provider_service import (
+    add_call_score,
     create_provider,
     delete_provider,
     get_call_log_detail,
     list_call_logs,
+    list_call_scores,
     list_providers,
     test_provider,
     update_provider,
@@ -115,3 +121,39 @@ async def log_detail(
         详情按编号精确查询，打开一条加载一条，列表和详情互不影响。
     """
     return ok(await get_call_log_detail(db, log_id))
+
+
+@logs_router.get("/{log_id}/scores")
+async def log_scores(
+    log_id: str,
+    principal: AdminPrincipal = Depends(require_permission("ai.log.read")),
+    db: AsyncSession = Depends(get_db),
+):
+    """一次调用已有的人工评分，按时间倒序。"""
+    return ok({"items": await list_call_scores(db, log_id)})
+
+
+@logs_router.post("/{log_id}/scores")
+async def score_log(
+    log_id: str,
+    body: AICallScoreRequest,
+    request: Request,
+    principal: AdminPrincipal = Depends(require_permission("ai.eval.write")),
+    db: AsyncSession = Depends(get_db),
+):
+    """给一次 AI 回答打 1-5 分并写评语。
+
+    评分先保存到本地，再尽力同步 Langfuse；
+    Langfuse 不可用时仍然返回成功，只是标记为未同步。
+    """
+    return ok(
+        await add_call_score(
+            db,
+            principal.admin,
+            log_id,
+            score=body.score,
+            comment=body.comment,
+            ip=client_ip(request),
+        ),
+        "评分已保存",
+    )

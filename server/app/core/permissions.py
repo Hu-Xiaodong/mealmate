@@ -16,6 +16,9 @@ PERMISSION_LABELS: dict[str, str] = {
     "dashboard.read": "查看数据看板",
     "ai.log.read": "查看 AI 日志",
     "ai.config.write": "修改 AI 配置",
+    # 评测写入单独一个权限点：能给回答打分的人不一定能改模型配置，
+    # 这样运营可以参与质量评估，但碰不到密钥和模型参数。
+    "ai.eval.write": "提交 AI 评测评分",
     "kb.document.manage": "管理知识库文档",
     "kb.search.test": "知识库检索测试",
     "audit.read": "查看审计日志",

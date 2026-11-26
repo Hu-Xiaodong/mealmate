@@ -9,6 +9,7 @@ import type {
   AICallLogDetail,
   AICallLogItem,
   AICallLogParams,
+  AICallScoreItem,
   AIProviderForm,
   AIProviderItem,
   AIProviderTestResult,
@@ -25,9 +26,17 @@ import type {
   KbIndexVersionItem,
   KbSearchParams,
   KbSearchResult,
+  LangfuseMetrics,
+  LangfusePromptItem,
+  LangfusePromptVersion,
+  LangfuseStatus,
   LoginResult,
   MeResult,
   PageResult,
+  PromptPreviewResult,
+  PromptVariableInput,
+  PromptVariableItem,
+  PromptVariableSaveRequest,
   PostListParams,
   RecipeBatchResult,
   RecipeForm,
@@ -374,6 +383,123 @@ export function listAICallLogs(params: AICallLogParams) {
 export function getAICallLog(logId: string) {
   return request<AICallLogDetail>({
     url: `/admin/ai-call-logs/${logId}`,
+  })
+}
+
+/** 给一次模型调用提交人工评分。 */
+export function scoreAICallLog(
+  logId: string,
+  data: { score: number; comment?: string },
+) {
+  return request<AICallScoreItem>({
+    url: `/admin/ai-call-logs/${logId}/scores`,
+    method: 'post',
+    data,
+  })
+}
+
+export function getLangfuseStatus() {
+  return request<LangfuseStatus>({ url: '/admin/langfuse/status' })
+}
+
+/** 本地指标：不依赖 Langfuse，直接聚合调用日志与评分。 */
+export function getLocalAiMetrics(days: number) {
+  return request<LangfuseMetrics>({
+    url: '/admin/ai-metrics',
+    params: { days },
+  })
+}
+
+export function getLangfuseMetrics(days: number) {
+  return request<LangfuseMetrics>({
+    url: '/admin/langfuse/metrics',
+    params: { days },
+  })
+}
+
+export function listPrompts() {
+  return request<{ configured: boolean; warning: string; items: LangfusePromptItem[] }>({
+    url: '/admin/prompts',
+  })
+}
+
+export function listPromptVersions(name: string) {
+  return request<{ items: LangfusePromptVersion[] }>({
+    url: `/admin/prompts/${encodeURIComponent(name)}/versions`,
+  })
+}
+
+export function publishPrompt(
+  name: string,
+  data: {
+    content: string
+    commitMessage?: string
+    variables?: PromptVariableInput[]
+  },
+) {
+  return request<{
+    name: string
+    version: number | null
+    labels: string[]
+    langfuseVersion: number | null
+    langfuseConfigured: boolean
+  }>({
+    url: `/admin/prompts/${encodeURIComponent(name)}/publish`,
+    method: 'post',
+    data,
+  })
+}
+
+export function previewPrompt(
+  name: string,
+  data: { content?: string; variables?: PromptVariableInput[] },
+) {
+  return request<PromptPreviewResult>({
+    url: `/admin/prompts/${encodeURIComponent(name)}/preview`,
+    method: 'post',
+    data,
+  })
+}
+
+export function rollbackPrompt(
+  name: string,
+  data: { version: number; commitMessage?: string },
+) {
+  return request<{
+    name: string
+    version: number
+    rollbackFrom: number
+    langfuseVersion: number | null
+    langfuseConfigured: boolean
+  }>({
+    url: `/admin/prompts/${encodeURIComponent(name)}/rollback`,
+    method: 'post',
+    data,
+  })
+}
+
+export function listPromptVariables(promptName?: string) {
+  return request<{
+    items: PromptVariableItem[]
+    prompts: Array<{ name: string; title: string }>
+  }>({
+    url: '/admin/prompt-variables',
+    params: promptName ? { promptName } : undefined,
+  })
+}
+
+export function savePromptVariable(data: PromptVariableSaveRequest) {
+  return request<PromptVariableItem>({
+    url: '/admin/prompt-variables',
+    method: 'post',
+    data,
+  })
+}
+
+export function deletePromptVariable(id: string) {
+  return request<{ id: string }>({
+    url: `/admin/prompt-variables/${encodeURIComponent(id)}`,
+    method: 'delete',
   })
 }
 

@@ -24,13 +24,15 @@ import logging
 import re
 import time
 import traceback
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
+from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -46,6 +48,7 @@ from app.db.models import (
     User,
 )
 from app.schemas import AIChatRequest, AIConstraints
+from app.services import langfuse_service, prompt_service
 from app.services.ai_history_service import (
     ConversationState,
     append_turn,
@@ -58,6 +61,57 @@ from app.services.storage import object_url
 from app.utils.time import business_date
 
 logger = logging.getLogger("mealmate.ai")
+
+# 当前正在使用的提示词名称与版本。
+#
+# 为什么用上下文变量（ContextVar）传递：
+# 一次调用可能先取“摘要提示词”再取“主对话提示词”，如果用一个全局变量，
+# 并发请求会互相覆盖。上下文变量按异步任务隔离，每个请求只能看到自己的值。
+# 上报 Langfuse 时读取它，就能把“这次生成用的是哪个提示词版本”一起记下来。
+_prompt_context: ContextVar[tuple[str, int | None, str] | None] = ContextVar(
+    "ai_prompt_context", default=None
+)
+
+
+def _remember_prompt(snapshot: prompt_service.PromptSnapshot) -> None:
+    """记录本次调用使用的提示词来源，供调用日志与 Langfuse 上报使用。"""
+    _prompt_context.set((snapshot.key, snapshot.version, snapshot.source))
+
+
+# 当前请求实际执行过的 SQL 语句。
+#
+# 为什么用上下文变量：并发请求的 SQL 不能混在一起，每个异步任务只记录自己的。
+# 为什么默认是 None：不是所有调用都需要记录（例如后台清理任务），
+# 只有问答入口显式开始记录时才收集，避免无谓的字符串拼接。
+_sql_trace: ContextVar[list[str] | None] = ContextVar("ai_sql_trace", default=None)
+
+# 单次请求最多保留的 SQL 条数，防止一次复杂请求生成过大的日志。
+_MAX_SQL_TRACE_ITEMS = 30
+
+
+@event.listens_for(Engine, "before_cursor_execute")
+def _capture_sql(
+    _conn: Any,
+    _cursor: Any,
+    statement: str,
+    _parameters: Any,
+    _context: Any,
+    _executemany: bool,
+) -> None:
+    """记录 SQLAlchemy 即将执行的语句。
+
+    只记录语句结构，不记录参数值：
+    参数里可能有手机号、用户编号等敏感信息，而排查问题时
+    真正需要的是“查了哪张表、用了什么条件、排序和限制是什么”。
+    """
+    records = _sql_trace.get()
+    if records is None or len(records) >= _MAX_SQL_TRACE_ITEMS:
+        return
+    text = " ".join(str(statement).split())
+    if len(text) > 500:
+        text = text[:500] + "…（已截断）"
+    records.append(text)
+
 
 TOOL_LABELS = {
     "wok": "炒锅",
@@ -72,6 +126,14 @@ TOOL_LABELS = {
 # 也方便产品、法务统一调整口径。
 SOURCE_NOTE = "做法与耗时来自平台试做菜谱；AI 只做筛选和解释，不代表你的实际食材一定可食用。"
 
+# 以下四个是“资源上限”，不是内容规则。
+# 内容上推荐几道、回复多少字由提示词变量控制；
+# 后端只保留防止异常输出拖垮存储和界面的硬上限。
+MAX_REPLY_CHARS = 4000
+MAX_REASON_CHARS = 500
+MAX_SELECTED_RECIPES = 20
+MAX_LOCAL_RECOMMENDATIONS = 20
+
 # 模型必须按这个结构返回。为什么不使用 LangChain 的结构化输出解析器：
 # 不同厂商对 JSON 模式的支持程度不一致，自建兼容服务常常只支持普通对话；
 # 这里用“提示词约定 + 后端严格解析”，任何不合规的输出都会被丢弃并切换下一个模型。
@@ -83,14 +145,14 @@ SYSTEM_PROMPT = (
     "绝对禁止编造菜谱、编号、食材、步骤或耗时。\n\n"
     "请只返回一个 JSON 对象，不要 Markdown 代码块，不要任何多余解释：\n"
     "{\n"
-    '  "reply": "给用户的中文回复，不超过 200 个汉字",\n'
+    '  "reply": "给用户的中文回复，控制在 {{max_reply_chars}} 个汉字以内",\n'
     '  "constraints": {"maxMinutes": null, "tools": [], "ingredients": [], "avoid": []},\n'
     '  "recipeIds": ["菜谱编号"],\n'
-    '  "reasons": {"菜谱编号": "推荐理由，不超过 30 个汉字"}\n'
+    '  "reasons": {"菜谱编号": "推荐理由，控制在 {{max_reason_chars}} 个汉字以内"}\n'
     "}\n\n"
     "规则：\n"
     "1. 一般性问题直接回答，recipeIds 返回空数组；\n"
-    "2. 需要推荐菜谱时，recipeIds 最多 3 个，必须原样来自目录，不能重复；\n"
+    "2. 需要推荐菜谱时，recipeIds 最多 {{max_recipes}} 个，必须原样来自目录，不能重复；\n"
     "3. 用户给出时间上限时，只选耗时不超过该值的菜谱；\n"
     "4. 用户指定器具时，菜谱所需器具必须全部在用户可用器具内；\n"
     "5. 用户说不吃或忌口的食材，不能出现在菜谱标题、主要食材或配料里；\n"
@@ -115,13 +177,13 @@ STREAM_SYSTEM_PROMPT = (
     "“已发布菜谱目录”里挑选，绝对禁止编造菜谱、编号、食材、步骤或耗时。\n\n"
     "请严格按照下面的标签格式输出，不要 Markdown 代码块，不要额外解释：\n"
     "<reply>\n"
-    "给用户的中文回复，不超过 200 个汉字\n"
+    "给用户的中文回复，控制在 {{max_reply_chars}} 个汉字以内\n"
     "</reply>\n"
     "<recipes>r_101,r_104</recipes>\n"
     "<reasons>r_101=十五分钟搞定；r_104=不用开火</reasons>\n\n"
     "规则：\n"
     "1. 一般性问题直接回答，<recipes> 留空；\n"
-    "2. 需要推荐菜谱时最多 3 个，编号必须原样来自目录，不能重复；\n"
+    "2. 需要推荐菜谱时最多 {{max_recipes}} 个，编号必须原样来自目录，不能重复；\n"
     "3. 用户给出时间上限时，只选耗时不超过该值的菜谱；\n"
     "4. 用户指定器具时，菜谱所需器具必须全部在用户可用器具内；\n"
     "5. 用户说不吃或忌口的食材，不能出现在菜谱标题、主要食材或配料里；\n"
@@ -153,7 +215,7 @@ PROBE_USER_PROMPT = "请只回复两个字：可用"
 # 后面每一轮都会基于错误信息回答；菜谱编号丢失则会导致追问时接不上。
 SUMMARY_SYSTEM_PROMPT = (
     "你是 MealMate 的对话摘要助手。请把用户与做饭助手的旧对话"
-    "合并成一段不超过 300 字的中文摘要。\n"
+    "合并成一段不超过 {{max_summary_chars}} 字的中文摘要。\n"
     "必须保留：用户的口味偏好、忌口、可用器具、时间限制、"
     "已经推荐过的菜谱编号、尚未解决的问题。\n"
     "不能编造对话里没有的信息；不要输出 Markdown，不要解释，只输出摘要正文。"
@@ -164,8 +226,8 @@ SUMMARY_SYSTEM_PROMPT = (
 # 800 字符足以保留一条消息的核心意思，也符合“先压缩再总结”的目的。
 SUMMARY_MESSAGE_CHARS = 800
 
-# 摘要结果最多保存多少字符。系统提示词要求 300 字，
-# 留一倍余量是为了兼容模型偶尔啰嗦，同时避免摘要无限增长。
+# 摘要结果最多保存多少字符。目标长度由共用变量 max_summary_chars 控制；
+# 这里留一倍余量作为资源上限，兼容模型偶尔啰嗦，同时避免摘要无限增长。
 SUMMARY_MAX_CHARS = 600
 
 
@@ -660,6 +722,11 @@ def record_call(
     Returns:
         调用日志编号。调用方后续追加步骤（例如“回退本地规则”）时要用到。
     """
+    input_cost = max(prompt_tokens, 0) / 1000 * max(provider.input_price_per_1k, 0)
+    output_cost = (
+        max(completion_tokens, 0) / 1000 * max(provider.output_price_per_1k, 0)
+    )
+    total_cost = round(input_cost + output_cost, 8)
     log = AICallLog(
         id=new_id("ail"),
         request_id=request_id_ctx.get() or None,
@@ -675,7 +742,47 @@ def record_call(
         total_tokens=max(total_tokens, 0),
         error_code=_short(error_code, 40) if error_code else None,
         error_message=_short(error_message, 200) if error_message else None,
+        # 成本在调用时算好并固定下来，供应商调价不会改写历史趋势。
+        cost_usd=total_cost,
     )
+    prompt_meta = _prompt_context.get()
+    if prompt_meta:
+        log.prompt_name = _short(prompt_meta[0], 80)
+        log.prompt_version = prompt_meta[1]
+        log.prompt_source = _short(prompt_meta[2], 20)
+    if trace is not None:
+        # 汇总步骤放在时间线末尾：排查时先看过程，最后直接核对钱和 token。
+        trace.add(
+            "cost_summary",
+            "成本与 Token 汇总",
+            status="success" if status == "success" else "info",
+            detail=(
+                f"输入 Token：{max(prompt_tokens, 0)}\n"
+                f"输出 Token：{max(completion_tokens, 0)}\n"
+                f"总 Token：{max(total_tokens, 0)}\n"
+                f"输入单价：{max(provider.input_price_per_1k, 0)} 美元/千 token\n"
+                f"输出单价：{max(provider.output_price_per_1k, 0)} 美元/千 token\n"
+                f"输入成本：${input_cost:.8f}\n"
+                f"输出成本：${output_cost:.8f}\n"
+                f"总成本：${total_cost:.8f}\n"
+                f"调用耗时：{max(latency_ms, 0)} ms；状态：{status}"
+            ),
+        )
+        sql_records = _sql_trace.get()
+        if sql_records:
+            lines = "\n".join(
+                f"[{index}] {sql}"
+                for index, sql in enumerate(sql_records, start=1)
+            )
+            trace.add(
+                "sql_summary",
+                "实际执行的 SQL 摘要",
+                detail=(
+                    f"共记录 {len(sql_records)} 条语句（只记录语句结构，"
+                    f"参数值用占位符，最多保留 {_MAX_SQL_TRACE_ITEMS} 条）：\n\n"
+                    f"{lines}"
+                ),
+            )
     db.add(log)
     if trace is not None:
         for seq, item in enumerate(trace.steps, start=1):
@@ -692,6 +799,28 @@ def record_call(
                     duration_ms=item.duration_ms,
                 )
             )
+    # 同步上报 Langfuse（可选）。这里只是把事件放进内存队列，
+    # 不产生网络等待；未配置或队列已满时会自动跳过，不影响问答。
+    langfuse_service.report_model_call(
+        call_log_id=log.id,
+        request_id=log.request_id,
+        subject_ref=log.subject_ref,
+        context_type=log.context_type,
+        provider_name=log.provider_name,
+        model=log.model,
+        status=status,
+        latency_ms=log.latency_ms,
+        prompt_tokens=log.prompt_tokens,
+        completion_tokens=log.completion_tokens,
+        total_tokens=log.total_tokens,
+        error_code=log.error_code,
+        error_message=log.error_message,
+        steps=trace.steps if trace is not None else None,
+        input_price_per_1k=provider.input_price_per_1k,
+        output_price_per_1k=provider.output_price_per_1k,
+        prompt_name=prompt_meta[0] if prompt_meta else None,
+        prompt_version=prompt_meta[1] if prompt_meta else None,
+    )
     return log.id
 
 
@@ -1120,6 +1249,19 @@ async def _prepare_history(
     return state
 
 
+def _prompt_source_label(source: str) -> str:
+    """把提示词来源翻译成排查时能直接看懂的中文。
+
+    本地优先改造后 source 有三种取值，旧代码只判断了 langfuse，
+    导致本地版本被显示成“代码默认值”，排查时会误判提示词来自哪里。
+    """
+    return {
+        "local": "本地数据库",
+        "langfuse": "Langfuse",
+        "default": "代码默认值",
+    }.get(source, source or "-")
+
+
 def _history_detail(state: ConversationState, provider: AIProvider) -> str:
     """生成“对话历史与窗口”步骤的详情，供后台调用详情页排查。
 
@@ -1169,6 +1311,13 @@ async def _compress_history(
     if not segments:
         return False
 
+    # 摘要提示词同样支持后台版本管理；读取后记住来源，
+    # 这样压缩调用的日志里也能看到用的是哪个版本。
+    summary_prompt = await prompt_service.get_prompt(
+        db, "mealmate.history.summary.system"
+    )
+    _remember_prompt(summary_prompt)
+
     for attempt in (1, 2):
         # 每次尝试单独一份过程记录：失败日志和成功日志各自完整，
         # 在后台详情页不会混进另一次尝试的步骤。
@@ -1199,7 +1348,7 @@ async def _compress_history(
         )
         try:
             result = await _invoke_model_traced(
-                provider, SUMMARY_SYSTEM_PROMPT, prompt, trace
+                provider, summary_prompt.text, prompt, trace
             )
         except AICallError as exc:
             if _is_context_length_error(exc) and attempt == 1 and len(segments) > 1:
@@ -1420,6 +1569,8 @@ async def chat(
     6. 校验模型返回的菜谱编号与条件，全部不合格则使用本地规则推荐；
     7. 保存本轮用户问题与助手回答，写调用日志并返回统一响应。
     """
+    # 本次请求开始记录实际执行的 SQL，随调用日志一起写入详情。
+    _sql_trace.set([])
     quota = await _consume_quota(db, viewer, subject_ref)
     context_post, recipes, catalog, constraints, providers = await _chat_context(db, body)
     # 历史准备必须在拼提示词之前完成：压缩会改写摘要，
@@ -1427,6 +1578,10 @@ async def chat(
     state = await _prepare_history(db, viewer, subject_ref, body, providers)
 
     if providers:
+        # 提示词从 Langfuse 读取 production 版本；未配置或读取失败时
+        # 自动使用代码里的默认值，不会因为观测服务不可用而中断问答。
+        chat_prompt = await prompt_service.get_prompt(db, "mealmate.chat.system")
+        _remember_prompt(chat_prompt)
         user_prompt = _user_prompt(
             body,
             constraints,
@@ -1436,7 +1591,7 @@ async def chat(
             summary=state.summary,
         )
         attempted_log_ids: list[str] = []
-        for provider in providers:
+        for attempt, provider in enumerate(providers, start=1):
             # 每次模型尝试单独一份过程记录，最终随这条调用日志一起落库。
             trace = CallTrace()
             trace.add(
@@ -1447,7 +1602,9 @@ async def chat(
                     "处理函数：app.services.ai_service.chat\n"
                     f"请求参数：message={body.message!r}，"
                     f"context_type={body.context_type!r}，"
-                    f"context_id={body.context_id!r}，history={len(body.history)} 条"
+                    f"context_id={body.context_id!r}，history={len(body.history)} 条\n"
+                    f"会话编号：{body.conversation_id or '（新会话）'}；"
+                    f"消息编号：{body.message_id or '-'}"
                 ),
             )
             trace.add(
@@ -1490,17 +1647,25 @@ async def chat(
                 "provider_selected",
                 "选择启用的模型",
                 detail=(
+                    f"尝试顺序：第 {attempt}/{len(providers)} 个启用模型\n"
                     f"供应商：{provider.name}（{provider.id}）\n"
                     f"模型：{provider.model}\n"
                     f"优先级：{provider.priority}\n"
-                    f"接口地址：{provider.base_url}"
+                    f"接口地址：{provider.base_url}\n"
+                    f"超时：{provider.timeout_seconds} 秒；"
+                    f"输出上限：{provider.max_output_tokens} token；"
+                    f"上下文窗口：{provider.context_window_tokens} token\n"
+                    f"单价：输入 {provider.input_price_per_1k} / "
+                    f"输出 {provider.output_price_per_1k} 美元/千 token"
                 ),
             )
             trace.add(
                 "prompt_built",
                 "组装提示词",
                 detail=(
-                    f"系统提示词：{len(SYSTEM_PROMPT)} 字符\n"
+                    f"系统提示词：{len(chat_prompt.text)} 字符"
+                    f"（来源：{_prompt_source_label(chat_prompt.source)}"
+                    f"，版本：{chat_prompt.version or '-'}）\n"
                     f"用户提示词：{len(user_prompt)} 字符\n"
                     f"已发布菜谱：{len(recipes)} 道\n"
                     "完整提示词见下一步“发送模型请求”，避免同一次调用里重复保存大段正文。"
@@ -1509,7 +1674,7 @@ async def chat(
 
             try:
                 result = await _invoke_model_traced(
-                    provider, SYSTEM_PROMPT, user_prompt, trace
+                    provider, chat_prompt.text, user_prompt, trace
                 )
             except AICallError as exc:
                 # 上下文超限单独记一条醒目步骤：这说明后台填写的窗口
@@ -1569,8 +1734,8 @@ async def chat(
                     status="success",
                     detail=_validation_detail(selected),
                 )
-                # 一般性问题也允许回答，但限制长度，避免模型输出一整篇文章。
-                reply_text = str(payload["reply"]).strip()[:400]
+                # 内容长短由提示词变量控制；这里只做资源上限，避免异常输出撑爆响应。
+                reply_text = str(payload["reply"]).strip()[:MAX_REPLY_CHARS]
             except (ValueError, AICallError) as exc:
                 code = exc.code if isinstance(exc, AICallError) else "AI_OUTPUT_INVALID"
                 if not trace.has("output_parse"):
@@ -1780,10 +1945,10 @@ def _parse_stream_output(raw: str) -> tuple[str, list[str], dict[str, str]]:
                 if isinstance(raw_reasons, dict)
                 else {}
             )
-            return reply[:400], recipe_ids, reasons
+            return reply[:MAX_REPLY_CHARS], recipe_ids, reasons
         except (ValueError, TypeError):
             cleaned = re.sub(r"<[^>]+>", "", raw).strip()
-            return cleaned[:400], [], {}
+            return cleaned[:MAX_REPLY_CHARS], [], {}
 
     recipe_ids = [
         item.strip()
@@ -1796,8 +1961,8 @@ def _parse_stream_output(raw: str) -> tuple[str, list[str], dict[str, str]]:
             key, value = part.split("=", 1)
             key = key.strip()
             if key:
-                reasons[key] = value.strip()[:60]
-    return reply[:400], recipe_ids, reasons
+                reasons[key] = value.strip()[:MAX_REASON_CHARS]
+    return reply[:MAX_REPLY_CHARS], recipe_ids, reasons
 
 
 def _partial_reply(raw: str) -> str:
@@ -1824,6 +1989,8 @@ async def chat_stream(
     配额不足、参数错误这类问题必须在响应开始前抛出，才能返回正常的 429/400；
     一旦开始写 SSE，HTTP 状态码已经发出，再抛异常客户端只能看到连接中断。
     """
+    # 本次请求开始记录实际执行的 SQL，随调用日志一起写入详情。
+    _sql_trace.set([])
     quota = await _consume_quota(db, viewer, subject_ref)
     context_post, recipes, catalog, constraints, providers = await _chat_context(db, body)
     # 与普通接口共用同一套历史准备：复用会话、判断阈值、必要时压缩。
@@ -1888,8 +2055,13 @@ async def chat_stream(
             )
             return
 
+        # 流式提示词同样走 Langfuse 版本管理，未配置时自动使用代码默认值。
+        stream_prompt = await prompt_service.get_prompt(
+            db, "mealmate.chat.stream.system"
+        )
+        _remember_prompt(stream_prompt)
         attempted_log_ids: list[str] = []
-        for provider in providers:
+        for attempt, provider in enumerate(providers, start=1):
             stats = StreamStats()
             raw = ""
             sent_until = 0
@@ -1908,7 +2080,9 @@ async def chat_stream(
                     "status → delta × N → done\n"
                     f"请求参数：message={body.message!r}，"
                     f"context_type={body.context_type!r}，"
-                    f"context_id={body.context_id!r}，history={len(body.history)} 条"
+                    f"context_id={body.context_id!r}，history={len(body.history)} 条\n"
+                    f"会话编号：{body.conversation_id or '（新会话）'}；"
+                    f"消息编号：{body.message_id or '-'}"
                 ),
             )
             trace.add(
@@ -1949,17 +2123,25 @@ async def chat_stream(
                 "provider_selected",
                 "选择启用的模型",
                 detail=(
+                    f"尝试顺序：第 {attempt}/{len(providers)} 个启用模型\n"
                     f"供应商：{provider.name}（{provider.id}）\n"
                     f"模型：{provider.model}\n"
                     f"优先级：{provider.priority}\n"
-                    f"接口地址：{provider.base_url}"
+                    f"接口地址：{provider.base_url}\n"
+                    f"超时：{provider.timeout_seconds} 秒；"
+                    f"输出上限：{provider.max_output_tokens} token；"
+                    f"上下文窗口：{provider.context_window_tokens} token\n"
+                    f"单价：输入 {provider.input_price_per_1k} / "
+                    f"输出 {provider.output_price_per_1k} 美元/千 token"
                 ),
             )
             trace.add(
                 "prompt_built",
                 "组装提示词",
                 detail=(
-                    f"系统提示词：{len(STREAM_SYSTEM_PROMPT)} 字符\n"
+                    f"系统提示词：{len(stream_prompt.text)} 字符"
+                    f"（来源：{_prompt_source_label(stream_prompt.source)}"
+                    f"，版本：{stream_prompt.version or '-'}）\n"
                     f"用户提示词：{len(user_prompt)} 字符\n"
                     f"已发布菜谱：{len(recipes)} 道\n"
                     "完整提示词见下一步“发起流式请求”，避免重复保存大段正文。"
@@ -1974,14 +2156,14 @@ async def chat_stream(
                     f"超时：{provider.timeout_seconds} 秒\n"
                     f"输出上限：{provider.max_output_tokens} token\n"
                     "已开始接收流式响应；首个文本片段到达前，客户端展示“正在生成”。\n\n"
-                    f"【系统提示词】\n{STREAM_SYSTEM_PROMPT}\n\n"
+                    f"【系统提示词】\n{stream_prompt.text}\n\n"
                     f"【用户提示词】\n{user_prompt}"
                 ),
             )
 
             try:
                 async for piece in _stream_model(
-                    provider, STREAM_SYSTEM_PROMPT, user_prompt, stats
+                    provider, stream_prompt.text, user_prompt, stats
                 ):
                     raw += piece
                     if reply_open < 0:
@@ -2329,7 +2511,8 @@ def _validate_reply(
         catalog: 已发布菜谱，键是编号。
         constraints: 后端解析后的硬性条件。
     Returns:
-        [(菜谱, 推荐理由)]，最多 3 个。
+        [(菜谱, 推荐理由)]。推荐数量由提示词变量控制，
+        后端只保留 MAX_SELECTED_RECIPES 这个资源上限，防止异常输出拖垮界面。
     Raises:
         AICallError: 回复正文缺失，或模型返回的编号全部不存在 / 不满足条件。
     Why:
@@ -2359,9 +2542,12 @@ def _validate_reply(
         if recipe is None or not _satisfies(recipe, constraints):
             invalid += 1
             continue
-        reason = str(reasons.get(recipe_id, "")).strip()[:60] or _reason(recipe)
+        reason = (
+            str(reasons.get(recipe_id, "")).strip()[:MAX_REASON_CHARS]
+            or _reason(recipe)
+        )
         selected.append((recipe, reason))
-        if len(selected) >= 3:
+        if len(selected) >= MAX_SELECTED_RECIPES:
             break
 
     if invalid and not selected:
@@ -2707,9 +2893,10 @@ def _select_recipes(
     hard = [recipe for recipe in recipes if _satisfies(recipe, constraints)]
     hard.sort(key=_minutes_sort_key)
     if hard:
-        return hard[:3], False
+        # 推荐几道由提示词变量控制；这里只封顶到资源上限，避免一次返回过多卡片。
+        return hard[:MAX_LOCAL_RECOMMENDATIONS], False
 
-    fallback = sorted(recipes, key=_minutes_sort_key)[:2]
+    fallback = sorted(recipes, key=_minutes_sort_key)[:MAX_LOCAL_RECOMMENDATIONS]
     return fallback, True
 
 

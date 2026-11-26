@@ -17,6 +17,9 @@ export const NAV_ITEMS = [
   { path: '/taste-tags', label: '口味标签', permission: 'taste_tag.manage' },
   { path: '/ai-providers', label: '模型配置', permission: 'ai.config.write' },
   { path: '/ai-call-logs', label: 'AI 调用日志', permission: 'ai.log.read' },
+  { path: '/ai-observability', label: 'AI 观测', permission: 'ai.log.read' },
+  { path: '/ai-prompts', label: '提示词管理', permission: 'ai.log.read' },
+  { path: '/prompt-variables', label: '变量管理', permission: 'ai.log.read' },
   { path: '/knowledge-base', label: '知识库', permission: 'kb.document.manage' },
   { path: '/users', label: '用户管理', permission: 'user.read' },
   { path: '/admins', label: '管理员与角色', permission: 'admin.manage' },
@@ -83,6 +86,24 @@ const router = createRouter({
           name: 'ai-call-logs',
           component: () => import('@/views/ai/AICallLogView.vue'),
           meta: { title: 'AI 调用日志', permission: 'ai.log.read' },
+        },
+        {
+          path: 'ai-observability',
+          name: 'ai-observability',
+          component: () => import('@/views/ai/LangfuseDashboardView.vue'),
+          meta: { title: 'AI 观测', permission: 'ai.log.read' },
+        },
+        {
+          path: 'ai-prompts',
+          name: 'ai-prompts',
+          component: () => import('@/views/ai/LangfusePromptView.vue'),
+          meta: { title: '提示词管理', permission: 'ai.log.read' },
+        },
+        {
+          path: 'prompt-variables',
+          name: 'prompt-variables',
+          component: () => import('@/views/ai/PromptVariableView.vue'),
+          meta: { title: '变量管理', permission: 'ai.log.read' },
         },
         {
           // 详情页从日志列表进入，不出现在左侧菜单，权限沿用日志查看权限。

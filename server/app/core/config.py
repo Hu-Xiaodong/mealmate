@@ -90,6 +90,38 @@ class Settings(BaseSettings):
     # AI 调用日志保留多少天。日志是排障与成本核算依据，要求保留更久。
     ai_call_log_retention_days: int = 180
 
+    # ---- Langfuse（大模型可观测平台，可选接入）----
+    # Langfuse 是一个开源的“大模型调用观测”服务：记录调用链、Token、成本、
+    # 提示词版本和人工评分。本项目只把它当后端服务使用：
+    # 后端通过它的开放接口写入数据、读取指标，管理后台用自己的页面展示，
+    # 不嵌入 Langfuse 的网页界面，避免前端被第三方界面绑定。
+    #
+    # 为什么不直接使用 Langfuse 的官方 SDK：
+    # 1. 官方 SDK 会额外引入 OpenTelemetry 等依赖，而本项目只需要几个固定接口；
+    # 2. 直接用 HTTP 接口更容易解释每一步发了什么、收到了什么，
+    #    也方便在测试里用假的 HTTP 响应验证，不依赖外网。
+    #
+    # 三个值都为空时自动关闭上报，功能照常运行：
+    # 管理后台的观测页会显示“未配置”，日志以本地 ai_call_logs 为准。
+    langfuse_base_url: str = ""
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    # 调用 Langfuse 接口的超时时间（秒）。观测是旁路能力，
+    # 绝对不能因为观测服务变慢而拖住用户问答，所以超时要短。
+    langfuse_timeout_seconds: float = 3.0
+    # 运行时提示词缓存时间（秒）。每轮问答都去 Langfuse 拉提示词会多一次网络请求，
+    # 缓存后既能及时拿到新版本，又不会给每次问答增加延迟。
+    langfuse_prompt_cache_seconds: int = 300
+
+    @property
+    def langfuse_configured(self) -> bool:
+        """地址和两个密钥都填了才算配置完成。"""
+        return bool(
+            self.langfuse_base_url.strip()
+            and self.langfuse_public_key.strip()
+            and self.langfuse_secret_key.strip()
+        )
+
     rank_cache_seconds: int = 10
 
     # ---- 地图服务（腾讯位置服务 WebService API）----

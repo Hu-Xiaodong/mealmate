@@ -15,6 +15,7 @@ from app.core.errors import register_error_handlers, request_id_ctx
 from app.core.responses import ok
 from app.db.seed import seed_admin_data, seed_demo_data, seed_taste_tags
 from app.db.session import SessionLocal, init_db
+from app.services import langfuse_service
 from app.services.cache import close_cache
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -36,8 +37,12 @@ async def lifespan(_: FastAPI):
     # 即使演示数据已经存在，也要补齐新增的角色和权限点。
     async with SessionLocal() as db:
         await seed_admin_data(db)
+    # Langfuse 未配置时 start_worker 直接返回，不会产生任何后台任务。
+    # 配置后由后台协程批量上报模型调用，避免拖慢用户请求。
+    langfuse_service.start_worker()
     logger.info("应用启动完成 env=%s", settings.app_env)
     yield
+    await langfuse_service.stop_worker()
     await close_cache()
 
 

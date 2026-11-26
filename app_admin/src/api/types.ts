@@ -296,6 +296,10 @@ export interface AIProviderItem {
   timeoutSeconds: number
   maxOutputTokens: number
   contextWindowTokens: number
+  /** 输入单价：美元 / 1000 token；0 表示未填写。 */
+  inputPricePer1k: number
+  /** 输出单价：美元 / 1000 token；0 表示未填写。 */
+  outputPricePer1k: number
   lastTestAt: string | null
   lastTestOk: boolean | null
   lastTestMessage: string | null
@@ -316,6 +320,20 @@ export interface AIProviderForm {
   timeoutSeconds: number
   maxOutputTokens: number
   contextWindowTokens: number
+  inputPricePer1k: number
+  outputPricePer1k: number
+}
+
+/** 一次模型调用的人工评分。 */
+export interface AICallScoreItem {
+  id: string
+  callLogId: string
+  score: number
+  comment: string | null
+  scorerName: string
+  source: string
+  langfuseSynced: boolean
+  createdAt: string
 }
 
 export interface AIProviderTestResult {
@@ -338,6 +356,11 @@ export interface AICallLogItem {
   promptTokens: number
   completionTokens: number
   totalTokens: number
+  /** 调用时按单价算好的美元成本。 */
+  costUsd: number
+  promptName: string | null
+  promptVersion: number | null
+  promptSource: string | null
   errorCode: string | null
   errorMessage: string | null
   createdAt: string
@@ -364,6 +387,124 @@ export interface AICallTraceItem {
 
 export interface AICallLogDetail extends AICallLogItem {
   traces: AICallTraceItem[]
+  scores: AICallScoreItem[]
+}
+
+/** Langfuse 连接状态。 */
+export interface LangfuseStatus {
+  configured: boolean
+  ok: boolean
+  message: string
+  baseUrl?: string
+}
+
+/** 成本与指标看板。本地统计与 Langfuse 返回结构保持一致。 */
+export interface LangfuseMetrics {
+  configured: boolean
+  message: string
+  rangeDays: number
+  /** local 本地数据库；langfuse 远端指标。 */
+  source?: 'local' | 'langfuse' | string
+  summary: {
+    calls?: number
+    errors?: number
+    errorRate?: number
+    avgLatencyMs?: number
+    p95LatencyMs?: number
+    totalTokens?: number
+    totalCost?: number
+  }
+  trend: Array<{
+    date: string
+    calls: number
+    errors: number
+    avgLatencyMs: number
+    totalTokens: number
+    totalCost: number
+  }>
+  scores: {
+    count?: number
+    average?: number
+    distribution?: Array<{ score: number; count: number }>
+  }
+  /** 按提示词版本聚合，只有本地统计返回。 */
+  prompts?: Array<{
+    name: string
+    version: number | null
+    source: string | null
+    calls: number
+    errors: number
+    avgLatencyMs: number
+    totalCost: number
+  }>
+}
+
+/** 提示词变量：共用变量或绑定到单个提示词的专属变量。 */
+export interface PromptVariableItem {
+  id: string
+  key: string
+  value: string
+  defaultValue: string | null
+  scope: 'shared' | 'prompt'
+  promptName: string | null
+  updatedBy: string
+  updatedAt: string
+  /** 哪些已发布提示词正文引用了这个 Key。 */
+  usedBy: string[]
+}
+
+/** 编辑器里提交的一行专属变量。 */
+export interface PromptVariableInput {
+  key: string
+  value: string
+  defaultValue?: string | null
+}
+
+export interface PromptVariableSaveRequest extends PromptVariableInput {
+  scope: 'shared' | 'prompt'
+  promptName?: string | null
+}
+
+/** 变量渲染预览结果。 */
+export interface PromptPreviewResult {
+  name: string
+  content: string
+  missingKeys: string[]
+  values: Record<string, string>
+  sources: Record<string, string>
+}
+
+/** 后台提示词列表项（本地版本为主，Langfuse 为可选镜像）。 */
+export interface LangfusePromptItem {
+  name: string
+  title: string
+  description: string
+  version: number | null
+  source: 'langfuse' | 'local' | 'default' | string
+  /** 带 {{key}} 的原文，编辑器使用。 */
+  content: string
+  /** 变量替换后的预览正文。 */
+  preview: string
+  /** 当前缺失的变量 Key；正常发布不会出现。 */
+  missingKeys: string[]
+  /** 该提示词的专属变量。 */
+  variables: PromptVariableInput[]
+  versions: number[]
+  updatedAt: string | null
+  langfuseVersion: number | null
+}
+
+/** 提示词历史版本。 */
+export interface LangfusePromptVersion {
+  version: number
+  content: string
+  labels: string[]
+  createdAt: string | null
+  createdBy?: string
+  commitMessage?: string | null
+  langfuseVersion?: number | null
+  /** 发布时的专属变量快照。 */
+  variables?: PromptVariableInput[]
 }
 
 export interface KbBatchOperationItem {

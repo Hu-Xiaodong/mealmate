@@ -14,14 +14,15 @@
 
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.serializers import iso
 from app.core.errors import AppError
 from app.core.security import decrypt_secret, encrypt_secret, mask_secret, new_id
-from app.db.models import AdminUser, AICallLog, AICallTrace, AIProvider
+from app.db.models import AdminUser, AICallLog, AICallScore, AICallTrace, AIProvider
 from app.schemas import AIProviderCreateRequest, AIProviderUpdateRequest
+from app.services import langfuse_service
 from app.services.ai_service import probe_provider
 from app.services.audit_service import write_audit
 from app.utils.time import now_utc
@@ -57,6 +58,8 @@ def _payload(provider: AIProvider) -> dict[str, Any]:
         "timeoutSeconds": provider.timeout_seconds,
         "maxOutputTokens": provider.max_output_tokens,
         "contextWindowTokens": provider.context_window_tokens,
+        "inputPricePer1k": provider.input_price_per_1k,
+        "outputPricePer1k": provider.output_price_per_1k,
         "lastTestAt": iso(provider.last_test_at),
         "lastTestOk": provider.last_test_ok,
         "lastTestMessage": provider.last_test_message,
@@ -83,6 +86,8 @@ def _snapshot(provider: AIProvider) -> dict[str, Any]:
         "timeoutSeconds": provider.timeout_seconds,
         "maxOutputTokens": provider.max_output_tokens,
         "contextWindowTokens": provider.context_window_tokens,
+        "inputPricePer1k": provider.input_price_per_1k,
+        "outputPricePer1k": provider.output_price_per_1k,
     }
 
 
@@ -162,6 +167,8 @@ async def create_provider(
         timeout_seconds=body.timeout_seconds,
         max_output_tokens=body.max_output_tokens,
         context_window_tokens=body.context_window_tokens,
+        input_price_per_1k=body.input_price_per_1k,
+        output_price_per_1k=body.output_price_per_1k,
         created_at=now_utc(),
         updated_at=now_utc(),
     )
@@ -223,6 +230,10 @@ async def update_provider(
         provider.max_output_tokens = body.max_output_tokens
     if body.context_window_tokens is not None:
         provider.context_window_tokens = body.context_window_tokens
+    if body.input_price_per_1k is not None:
+        provider.input_price_per_1k = body.input_price_per_1k
+    if body.output_price_per_1k is not None:
+        provider.output_price_per_1k = body.output_price_per_1k
     # 空字符串表示“保留原密钥”，只有真正填写了新密钥才重新加密。
     if body.api_key and body.api_key.strip():
         provider.api_key_encrypted = encrypt_secret(body.api_key.strip())
@@ -318,6 +329,10 @@ def _log_payload(log: AICallLog) -> dict[str, Any]:
         "promptTokens": log.prompt_tokens,
         "completionTokens": log.completion_tokens,
         "totalTokens": log.total_tokens,
+        "costUsd": log.cost_usd,
+        "promptName": log.prompt_name,
+        "promptVersion": log.prompt_version,
+        "promptSource": log.prompt_source,
         "errorCode": log.error_code,
         "errorMessage": log.error_message,
         "createdAt": iso(log.created_at),
@@ -336,6 +351,92 @@ def _trace_payload(trace: AICallTrace) -> dict[str, Any]:
         "durationMs": trace.duration_ms,
         "createdAt": iso(trace.created_at),
     }
+
+
+def _score_payload(score: AICallScore) -> dict[str, Any]:
+    """一条人工评分的展示字段。"""
+    return {
+        "id": score.id,
+        "callLogId": score.call_log_id,
+        "score": score.score,
+        "comment": score.comment,
+        "scorerName": score.scorer_name,
+        "source": score.source,
+        "langfuseSynced": score.langfuse_synced,
+        "createdAt": iso(score.created_at),
+    }
+
+
+async def list_call_scores(db: AsyncSession, log_id: str) -> list[dict[str, Any]]:
+    """按时间倒序列出一条调用的全部评分。"""
+    rows = (
+        await db.scalars(
+            select(AICallScore)
+            .where(AICallScore.call_log_id == log_id)
+            .order_by(AICallScore.created_at.desc(), AICallScore.id.desc())
+        )
+    ).all()
+    return [_score_payload(row) for row in rows]
+
+
+async def add_call_score(
+    db: AsyncSession,
+    admin: AdminUser,
+    log_id: str,
+    *,
+    score: int,
+    comment: str | None,
+    ip: str | None,
+) -> dict[str, Any]:
+    """给一次调用打人工分，并尽力同步到 Langfuse。
+
+    保存顺序：先写本地库并提交，再推送 Langfuse。
+    这样即使观测服务不可用，评分也不会丢；推送失败只把
+    langfuseSynced 置为 false，后台可以据此看出“还没同步”。
+    """
+    log = await db.get(AICallLog, log_id)
+    if log is None:
+        raise AppError(
+            "AI_CALL_LOG_NOT_FOUND", "调用日志不存在或已被清理", status_code=404
+        )
+    row = AICallScore(
+        id=new_id("ais"),
+        call_log_id=log_id,
+        score=score,
+        comment=(comment or "").strip() or None,
+        scorer_name=(admin.display_name or admin.username)[:80],
+        source="manual",
+        langfuse_synced=False,
+        created_at=now_utc(),
+    )
+    db.add(row)
+    write_audit(
+        db,
+        actor=admin,
+        action="ai_call.score",
+        target_type="ai_call_log",
+        target_id=log_id,
+        after={"score": score, "comment": row.comment},
+        ip=ip,
+    )
+    await db.commit()
+
+    synced = await langfuse_service.push_score(
+        score_id=row.id,
+        call_log_id=log_id,
+        score=score,
+        comment=row.comment,
+        scorer_name=row.scorer_name,
+    )
+    if synced:
+        await db.execute(
+            update(AICallScore)
+            .where(AICallScore.id == row.id)
+            .values(langfuse_synced=True)
+        )
+        await db.commit()
+        row.langfuse_synced = True
+    return _score_payload(row)
 
 
 async def get_call_log_detail(db: AsyncSession, log_id: str) -> dict[str, Any]:
@@ -362,7 +463,11 @@ async def get_call_log_detail(db: AsyncSession, log_id: str) -> dict[str, Any]:
             .order_by(AICallTrace.seq, AICallTrace.created_at, AICallTrace.id)
         )
     ).all()
-    return {**_log_payload(log), "traces": [_trace_payload(row) for row in traces]}
+    return {
+        **_log_payload(log),
+        "traces": [_trace_payload(row) for row in traces],
+        "scores": await list_call_scores(db, log_id),
+    }
 
 
 async def list_call_logs(

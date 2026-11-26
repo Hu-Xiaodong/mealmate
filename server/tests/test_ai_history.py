@@ -16,7 +16,13 @@ from datetime import timedelta
 
 from sqlalchemy import func, select
 
-from app.db.models import AICallLog, AICallTrace, AIConversation, AIMessage
+from app.db.models import (
+    AICallLog,
+    AICallScore,
+    AICallTrace,
+    AIConversation,
+    AIMessage,
+)
 from app.jobs.cleanup import purge_expired_call_logs
 from app.main import app
 from app.services.ai_history_service import (
@@ -611,12 +617,24 @@ async def test_cleanup_removes_expired_conversations_and_logs(client):
                     created_at=moment,
                 )
             )
+            db.add(
+                AICallScore(
+                    id=f"score_{log_id}",
+                    call_log_id=log_id,
+                    score=4,
+                    comment=None,
+                    scorer_name="测试管理员",
+                    source="manual",
+                    langfuse_synced=False,
+                    created_at=moment,
+                )
+            )
         await db.commit()
 
         deleted_conversations = await purge_expired_conversations(db)
         assert deleted_conversations == 1
         log_counts = await purge_expired_call_logs(db)
-        assert log_counts == {"callLogs": 1, "callTraces": 1}
+        assert log_counts == {"callLogs": 1, "callTraces": 1, "callScores": 1}
 
         # 孤儿明细：汇总日志可能被手工删除，只剩超过保留期的过程明细。
         db.add(
@@ -635,7 +653,11 @@ async def test_cleanup_removes_expired_conversations_and_logs(client):
         )
         await db.commit()
         # 再跑一次：没有过期汇总日志时，也要按明细自己的时间清理孤儿明细。
-        assert await purge_expired_call_logs(db) == {"callLogs": 0, "callTraces": 1}
+        assert await purge_expired_call_logs(db) == {
+            "callLogs": 0,
+            "callTraces": 1,
+            "callScores": 0,
+        }
 
         # 孤儿会话：所属用户已经不存在，每天兜底清理一次。
         db.add(
@@ -668,6 +690,9 @@ async def test_cleanup_removes_expired_conversations_and_logs(client):
         assert await db.get(AICallLog, "ail_cleanup_old") is None
         assert await db.get(AICallLog, "ail_cleanup_new") is not None
         assert await db.get(AICallTrace, "trace_ail_cleanup_old") is None
+        # 评分跟随日志一起删除；最近那条日志的评分保留。
+        assert await db.get(AICallScore, "score_ail_cleanup_old") is None
+        assert await db.get(AICallScore, "score_ail_cleanup_new") is not None
 
 
 async def test_delete_user_ai_data_removes_conversations_but_keeps_logs(client):
